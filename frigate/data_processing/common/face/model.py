@@ -41,12 +41,17 @@ class FaceRecognizer(ABC):
 
     @redirect_output_to_logger(logger, logging.DEBUG)  # type: ignore[misc]
     def init_landmark_detector(self) -> None:
-        landmark_model = os.path.join(MODEL_CACHE_DIR, "facedet/landmarkdet.yaml")
+        self.landmark_detector = self.create_landmark_detector()
 
-        if os.path.exists(landmark_model):
-            landmark_detector = cv2.face.createFacemarkLBF()
-            landmark_detector.loadModel(landmark_model)
-            self.landmark_detector = landmark_detector
+    @redirect_output_to_logger(logger, logging.DEBUG)  # type: ignore[misc]
+    def create_landmark_detector(self) -> cv2.face.Facemark | None:
+        """Create one landmark detector for one owning CPU worker."""
+        landmark_model = os.path.join(MODEL_CACHE_DIR, "facedet/landmarkdet.yaml")
+        if not os.path.exists(landmark_model):
+            return None
+        landmark_detector = cv2.face.createFacemarkLBF()
+        landmark_detector.loadModel(landmark_model)
+        return landmark_detector
 
     def align_face(
         self,
@@ -54,7 +59,18 @@ class FaceRecognizer(ABC):
         output_width: int,
         output_height: int,
     ) -> np.ndarray:
-        if not self.landmark_detector:
+        return self.align_face_with(
+            self.landmark_detector, image, output_width, output_height
+        )
+
+    @staticmethod
+    def align_face_with(
+        landmark_detector: cv2.face.Facemark | None,
+        image: np.ndarray,
+        output_width: int,
+        output_height: int,
+    ) -> np.ndarray:
+        if not landmark_detector:
             raise ValueError("Landmark detector not initialized")
 
         # landmark is run on grayscale images
@@ -63,7 +79,7 @@ class FaceRecognizer(ABC):
         else:
             land_image = image
 
-        _, lands = self.landmark_detector.fit(
+        _, lands = landmark_detector.fit(
             land_image, np.array([(0, 0, land_image.shape[1], land_image.shape[0])])
         )
         landmarks: np.ndarray = lands[0][0]
@@ -113,6 +129,27 @@ class FaceRecognizer(ABC):
         return cv2.warpAffine(
             image, M, (output_width, output_height), flags=cv2.INTER_CUBIC
         )
+
+    def prepare_face(
+        self,
+        face_image: np.ndarray,
+        landmark_detector: cv2.face.Facemark | None = None,
+    ) -> tuple[np.ndarray, float]:
+        """Run CPU-only scoring and alignment with a worker-owned detector."""
+        blur_reduction = self.get_blur_confidence_reduction(face_image)
+        detector = landmark_detector or self.landmark_detector
+        return (
+            self.align_face_with(
+                detector, face_image, face_image.shape[1], face_image.shape[0]
+            ),
+            blur_reduction,
+        )
+
+    def classify_prepared_batch(
+        self, prepared: list[tuple[np.ndarray, float]]
+    ) -> list[tuple[str, float] | None]:
+        """Default bounded sequential path used by the static-batch FaceNet model."""
+        return [self.classify(image) for image, _ in prepared]
 
     def get_blur_confidence_reduction(self, input: np.ndarray) -> float:
         """Calculates the reduction in confidence based on the blur of the image."""
@@ -223,12 +260,23 @@ class FaceNetRecognizer(FaceRecognizer):
         self.mean_embs: dict[str, np.ndarray] = {}
         self.face_embedder: FaceNetEmbedding = FaceNetEmbedding()
         self.model_builder_queue: queue.Queue | None = None
+        self.build_generation = 0
+        self.build_lock = threading.Lock()
+        self.embedding_lock = threading.Lock()
 
     def clear(self) -> None:
-        self.mean_embs = {}
+        with self.build_lock:
+            self.build_generation += 1
+            self.model_builder_queue = None
+        self.run_build_task()
 
     def run_build_task(self) -> None:
-        self.model_builder_queue = queue.Queue()
+        with self.build_lock:
+            if self.model_builder_queue is not None:
+                return
+            generation = self.build_generation
+            result_queue: queue.Queue = queue.Queue(maxsize=1)
+            self.model_builder_queue = result_queue
 
         def build_model() -> None:
             face_embeddings_map: dict[str, list[np.ndarray]] = {}
@@ -248,14 +296,16 @@ class FaceNetRecognizer(FaceRecognizer):
                     if img is None:
                         continue  # type: ignore[unreachable]
 
-                    img = self.align_face(img, img.shape[1], img.shape[0])
-                    emb = self.face_embedder([img])[0].squeeze()
+                    img = self.align_face_with(
+                        landmark_detector, img, img.shape[1], img.shape[0]
+                    )
+                    with self.embedding_lock:
+                        emb = self.face_embedder([img])[0].squeeze()
                     face_embeddings_map[name].append(emb)
 
                 idx += 1
 
-            assert self.model_builder_queue is not None
-            self.model_builder_queue.put(face_embeddings_map)
+            result_queue.put((generation, face_embeddings_map))
 
         thread = threading.Thread(target=build_model, daemon=True)
         thread.start()
@@ -267,8 +317,8 @@ class FaceNetRecognizer(FaceRecognizer):
 
         if self.model_builder_queue is not None:
             try:
-                face_embeddings_map: dict[str, list[np.ndarray]] = (
-                    self.model_builder_queue.get(timeout=0.1)
+                generation, face_embeddings_map = self.model_builder_queue.get(
+                    timeout=0.1
                 )
                 self.model_builder_queue = None
             except queue.Empty:
@@ -277,12 +327,15 @@ class FaceNetRecognizer(FaceRecognizer):
             self.run_build_task()
             return
 
-        if not face_embeddings_map:
+        if generation != self.build_generation:
+            self.run_build_task()
             return
-
+        mean_embs: dict[str, np.ndarray] = {}
         for name, embs in face_embeddings_map.items():
             if embs:
-                self.mean_embs[name] = build_class_mean(embs)
+                mean_embs[name] = build_class_mean(embs)
+
+        self.mean_embs = mean_embs
 
         logger.debug("Finished building ArcFace model")
 
@@ -290,6 +343,8 @@ class FaceNetRecognizer(FaceRecognizer):
         if not self.landmark_detector:
             return None
 
+        if self.model_builder_queue is not None:
+            self.build()
         if not self.mean_embs:
             self.build()
 
@@ -324,6 +379,35 @@ class FaceNetRecognizer(FaceRecognizer):
 
         return label, max(0, round(score - blur_reduction, 2))
 
+    def classify_prepared_batch(
+        self, prepared: list[tuple[np.ndarray, float]]
+    ) -> list[tuple[str, float] | None]:
+        """Keep FaceNet sequential because its TFLite input is static batch one."""
+        if self.model_builder_queue is not None:
+            self.build()
+        if not self.mean_embs:
+            self.build()
+            if not self.mean_embs:
+                return [None] * len(prepared)
+        results: list[tuple[str, float] | None] = []
+        for image, blur_reduction in prepared:
+            with self.embedding_lock:
+                embedding = self.face_embedder([image])[0].squeeze()
+            score = 0.0
+            label = ""
+            for name, mean_emb in self.mean_embs.items():
+                cosine_similarity = np.dot(embedding, mean_emb) / (
+                    np.linalg.norm(embedding) * np.linalg.norm(mean_emb)
+                )
+                confidence = similarity_to_confidence(
+                    cosine_similarity, median=0.5, range_width=0.6
+                )
+                if confidence > score:
+                    score = float(confidence)
+                    label = name
+            results.append((label, max(0, round(score - blur_reduction, 2))))
+        return results
+
 
 class ArcFaceRecognizer(FaceRecognizer):
     def __init__(self, config: FrigateConfig):
@@ -331,16 +415,34 @@ class ArcFaceRecognizer(FaceRecognizer):
         self.mean_embs: dict[str, np.ndarray] = {}
         self.face_embedder: ArcfaceEmbedding = ArcfaceEmbedding(config.face_recognition)
         self.model_builder_queue: queue.Queue | None = None
+        self.build_generation = 0
+        self.build_lock = threading.Lock()
+        self.embedding_lock = threading.Lock()
+        self.library_lock = threading.Lock()
+        self.library_snapshot: tuple[tuple[str, ...], np.ndarray, int] = (
+            (),
+            np.empty((0, 0), dtype=np.float32),
+            0,
+        )
 
     def clear(self) -> None:
-        self.mean_embs = {}
+        with self.build_lock:
+            self.build_generation += 1
+            self.model_builder_queue = None
+        self.run_build_task()
 
     def run_build_task(self) -> None:
-        self.model_builder_queue = queue.Queue()
+        with self.build_lock:
+            if self.model_builder_queue is not None:
+                return
+            generation = self.build_generation
+            result_queue: queue.Queue = queue.Queue(maxsize=1)
+            self.model_builder_queue = result_queue
 
         def build_model() -> None:
             face_embeddings_map: dict[str, list[np.ndarray]] = {}
             idx = 0
+            landmark_detector = self.create_landmark_detector()
 
             dir = FACE_DIR
             for name in os.listdir(dir):
@@ -356,14 +458,16 @@ class ArcFaceRecognizer(FaceRecognizer):
                     if img is None:
                         continue  # type: ignore[unreachable]
 
-                    img = self.align_face(img, img.shape[1], img.shape[0])
-                    emb = self.face_embedder([img])[0].squeeze()  # type: ignore[arg-type]
+                    img = self.align_face_with(
+                        landmark_detector, img, img.shape[1], img.shape[0]
+                    )
+                    with self.embedding_lock:
+                        emb = self.face_embedder([img])[0].squeeze()  # type: ignore[arg-type]
                     face_embeddings_map[name].append(emb)
 
                 idx += 1
 
-            assert self.model_builder_queue is not None
-            self.model_builder_queue.put(face_embeddings_map)
+            result_queue.put((generation, face_embeddings_map))
 
         thread = threading.Thread(target=build_model, daemon=True)
         thread.start()
@@ -375,8 +479,8 @@ class ArcFaceRecognizer(FaceRecognizer):
 
         if self.model_builder_queue is not None:
             try:
-                face_embeddings_map: dict[str, list[np.ndarray]] = (
-                    self.model_builder_queue.get(timeout=0.1)
+                generation, face_embeddings_map = self.model_builder_queue.get(
+                    timeout=0.1
                 )
                 self.model_builder_queue = None
             except queue.Empty:
@@ -385,12 +489,29 @@ class ArcFaceRecognizer(FaceRecognizer):
             self.run_build_task()
             return
 
-        if not face_embeddings_map:
+        if generation != self.build_generation:
+            self.run_build_task()
             return
-
+        mean_embs: dict[str, np.ndarray] = {}
         for name, embs in face_embeddings_map.items():
             if embs:
-                self.mean_embs[name] = build_class_mean(embs)
+                mean_embs[name] = build_class_mean(embs)
+
+        labels = tuple(sorted(mean_embs))
+        if labels:
+            matrix = np.stack([mean_embs[label] for label in labels]).astype(
+                np.float32, copy=False
+            )
+            matrix /= np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
+            normalized_means = {
+                label: matrix[index] for index, label in enumerate(labels)
+            }
+        else:
+            matrix = np.empty((0, 0), dtype=np.float32)
+            normalized_means = {}
+        with self.library_lock:
+            self.mean_embs = normalized_means
+            self.library_snapshot = (labels, matrix, generation)
 
         logger.debug("Finished building ArcFace model")
 
@@ -398,34 +519,58 @@ class ArcFaceRecognizer(FaceRecognizer):
         if not self.landmark_detector:
             return None
 
+        if self.model_builder_queue is not None:
+            self.build()
         if not self.mean_embs:
             self.build()
 
             if not self.mean_embs:
                 return None
 
-        # face recognition is best run on grayscale images
+        prepared = self.prepare_face(face_image)
+        return self.classify_prepared_batch([prepared])[0]
 
-        # get blur reduction before aligning face
-        blur_reduction = self.get_blur_confidence_reduction(face_image)
+    def prepare_face(
+        self,
+        face_image: np.ndarray,
+        landmark_detector: cv2.face.Facemark | None = None,
+    ) -> tuple[np.ndarray, float]:
+        """Align and normalize on CPU before work reaches the GPU executor."""
+        aligned, blur_reduction = super().prepare_face(
+            face_image, landmark_detector
+        )
+        return self.face_embedder.preprocess_one(aligned), blur_reduction
 
-        # align face and run recognition
-        img = self.align_face(face_image, face_image.shape[1], face_image.shape[0])
-        embedding = self.face_embedder([img])[0].squeeze()  # type: ignore[arg-type]
+    def classify_prepared_batch(
+        self, prepared: list[tuple[np.ndarray, float]]
+    ) -> list[tuple[str, float] | None]:
+        """Embed a dynamic batch and classify it with one matrix multiply."""
+        if not prepared:
+            return []
+        if self.model_builder_queue is not None:
+            self.build()
+        with self.library_lock:
+            labels, library, _ = self.library_snapshot
+        if not labels or library.size == 0:
+            self.build()
+            return [None] * len(prepared)
 
-        score: float = 0
-        label = ""
-
-        for name, mean_emb in self.mean_embs.items():
-            dot_product = np.dot(embedding, mean_emb)
-            magnitude_A = np.linalg.norm(embedding)
-            magnitude_B = np.linalg.norm(mean_emb)
-
-            cosine_similarity = dot_product / (magnitude_A * magnitude_B)
-            confidence = similarity_to_confidence(cosine_similarity)
-
-            if confidence > score:
-                score = confidence
-                label = name
-
-        return label, max(0, round(score - blur_reduction, 2))
+        with self.embedding_lock:
+            embeddings = np.stack(
+                [
+                    np.asarray(embedding).squeeze()
+                    for embedding in self.face_embedder.embed_preprocessed(
+                        [image for image, _ in prepared]
+                    )
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
+        embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
+        similarities = embeddings @ library.T
+        confidences = similarity_to_confidence(similarities)
+        best_indices = np.argmax(confidences, axis=1)
+        results: list[tuple[str, float] | None] = []
+        for row, best_index in enumerate(best_indices):
+            score = float(confidences[row, best_index]) - prepared[row][1]
+            results.append((labels[int(best_index)], max(0, round(score, 2))))
+        return results

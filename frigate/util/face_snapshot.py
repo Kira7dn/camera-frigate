@@ -1,6 +1,8 @@
 """Bounded background work for event-safe face snapshots."""
 
 import logging
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -8,7 +10,7 @@ import threading
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -19,11 +21,15 @@ logger = logging.getLogger(__name__)
 
 FaceTrackKey = tuple[str, str]
 Box = tuple[int, int, int, int]
-FACE_EVENT_STAGING_DIR = "/tmp/cache/face-events"
+FACE_COMMIT_ROOT = "/media/frigate/.face-commits"
+FACE_EVENT_STAGING_DIR = os.path.join(FACE_COMMIT_ROOT, "staging")
+FACE_COMMIT_JOURNAL_DIR = os.path.join(FACE_COMMIT_ROOT, "journal")
 FACE_PROCESS_INTERVAL = 0.5
 EXCLUDED_FACE_DIRECTORIES = frozenset({"train", "events", "staging", "face-events"})
 _LEGACY_ARTIFACT = re.compile(r"^.+-.+-\d+(?:\.\d+)?\.webp(?:\.tmp-\d+-\d+\.webp)?$")
 _FACE_ATTEMPT_IMAGE_EXTENSIONS = frozenset({".webp", ".png", ".jpg", ".jpeg"})
+_FACE_ATTEMPT_INDEX: dict[str, deque[Path]] = {}
+_FACE_ATTEMPT_INDEX_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,7 @@ class FaceRecognitionResult:
     sub_label: str
     face_score: float
     artifact_path: str
+    transaction_id: str = ""
 
     @property
     def key(self) -> FaceTrackKey:
@@ -63,6 +70,7 @@ class FaceRecognitionResult:
             "sub_label": self.sub_label,
             "face_score": self.face_score,
             "artifact_path": self.artifact_path,
+            "transaction_id": self.transaction_id,
         }
 
 
@@ -77,6 +85,13 @@ class FaceTrackState:
     candidate: FaceRecognitionResult | None = None
     last_attempt_time: float = 0.0
     result_emitted: bool = False
+    generation: int = 0
+    first_seen_monotonic: float = field(default_factory=time.monotonic)
+    first_attempt_monotonic: float = 0.0
+    pending_frame_times: set[float] = field(default_factory=set)
+    last_result_frame_time: float = 0.0
+    first_attempt_completed: bool = False
+    first_match_monotonic: dict[str, float] = field(default_factory=dict)
 
 
 def parse_face_attempt_filename(filename: str) -> tuple[str, str] | None:
@@ -139,6 +154,11 @@ class SnapshotCommitted:
     result: FaceRecognitionResult
     canonical_path: str
     thumbnail_path: str
+    canonical_backup: str = ""
+    thumbnail_backup: str = ""
+    had_canonical: bool = False
+    had_thumbnail: bool = False
+    journal_path: str = ""
 
     def as_payload(self) -> dict[str, Any]:
         """Return a JSON-serializable completion message."""
@@ -146,6 +166,7 @@ class SnapshotCommitted:
             **self.result.as_payload(),
             "canonical_path": self.canonical_path,
             "thumbnail_path": self.thumbnail_path,
+            "transaction_id": self.result.transaction_id,
         }
 
 
@@ -239,6 +260,7 @@ class LatestPerObjectWorker:
         self._condition = threading.Condition()
         self._stopping = False
         self._active_key: FaceTrackKey | None = None
+        self._last_was_control = False
         self._counters: Counter[str] = Counter()
         self._thread = threading.Thread(target=self._run, daemon=True, name=name)
         self._thread.start()
@@ -270,6 +292,9 @@ class LatestPerObjectWorker:
         """Submit release or cleanup work without consuming an object slot."""
         with self._condition:
             if self._stopping:
+                return False
+            if len(self._control) >= 64:
+                self._counters["control_rejected"] += 1
                 return False
             self._control.append(job)
             self._condition.notify()
@@ -310,12 +335,14 @@ class LatestPerObjectWorker:
                     self._condition.wait()
                 if self._stopping:
                     return
-                if self._control:
+                if self._control and (not self._pending or not self._last_was_control):
                     key = None
                     job = self._control.popleft()
+                    self._last_was_control = True
                 else:
                     key, job = self._pending.popitem(last=False)
                     self._active_key = key
+                    self._last_was_control = False
             try:
                 result = self._handler(job)
             except Exception:
@@ -367,6 +394,9 @@ def write_face_snapshot_artifact(
         os.replace(temporary_path, artifact_path)
     finally:
         Path(temporary_path).unlink(missing_ok=True)
+    transaction_id = hashlib.sha256(
+        f"{job.camera}\0{job.event_id}\0{job.frame_time}".encode()
+    ).hexdigest()[:24]
     return FaceRecognitionResult(
         camera=job.camera,
         event_id=job.event_id,
@@ -376,7 +406,41 @@ def write_face_snapshot_artifact(
         sub_label=job.sub_label,
         face_score=job.face_score,
         artifact_path=artifact_path,
+        transaction_id=transaction_id,
     )
+
+
+def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    temporary = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(temporary, "w", encoding="utf-8") as file:
+            json.dump(payload, file, separators=(",", ":"))
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _journal_payload(
+    job: SnapshotCommitJob,
+    state: str,
+    canonical_backup: str,
+    thumbnail_backup: str,
+    had_canonical: bool,
+    had_thumbnail: bool,
+) -> dict[str, Any]:
+    return {
+        "state": state,
+        "result": job.result.as_payload(),
+        "canonical_path": job.canonical_path,
+        "thumbnail_path": job.thumbnail_path,
+        "canonical_backup": canonical_backup,
+        "thumbnail_backup": thumbnail_backup,
+        "had_canonical": had_canonical,
+        "had_thumbnail": had_thumbnail,
+    }
 
 
 def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
@@ -396,6 +460,21 @@ def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
     thumbnail_backup = f"{job.thumbnail_path}.bak-{os.getpid()}-{threading.get_ident()}"
     had_canonical = os.path.isfile(job.canonical_path)
     had_thumbnail = os.path.isfile(job.thumbnail_path)
+    transaction_id = job.result.transaction_id or hashlib.sha256(
+        f"{job.result.camera}\0{job.result.event_id}\0{job.result.frame_time}".encode()
+    ).hexdigest()[:24]
+    journal_path = os.path.join(FACE_COMMIT_JOURNAL_DIR, f"{transaction_id}.json")
+    _atomic_write_json(
+        journal_path,
+        _journal_payload(
+            job,
+            "prepared",
+            canonical_backup,
+            thumbnail_backup,
+            had_canonical,
+            had_thumbnail,
+        ),
+    )
     try:
         if not cv2.imwrite(canonical_temp, image):
             raise OSError("Unable to encode canonical face snapshot")
@@ -413,6 +492,17 @@ def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
             os.replace(job.thumbnail_path, thumbnail_backup)
         os.replace(canonical_temp, job.canonical_path)
         os.replace(thumbnail_temp, job.thumbnail_path)
+        _atomic_write_json(
+            journal_path,
+            _journal_payload(
+                job,
+                "media_applied",
+                canonical_backup,
+                thumbnail_backup,
+                had_canonical,
+                had_thumbnail,
+            ),
+        )
     except Exception:
         Path(job.canonical_path).unlink(missing_ok=True)
         Path(job.thumbnail_path).unlink(missing_ok=True)
@@ -420,18 +510,94 @@ def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
             os.replace(canonical_backup, job.canonical_path)
         if had_thumbnail and os.path.isfile(thumbnail_backup):
             os.replace(thumbnail_backup, job.thumbnail_path)
+        Path(journal_path).unlink(missing_ok=True)
+        Path(job.result.artifact_path).unlink(missing_ok=True)
         raise
     finally:
         Path(canonical_temp).unlink(missing_ok=True)
         Path(thumbnail_temp).unlink(missing_ok=True)
-        Path(canonical_backup).unlink(missing_ok=True)
-        Path(thumbnail_backup).unlink(missing_ok=True)
-        Path(job.result.artifact_path).unlink(missing_ok=True)
-    return SnapshotCommitted(job.result, job.canonical_path, job.thumbnail_path)
+    return SnapshotCommitted(
+        job.result,
+        job.canonical_path,
+        job.thumbnail_path,
+        canonical_backup,
+        thumbnail_backup,
+        had_canonical,
+        had_thumbnail,
+        journal_path,
+    )
+
+
+def finalize_snapshot_commit(completion: SnapshotCommitted) -> None:
+    """Remove transaction artifacts after the database commit succeeds."""
+    for path in (
+        completion.canonical_backup,
+        completion.thumbnail_backup,
+        completion.result.artifact_path,
+        completion.journal_path,
+    ):
+        if path:
+            Path(path).unlink(missing_ok=True)
+
+
+def rollback_snapshot_commit(completion: SnapshotCommitted) -> None:
+    """Restore the media pair owned by a failed transaction."""
+    Path(completion.canonical_path).unlink(missing_ok=True)
+    Path(completion.thumbnail_path).unlink(missing_ok=True)
+    if completion.had_canonical and os.path.isfile(completion.canonical_backup):
+        os.replace(completion.canonical_backup, completion.canonical_path)
+    if completion.had_thumbnail and os.path.isfile(completion.thumbnail_backup):
+        os.replace(completion.thumbnail_backup, completion.thumbnail_path)
+    finalize_snapshot_commit(completion)
+
+
+def load_snapshot_journal() -> list[SnapshotCommitted]:
+    """Load recoverable media transactions and rollback incomplete prepares."""
+    journal_dir = Path(FACE_COMMIT_JOURNAL_DIR)
+    if not journal_dir.is_dir():
+        return []
+    recovered: list[SnapshotCommitted] = []
+    for path in journal_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            raw = payload["result"]
+            result = FaceRecognitionResult(
+                camera=str(raw["camera"]),
+                event_id=str(raw["event_id"]),
+                frame_time=float(raw["frame_time"]),
+                person_box=tuple(int(value) for value in raw["person_box"]),
+                face_box=tuple(int(value) for value in raw["face_box"]),
+                sub_label=str(raw["sub_label"]),
+                face_score=float(raw["face_score"]),
+                artifact_path=str(raw["artifact_path"]),
+                transaction_id=str(raw.get("transaction_id", path.stem)),
+            )
+            completion = SnapshotCommitted(
+                result=result,
+                canonical_path=str(payload["canonical_path"]),
+                thumbnail_path=str(payload["thumbnail_path"]),
+                canonical_backup=str(payload.get("canonical_backup", "")),
+                thumbnail_backup=str(payload.get("thumbnail_backup", "")),
+                had_canonical=bool(payload.get("had_canonical")),
+                had_thumbnail=bool(payload.get("had_thumbnail")),
+                journal_path=str(path),
+            )
+        except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
+            logger.exception("Unable to load face commit journal %s", path)
+            try:
+                path.rename(path.with_suffix(f".invalid-{int(time.time())}"))
+            except OSError:
+                logger.exception("Unable to quarantine face commit journal %s", path)
+            continue
+        if payload.get("state") == "media_applied":
+            recovered.append(completion)
+        else:
+            rollback_snapshot_commit(completion)
+    return recovered
 
 
 def write_face_attempt(job: FaceAttemptJob) -> None:
-    """Persist and trim attempts outside the recognition thread."""
+    """Persist attempts with an indexed, bounded retention list."""
     folder = os.path.join(job.face_dir, "train")
     os.makedirs(folder, exist_ok=True)
     sub_label = job.sub_label.replace("-", "_")
@@ -440,13 +606,29 @@ def write_face_attempt(job: FaceAttemptJob) -> None:
     )
     if not cv2.imwrite(path, job.frame):
         raise OSError("Unable to encode face attempt")
-    files = sorted(
-        (entry for entry in Path(folder).glob("*.webp") if entry.is_file()),
-        key=lambda entry: entry.stat().st_ctime,
-        reverse=True,
-    )
-    for old_file in files[job.max_files :]:
-        old_file.unlink(missing_ok=True)
+    with _FACE_ATTEMPT_INDEX_LOCK:
+        files = _FACE_ATTEMPT_INDEX.get(folder)
+        if files is None:
+            files = deque(
+                sorted(
+                    (
+                        entry
+                        for entry in Path(folder).glob("*.webp")
+                        if entry.is_file()
+                    ),
+                    key=lambda entry: entry.stat().st_ctime,
+                    reverse=True,
+                )
+            )
+            _FACE_ATTEMPT_INDEX[folder] = files
+        new_path = Path(path)
+        try:
+            files.remove(new_path)
+        except ValueError:
+            pass
+        files.appendleft(new_path)
+        while len(files) > job.max_files:
+            files.pop().unlink(missing_ok=True)
 
 
 def reap_stale_staging(
@@ -457,10 +639,24 @@ def reap_stale_staging(
     if not folder.is_dir():
         return 0
     cutoff = time.time() - max_age_seconds
+    referenced: set[str] = set()
+    journal_dir = Path(FACE_COMMIT_JOURNAL_DIR)
+    if journal_dir.is_dir():
+        for journal in journal_dir.glob("*.json"):
+            try:
+                payload = json.loads(journal.read_text(encoding="utf-8"))
+                referenced.add(os.path.abspath(payload["result"]["artifact_path"]))
+            except (KeyError, TypeError, OSError, json.JSONDecodeError):
+                continue
     removed = 0
     for path in folder.glob("*.webp*"):
         is_contract_staging = bool(_LEGACY_ARTIFACT.match(path.name))
-        if is_contract_staging and path.is_file() and path.stat().st_mtime < cutoff:
+        if (
+            is_contract_staging
+            and os.path.abspath(path) not in referenced
+            and path.is_file()
+            and path.stat().st_mtime < cutoff
+        ):
             path.unlink(missing_ok=True)
             removed += 1
     return removed
@@ -477,18 +673,25 @@ def is_face_identity_directory(name: str, path: str) -> bool:
 
 
 def cleanup_legacy_face_events(face_dir: str) -> int:
-    """Remove only the obsolete runtime-created FACE_DIR/events artifact folder."""
+    """Remove a legacy artifact folder only when runtime ownership is explicit."""
     legacy = Path(face_dir) / "events"
     if not legacy.is_dir():
         return 0
-    entries = list(legacy.iterdir())
+    ownership_marker = legacy / ".frigate-runtime-artifacts"
+    entries = [entry for entry in legacy.iterdir() if entry != ownership_marker]
     if any(
         not entry.is_file() or not _LEGACY_ARTIFACT.match(entry.name)
         for entry in entries
     ):
         logger.warning("Preserving non-runtime content in legacy face events directory")
         return 0
+    if not ownership_marker.is_file():
+        quarantine = Path(face_dir) / f".events-quarantine-{int(time.time())}"
+        legacy.rename(quarantine)
+        logger.warning("Quarantined unowned legacy face events directory at %s", quarantine)
+        return 0
     for entry in entries:
         entry.unlink(missing_ok=True)
+    ownership_marker.unlink(missing_ok=True)
     shutil.rmtree(legacy, ignore_errors=False)
     return len(entries)

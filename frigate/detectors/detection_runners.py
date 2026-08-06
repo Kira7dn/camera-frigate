@@ -203,6 +203,9 @@ class CudaGraphRunner(BaseModelRunner):
             ModelTypeEnum.yolonas.value,
             ModelTypeEnum.dfine.value,
             EnrichmentModelTypeEnum.paddleocr.value,
+            # ArcFace has a dynamic batch input. A captured CUDA graph owns
+            # fixed-size OrtValues and cannot be replayed for batch sizes 1-4.
+            EnrichmentModelTypeEnum.arcface.value,
             EnrichmentModelTypeEnum.jina_v1.value,
             EnrichmentModelTypeEnum.jina_v2.value,
             EnrichmentModelTypeEnum.yolov9_license_plate.value,

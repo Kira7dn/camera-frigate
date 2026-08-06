@@ -98,10 +98,11 @@ class FrigateApp:
         self.metrics_manager = manager
         self.audio_process: mp.Process | None = None
         self.stop_event = stop_event
-        self.detection_queue: Queue = mp.Queue()
+        camera_count = max(1, len(config.cameras))
+        self.detection_queue: Queue = mp.Queue(maxsize=camera_count * 4)
         self.detectors: dict[str, ObjectDetectProcess] = {}
         self.detection_shms: list[mp.shared_memory.SharedMemory] = []
-        self.log_queue: Queue = mp.Queue()
+        self.log_queue: Queue = mp.Queue(maxsize=10000)
         self.camera_metrics: DictProxy = self.metrics_manager.dict()
         self.embeddings_metrics: DataProcessorMetrics | None = (
             DataProcessorMetrics(
@@ -188,7 +189,26 @@ class FrigateApp:
         )
 
         # Queue for timeline events
-        self.timeline_queue: Queue = mp.Queue()
+        self.timeline_queue: Queue = mp.Queue(
+            maxsize=max(128, len(self.config.cameras) * 32)
+        )
+        face_queue_size = max(
+            4,
+            min(
+                32,
+                4
+                * sum(
+                    camera.enabled_in_config
+                    for camera in self.config.cameras.values()
+                ),
+            ),
+        )
+        self.face_result_queue: Queue = mp.Queue(maxsize=face_queue_size)
+        self.face_commit_queue: Queue = mp.Queue(maxsize=face_queue_size)
+        self.face_completion_queue: Queue = mp.Queue(maxsize=face_queue_size * 2)
+        self.event_update_queue: Queue = mp.Queue(
+            maxsize=max(256, len(self.config.cameras) * 64)
+        )
 
     def init_database(self) -> None:
         def vacuum_db(db: SqliteExtDatabase) -> None:
@@ -260,7 +280,10 @@ class FrigateApp:
     def init_embeddings_manager(self) -> None:
         # always start the embeddings process
         embedding_process = EmbeddingProcess(
-            self.config, self.embeddings_metrics, self.stop_event
+            self.config,
+            self.embeddings_metrics,
+            self.stop_event,
+            self.face_result_queue,
         )
         self.embedding_process = embedding_process
         embedding_process.start()
@@ -430,6 +453,10 @@ class FrigateApp:
             self.detected_frames_queue,
             self.ptz_autotracker_thread,
             self.stop_event,
+            self.face_result_queue,
+            self.face_commit_queue,
+            self.face_completion_queue,
+            self.event_update_queue,
         )
         self.detected_frames_processor.start()
 
@@ -469,6 +496,9 @@ class FrigateApp:
             self.config,
             self.timeline_queue,
             self.stop_event,
+            self.face_commit_queue,
+            self.face_completion_queue,
+            self.event_update_queue,
         )
         self.event_processor.start()
 
@@ -507,7 +537,10 @@ class FrigateApp:
                 "embedding_process",
                 "embeddings",
                 lambda: EmbeddingProcess(
-                    self.config, self.embeddings_metrics, self.stop_event
+                    self.config,
+                    self.embeddings_metrics,
+                    self.stop_event,
+                    self.face_result_queue,
                 ),
             ),
             (

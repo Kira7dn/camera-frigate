@@ -2,6 +2,7 @@
 
 import base64
 import datetime
+import json
 import logging
 import os
 import shutil
@@ -21,6 +22,11 @@ from frigate.data_processing.common.face.model import (
     ArcFaceRecognizer,
     FaceNetRecognizer,
     FaceRecognizer,
+)
+from frigate.data_processing.common.face.pipeline import (
+    FaceCaptureRequest,
+    FaceRecognitionOutcome,
+    FaceRecognitionPipeline,
 )
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.face_snapshot import (
@@ -67,6 +73,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.face_detector: cv2.FaceDetectorYN | None = None
         self.requires_face_detection = "face" not in self.config.objects.all_objects
         self.face_tracks: dict[tuple[str, str], FaceTrackState] = {}
+        self.face_generation_counter = 0
         self.face_counters: Counter[str] = Counter()
         self.last_face_metrics_log = time.monotonic()
         removed = reap_stale_staging()
@@ -77,7 +84,17 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             logger.info("Removed %d obsolete FACE_DIR/events artifacts", legacy_removed)
         self.face_snapshot_worker = LatestPerObjectWorker(
             write_face_snapshot_artifact,
-            max_objects=4,
+            max_objects=max(
+                4,
+                min(
+                    32,
+                    4
+                    * sum(
+                        camera.face_recognition.enabled
+                        for camera in config.cameras.values()
+                    ),
+                ),
+            ),
         )
         self.face_attempt_worker = LatestPerObjectWorker(
             write_face_attempt,
@@ -122,6 +139,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             self.recognizer = ArcFaceRecognizer(self.config)
 
         self.recognizer.build()
+        self.face_pipeline = FaceRecognitionPipeline(self.recognizer)
         identities, training_images = self.__face_library_stats()
         logger.info(
             "Face recognition initialized model=%s device=%s "
@@ -245,11 +263,69 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         if now - self.last_face_metrics_log < FACE_METRICS_LOG_INTERVAL:
             return
         identities, training_images = self.__face_library_stats()
+        pipeline = getattr(self, "face_pipeline", None)
+        batch_candidates = self.face_counters["batch_candidates"]
+        structured = {
+            "candidate_age_ms": round(
+                self.face_counters["candidate_age_ms_total"]
+                / max(1, batch_candidates),
+                1,
+            ),
+            "candidate_drops": {
+                key.removeprefix("drop_"): value
+                for key, value in (pipeline.metrics.items() if pipeline else [])
+                if key.startswith("drop_")
+            },
+            "pending_count": pipeline.pending_count() if pipeline else 0,
+            "batch_size": round(
+                self.face_counters["batch_size_total"] / max(1, batch_candidates),
+                2,
+            ),
+            "batch_wait_ms": round(
+                self.face_counters["batch_wait_ms_total"]
+                / max(1, batch_candidates),
+                1,
+            ),
+            "yunet_ms": round(
+                self.face_counters["yunet_ms_total"] / max(1, batch_candidates),
+                1,
+            ),
+            "alignment_ms": round(
+                self.face_counters["alignment_ms_total"]
+                / max(1, batch_candidates),
+                1,
+            ),
+            "embedding_ms": round(
+                self.face_counters["embedding_ms_total"]
+                / max(1, batch_candidates),
+                1,
+            ),
+            "end_to_end_ms": round(
+                self.face_counters["candidate_age_ms_total"]
+                / max(1, batch_candidates),
+                1,
+            ),
+            "first_attempt_ms": round(
+                self.face_counters["first_attempt_ms_total"]
+                / max(1, self.face_counters["first_attempt_count"]),
+                1,
+            ),
+            "confirmed_ms": round(
+                self.face_counters["confirmed_ms_total"]
+                / max(1, self.face_counters["confirmed_count"]),
+                1,
+            ),
+            "commit_state": {
+                "queued": self.face_counters["snapshot_queued"],
+                "rejected": self.face_counters["face_snapshot_rejected"],
+            },
+        }
+        logger.info("face_pipeline_metrics %s", json.dumps(structured, sort_keys=True))
         logger.info(
             "Face recognition pipeline frames=%d no_face=%d too_small=%d "
             "empty_crop=%d classifier_unavailable=%d classified=%d unknown=%d "
             "matched=%d vote_pending=%d snapshot_queued=%d snapshot_rejected=%d "
-            "stale=%d discontinuity=%d active_tracks=%d "
+            "stale_results=%d stale_frames=%d discontinuity=%d active_tracks=%d "
             "library_identities=%d training_images=%d",
             self.face_counters["frames"],
             self.face_counters["no_face"],
@@ -263,15 +339,154 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             self.face_counters["snapshot_queued"],
             self.face_counters["face_snapshot_rejected"],
             self.face_counters["stale_result"],
+            self.face_counters["stale_frame_ingest"],
             self.face_counters["face_track_discontinuity"],
             len(self.face_tracks),
             identities,
             training_images,
         )
+        for key in (
+            "batch_candidates",
+            "batch_size_total",
+            "batch_wait_ms_total",
+            "yunet_ms_total",
+            "alignment_ms_total",
+            "embedding_ms_total",
+            "candidate_age_ms_total",
+            "first_attempt_count",
+            "first_attempt_ms_total",
+            "confirmed_count",
+            "confirmed_ms_total",
+        ):
+            self.face_counters[key] = 0
         self.last_face_metrics_log = now
 
-    def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
+    def submit_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> bool:
+        """Conflate one eligible person track into the bounded face pipeline."""
+        self.face_counters["frames"] += 1
+        self.__log_pipeline_metrics()
+        self.metrics.face_rec_fps.value = self.faces_per_second.eps()
+        camera = str(obj_data["camera"])
+        if (
+            not self.config.cameras[camera].face_recognition.enabled
+            or obj_data.get("label") != "person"
+            or not obj_data.get("box")
+        ):
+            return False
+
+        event_id = str(obj_data["id"])
+        frame_time = float(obj_data["frame_time"])
+        person_box = tuple(int(value) for value in obj_data["box"])
+        key = (camera, event_id)
+        state = self.face_tracks.get(key)
+        if state is not None:
+            if frame_time <= state.last_frame_time:
+                self.face_counters["stale_frame_ingest"] += 1
+                return False
+            if is_track_discontinuity(
+                state.last_box,
+                person_box,
+                frame_time - state.last_frame_time,
+            ):
+                self.face_counters["face_track_discontinuity"] += 1
+                self.face_pipeline.expire(key)
+                state = FaceTrackState(
+                    last_frame_time=frame_time,
+                    last_box=person_box,
+                    last_snapshot_time=0,
+                    votes=[],
+                    generation=self.__next_track_generation(),
+                )
+                self.face_tracks[key] = state
+            else:
+                state.last_frame_time = frame_time
+                state.last_box = person_box
+        else:
+            state = FaceTrackState(
+                last_frame_time=frame_time,
+                last_box=person_box,
+                last_snapshot_time=0,
+                votes=[],
+                generation=self.__next_track_generation(),
+            )
+            self.face_tracks[key] = state
+
+        if frame_time - state.last_attempt_time < FACE_PROCESS_INTERVAL:
+            self.face_counters["rate_limited"] += 1
+            return False
+        if state.result_emitted:
+            if frame_time - state.last_snapshot_time < 10:
+                return False
+            state.result_emitted = False
+            state.votes.clear()
+            state.first_attempt_monotonic = 0.0
+            state.first_attempt_completed = False
+            state.first_match_monotonic.clear()
+            self.face_counters["snapshot_retry"] += 1
+        if obj_data.get("sub_label") and not state.votes:
+            return False
+        if len(state.votes) >= MAX_FACES_ATTEMPTS_AFTER_REC:
+            if obj_data.get("sub_label") or len(state.votes) >= MAX_FACE_ATTEMPTS:
+                return False
+
+        attribute_face_box: tuple[int, int, int, int] | None = None
+        if not self.requires_face_detection:
+            faces = [
+                attr
+                for attr in obj_data.get("current_attributes", [])
+                if attr.get("label") == "face" and attr.get("box")
+            ]
+            if not faces:
+                return False
+            best_face = max(faces, key=lambda attr: float(attr.get("score", 0.0)))
+            attribute_face_box = tuple(int(value) for value in best_face["box"])
+            if (
+                area(attribute_face_box)
+                < self.config.cameras[camera].face_recognition.min_area
+            ):
+                self.face_counters["too_small"] += 1
+                return False
+
+        request = FaceCaptureRequest(
+            camera=camera,
+            event_id=event_id,
+            frame_time=frame_time,
+            generation=state.generation,
+            person_box=person_box,
+            yuv_frame=frame,
+            detection_threshold=self.face_config.detection_threshold,
+            min_area=self.config.cameras[camera].face_recognition.min_area,
+            requires_face_detection=self.requires_face_detection,
+            attribute_face_box=attribute_face_box,
+            vote_count=len(state.votes),
+            created_monotonic=time.monotonic(),
+            quality=float(obj_data.get("area", area(person_box))),
+        )
+        state.last_attempt_time = frame_time
+        if state.first_attempt_monotonic == 0:
+            state.first_attempt_monotonic = request.created_monotonic
+        state.pending_frame_times.add(frame_time)
+        if len(state.pending_frame_times) > 4:
+            state.pending_frame_times = set(sorted(state.pending_frame_times)[-4:])
+        accepted = self.face_pipeline.submit(request)
+        if accepted:
+            self.face_counters["candidate_submitted"] += 1
+        return accepted
+
+    def __next_track_generation(self) -> int:
+        """Return a process-unique token, including after tracker flicker."""
+        self.face_generation_counter = getattr(self, "face_generation_counter", 0) + 1
+        return self.face_generation_counter
+
+    def process_frame(
+        self,
+        obj_data: dict[str, Any],
+        frame: np.ndarray,
+        bgr_frame: np.ndarray | None = None,
+    ) -> None:
         """Look for faces in image."""
+        if bgr_frame is None:
+            bgr_frame = getattr(self, "_shared_bgr_frame", None)
         self.face_counters["frames"] += 1
         self.__log_pipeline_metrics()
         self.metrics.face_rec_fps.value = self.faces_per_second.eps()
@@ -298,7 +513,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         track_state = self.face_tracks.get(key)
         if track_state is not None:
             if frame_time <= track_state.last_frame_time:
-                self.face_counters["stale_result"] += 1
+                self.face_counters["stale_frame_ingest"] += 1
                 return
             if is_track_discontinuity(
                 track_state.last_box,
@@ -316,6 +531,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                     last_box=person_box,
                     last_snapshot_time=0,
                     votes=[],
+                    generation=self.__next_track_generation(),
                 )
                 self.face_tracks[key] = track_state
             else:
@@ -327,6 +543,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 last_box=person_box,
                 last_snapshot_time=0,
                 votes=[],
+                generation=self.__next_track_generation(),
             )
             self.face_tracks[key] = track_state
 
@@ -336,7 +553,14 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         track_state.last_attempt_time = frame_time
 
         if track_state.result_emitted:
-            return
+            if frame_time - track_state.last_snapshot_time < 10:
+                return
+            track_state.result_emitted = False
+            track_state.votes.clear()
+            track_state.first_attempt_monotonic = 0.0
+            track_state.first_attempt_completed = False
+            track_state.first_match_monotonic.clear()
+            self.face_counters["snapshot_retry"] += 1
 
         # don't overwrite sub label for objects that have a sub label
         # that is not a face
@@ -371,7 +595,11 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 return
 
             # YuNet (cv2.FaceDetectorYN) is trained on BGR
-            bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            bgr = (
+                bgr_frame
+                if bgr_frame is not None
+                else cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            )
             left, top, right, bottom = person_box
             person = bgr[top:bottom, left:right]
             face_box = self.__detect_face(person, self.face_config.detection_threshold)
@@ -431,7 +659,11 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 logger.debug(f"Invalid face box {face}")
                 return
 
-            bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            bgr = (
+                bgr_frame
+                if bgr_frame is not None
+                else cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            )
 
             face_frame = bgr[
                 max(0, face_box[1]) : min(bgr.shape[0], face_box[3]),
@@ -468,7 +700,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             camera,
             face_frame,
             id,
-            datetime.datetime.now().timestamp(),
+            frame_time,
             sub_label,
             score,
         )
@@ -631,17 +863,120 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         return None
 
     def expire_object(self, object_id: str, camera: str) -> None:
-        self.face_tracks.pop((camera, object_id), None)
+        key = (camera, object_id)
+        self.face_tracks.pop(key, None)
+        if hasattr(self, "face_pipeline"):
+            self.face_pipeline.expire(key)
 
     def expire_missing_objects(self, camera: str, active_ids: set[str]) -> None:
         """Reconcile face state with the authoritative active detection set."""
         for key in list(self.face_tracks):
             if key[0] == camera and key[1] not in active_ids:
                 self.face_tracks.pop(key, None)
+        if hasattr(self, "face_pipeline"):
+            self.face_pipeline.expire_missing(camera, active_ids)
+
+    def _apply_recognition_outcome(self, outcome: FaceRecognitionOutcome) -> None:
+        """Apply a worker result only to the exact scheduled track generation."""
+        candidate = outcome.candidate
+        request = candidate.request
+        state = self.face_tracks.get(request.key)
+        if (
+            state is None
+            or state.generation != request.generation
+            or request.frame_time <= state.last_result_frame_time
+        ):
+            self.face_counters["stale_result"] += 1
+            return
+        state.pending_frame_times.discard(request.frame_time)
+        state.last_result_frame_time = request.frame_time
+
+        sub_label, score = outcome.sub_label, outcome.score
+        self.face_counters["classified"] += 1
+        if score <= self.face_config.unknown_score:
+            sub_label = "unknown"
+            self.face_counters["unknown"] += 1
+        else:
+            self.face_counters["matched"] += 1
+            state.first_match_monotonic.setdefault(
+                sub_label, outcome.completed_monotonic
+            )
+
+        self.queue_face_attempt(
+            request.camera,
+            candidate.face_frame,
+            request.event_id,
+            request.frame_time,
+            sub_label,
+            score,
+        )
+        state.votes.append(
+            FaceVote(sub_label, score, candidate.face_frame.shape[0] * candidate.face_frame.shape[1])
+        )
+        weighted_sub_label, weighted_score = self.weighted_average(state.votes)
+        if weighted_sub_label is None:
+            self.face_counters["vote_pending"] += 1
+        elif (
+            weighted_score >= self.face_config.recognition_threshold
+            and not state.result_emitted
+        ):
+            queued = self.face_snapshot_worker.submit(
+                request.key,
+                FaceSnapshotJob(
+                    camera=request.camera,
+                    event_id=request.event_id,
+                    frame_time=request.frame_time,
+                    person_box=request.person_box,
+                    face_box=candidate.face_box,
+                    sub_label=weighted_sub_label,
+                    face_score=weighted_score,
+                    frame=request.yuv_frame,
+                ),
+            )
+            if queued:
+                state.last_snapshot_time = request.frame_time
+                state.result_emitted = True
+                self.face_counters["snapshot_queued"] += 1
+                self.face_counters["confirmed_count"] += 1
+                self.face_counters["confirmed_ms_total"] += int(
+                    (
+                        outcome.completed_monotonic
+                        - state.first_match_monotonic.get(
+                            weighted_sub_label,
+                            state.first_attempt_monotonic,
+                        )
+                    )
+                    * 1000
+                )
+            else:
+                self.face_counters["face_snapshot_rejected"] += 1
+
+        self.face_counters["batch_candidates"] += 1
+        self.face_counters["batch_size_total"] += outcome.batch_size
+        self.face_counters["batch_wait_ms_total"] += int(outcome.batch_wait_ms)
+        self.face_counters["yunet_ms_total"] += int(candidate.capture_ms)
+        self.face_counters["alignment_ms_total"] += int(outcome.alignment_ms)
+        self.face_counters["embedding_ms_total"] += int(outcome.embedding_ms)
+        self.face_counters["candidate_age_ms_total"] += int(
+            (outcome.completed_monotonic - request.created_monotonic) * 1000
+        )
+        if not state.first_attempt_completed:
+            state.first_attempt_completed = True
+            self.face_counters["first_attempt_count"] += 1
+            self.face_counters["first_attempt_ms_total"] += int(
+                (outcome.completed_monotonic - request.created_monotonic) * 1000
+            )
+        processing_seconds = (
+            candidate.capture_ms + outcome.alignment_ms + outcome.embedding_ms
+        ) / 1000
+        self.__update_metrics(processing_seconds)
 
     def drain_results(self) -> list[dict[str, Any]]:
         """Return snapshot artifacts completed by the background worker."""
         payloads = []
+        if hasattr(self, "face_pipeline"):
+            for outcome in self.face_pipeline.drain_results():
+                self._apply_recognition_outcome(outcome)
         for result in self.face_snapshot_worker.drain_results():
             if not isinstance(result, FaceRecognitionResult):
                 continue
@@ -656,6 +991,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
 
     def shutdown(self) -> None:
         """Stop snapshot encoding during embeddings shutdown."""
+        if hasattr(self, "face_pipeline"):
+            self.face_pipeline.stop()
         self.face_snapshot_worker.stop()
         self.face_attempt_worker.stop()
 
@@ -705,16 +1042,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         if not weighted_scores:
             return None, 0.0
 
-        best_name = max(weighted_scores, key=lambda k: weighted_scores[k])
+        best_count = max(counts.values())
+        count_winners = [name for name, count in counts.items() if count == best_count]
+        if len(count_winners) != 1:
+            return None, 0.0
+        best_name = count_winners[0]
 
         # If the number of faces for this person < min_faces, we are not confident it is a correct result
         if counts[best_name] < self.face_config.min_faces:
             return None, 0.0
-
-        # If the best name has the same number of results as another name, we are not confident it is a correct result
-        for name, count in counts.items():
-            if name != best_name and counts[best_name] == count:
-                return None, 0.0
 
         weighted_average = weighted_scores[best_name] / total_weights[best_name]
 

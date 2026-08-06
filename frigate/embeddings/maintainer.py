@@ -4,7 +4,10 @@ import base64
 import datetime
 import json
 import logging
+import os
+import queue
 import threading
+from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
@@ -87,10 +90,12 @@ class EmbeddingMaintainer(threading.Thread):
         config: FrigateConfig,
         metrics: DataProcessorMetrics | None,
         stop_event: MpEvent,
+        face_result_queue: Queue,
     ) -> None:
         super().__init__(name="embeddings_maintainer")
         self.config = config
         self.metrics = metrics
+        self.face_result_queue = face_result_queue
         self.embeddings = None
         self.config_updater = CameraConfigUpdateSubscriber(
             self.config,
@@ -155,6 +160,15 @@ class EmbeddingMaintainer(threading.Thread):
         )
         self.review_subscriber = ReviewDataSubscriber("")
         self.detection_subscriber = DetectionSubscriber(DetectionTypeEnum.video.value)
+        self._latest_detection_lock = threading.Lock()
+        self._latest_detections: dict[str, Any] = {}
+        self._detection_frames_overwritten = 0
+        self._camera_cursor = 0
+        self._detection_reader = threading.Thread(
+            target=self._read_detection_updates,
+            daemon=True,
+            name="embeddings_detection_ingest",
+        )
         self.embeddings_responder = EmbeddingsResponder()
         self.frame_manager = SharedMemoryFrameManager()
 
@@ -283,6 +297,7 @@ class EmbeddingMaintainer(threading.Thread):
 
     def run(self) -> None:
         """Maintain a SQLite-vec database for semantic search."""
+        self._detection_reader.start()
         while not self.stop_event.is_set():
             self.config_updater.check_for_updates()
             self._check_enrichment_config_updates()
@@ -305,6 +320,7 @@ class EmbeddingMaintainer(threading.Thread):
         self.event_subscriber.stop()
         self.event_end_subscriber.stop()
         self.recordings_subscriber.stop()
+        self._detection_reader.join(timeout=2)
         self.detection_subscriber.stop()
         self.event_metadata_publisher.stop()
         self.event_metadata_subscriber.stop()
@@ -701,18 +717,44 @@ class EmbeddingMaintainer(threading.Thread):
                         },
                     )
 
-    def _process_frame_updates(self) -> None:
-        """Drain queued detections and process only the latest frame per camera."""
-        latest_by_camera: dict[str, Any] = {}
-        topic, data = self.detection_subscriber.check_for_update()
-        for _ in range(256):
-            if topic is None:
-                break
-            if data and data[0]:
-                latest_by_camera[str(data[0])] = data
-            topic, data = self.detection_subscriber.check_for_update(timeout=0)
+    def _read_detection_updates(self) -> None:
+        """Continuously conflate detection updates into one slot per camera."""
+        while not self.stop_event.is_set():
+            _, data = self.detection_subscriber.check_for_update(timeout=0.1)
+            if not data or not data[0]:
+                continue
+            camera = str(data[0])
+            with self._latest_detection_lock:
+                if camera in self._latest_detections:
+                    self._detection_frames_overwritten += 1
+                self._latest_detections[camera] = data
 
-        for data in latest_by_camera.values():
+    def _process_frame_updates(self) -> None:
+        """Process conflated camera frames in rotating camera order."""
+        if not hasattr(self, "_latest_detection_lock"):
+            latest_by_camera: dict[str, Any] = {}
+            topic, data = self.detection_subscriber.check_for_update(timeout=0)
+            for _ in range(256):
+                if topic is None:
+                    break
+                if data and data[0]:
+                    latest_by_camera[str(data[0])] = data
+                topic, data = self.detection_subscriber.check_for_update(timeout=0)
+            for data in latest_by_camera.values():
+                self._process_latest_frame(data)
+            return
+        with self._latest_detection_lock:
+            latest_by_camera = self._latest_detections
+            self._latest_detections = {}
+
+        cameras = sorted(latest_by_camera)
+        if not cameras:
+            return
+        start = self._camera_cursor % len(cameras)
+        ordered = cameras[start:] + cameras[:start]
+        self._camera_cursor = (start + 1) % len(cameras)
+        for camera in ordered:
+            data = latest_by_camera[camera]
             self._process_latest_frame(data)
 
     def _process_latest_frame(self, data: Any) -> None:
@@ -771,8 +813,14 @@ class EmbeddingMaintainer(threading.Thread):
                     camera, {str(obj["id"]) for obj in people}
                 )
                 people.sort(key=lambda obj: int(obj.get("area", 0)), reverse=True)
+                # One owning I420 copy is shared by the at-most-four keyed
+                # candidates. Capture workers convert only their person ROI.
+                owned_yuv_frame = yuv_frame.copy() if people else None
                 for obj in people[:4]:
-                    processor.process_frame(obj, yuv_frame)
+                    if hasattr(processor, "submit_frame"):
+                        processor.submit_frame(obj, owned_yuv_frame)
+                    else:
+                        processor.process_frame(obj, yuv_frame)
 
             if (
                 dedicated_lpr_enabled
@@ -808,10 +856,16 @@ class EmbeddingMaintainer(threading.Thread):
                             "artifact_path",
                         )
                     }
-                    self.event_metadata_publisher.publish(
-                        payload,
-                        EventMetadataTypeEnum.face_snapshot.value,
-                    )
+                    try:
+                        self.face_result_queue.put_nowait(payload)
+                    except queue.Full:
+                        logger.warning(
+                            "Dropping face snapshot because the result queue is full"
+                        )
+                        try:
+                            os.unlink(str(payload["artifact_path"]))
+                        except FileNotFoundError:
+                            pass
                     continue
 
                 if result.get("type") != "classification":

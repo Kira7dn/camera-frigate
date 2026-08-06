@@ -33,11 +33,11 @@ def test_runtime_cpu_limit_is_bounded() -> None:
 mqtt:
   enabled: false
 runtime:
-  cpu_limit: 5
+  cpu_limit: 9
 cameras: {}
 """
         )
     except ValueError as error:
         assert "cpu_limit" in str(error)
     else:
-        raise AssertionError("runtime.cpu_limit above four must be rejected")
+        raise AssertionError("runtime.cpu_limit above eight must be rejected")

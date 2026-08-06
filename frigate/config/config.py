@@ -262,7 +262,7 @@ class RuntimeDeploymentConfig(FrigateBaseModel):
 
     image: str = "camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt"
     build_base_image: str = "camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt"
-    cpu_limit: float = Field(default=4, gt=0, le=4)
+    cpu_limit: float = Field(default=4, gt=0, le=8)
     model_path: str = "models/yolov9-t-320.onnx"
     config_dir: str = "runtime/config"
     media_dir: str = "runtime/media"

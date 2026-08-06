@@ -4,9 +4,13 @@ import logging
 import os
 
 import numpy as np
+import onnxruntime as ort
 
 from frigate.const import MODEL_CACHE_DIR
-from frigate.detectors.detection_runners import get_optimized_runner
+from frigate.detectors.detection_runners import (
+    get_optimized_runner,
+    get_ort_session_options,
+)
 from frigate.embeddings.types import EnrichmentModelTypeEnum
 from frigate.log import suppress_stderr_during
 from frigate.util.downloader import ModelDownloader
@@ -152,43 +156,55 @@ class ArcfaceEmbedding(BaseEmbedding):
             if self.downloader:
                 self.downloader.wait_for_download()
 
+            session_options = get_ort_session_options() or ort.SessionOptions()
+            # The shipped model has a dynamic input but stale batch-1 output
+            # metadata. ORT otherwise emits one synchronous warning per batch.
+            session_options.log_severity_level = 3
             self.runner = get_optimized_runner(
                 os.path.join(self.download_path, self.model_file),
                 device=self.config.device or "GPU",
                 model_type=EnrichmentModelTypeEnum.arcface.value,
+                session_options=session_options,
             )
 
     def _preprocess_inputs(self, raw_inputs):
-        pil = self._process_image(self._bgr_to_rgb(raw_inputs[0]))
+        return [
+            {"data": np.expand_dims(self.preprocess_one(raw_input), axis=0)}
+            for raw_input in raw_inputs
+        ]
 
-        # handle images larger than input size
+    def preprocess_one(self, raw_input: np.ndarray) -> np.ndarray:
+        """Return one normalized CHW tensor without running GPU inference."""
+        pil = self._process_image(self._bgr_to_rgb(raw_input))
         width, height = pil.size
         if width != ARCFACE_INPUT_SIZE or height != ARCFACE_INPUT_SIZE:
             if width > height:
-                new_height = int(((height / width) * ARCFACE_INPUT_SIZE) // 4 * 4)
+                new_height = int(
+                    ((height / width) * ARCFACE_INPUT_SIZE) // 4 * 4
+                )
                 pil = pil.resize((ARCFACE_INPUT_SIZE, new_height))
             else:
-                new_width = int(((width / height) * ARCFACE_INPUT_SIZE) // 4 * 4)
+                new_width = int(
+                    ((width / height) * ARCFACE_INPUT_SIZE) // 4 * 4
+                )
                 pil = pil.resize((new_width, ARCFACE_INPUT_SIZE))
 
         og = np.array(pil).astype(np.float32)
-
-        # Image must be FACE_EMBEDDING_SIZExFACE_EMBEDDING_SIZE
         og_h, og_w, channels = og.shape
         frame = np.zeros(
             (ARCFACE_INPUT_SIZE, ARCFACE_INPUT_SIZE, channels), dtype=np.float32
         )
-
-        # compute center offset
         x_center = (ARCFACE_INPUT_SIZE - og_w) // 2
         y_center = (ARCFACE_INPUT_SIZE - og_h) // 2
-
-        # copy img image into center of result image
         frame[y_center : y_center + og_h, x_center : x_center + og_w] = og
-
-        # run arcface normalization
         frame = (frame / 127.5) - 1.0
+        return np.transpose(frame, (2, 0, 1))
 
-        frame = np.transpose(frame, (2, 0, 1))
-        frame = np.expand_dims(frame, axis=0)
-        return [{"data": frame}]
+    def embed_preprocessed(self, inputs: list[np.ndarray]) -> list[np.ndarray]:
+        """Run one dynamic GPU batch from worker-prepared CHW tensors."""
+        self._load_model_and_utils()
+        input_names = self.runner.get_input_names()
+        if len(input_names) != 1:
+            raise ValueError("ArcFace must expose exactly one tensor input")
+        outputs = self.runner.run({input_names[0]: np.stack(inputs, axis=0)})[0]
+        return [embedding for embedding in self._postprocess_outputs(outputs)]

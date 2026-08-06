@@ -14,7 +14,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from frigate.api.classification import get_faces
+from frigate.api.classification import _sanitize_face_name, get_faces
 from frigate.embeddings.maintainer import EmbeddingMaintainer, FaceRealTimeProcessor
 from frigate.events.maintainer import EventProcessor
 from frigate.track.object_processing import TrackedObjectProcessor
@@ -28,15 +28,23 @@ from frigate.util.face_snapshot import (
     SnapshotCommitJob,
     SnapshotCommitted,
     commit_snapshot_job,
+    finalize_snapshot_commit,
     is_face_identity_directory,
     is_track_discontinuity,
     is_unknown_face_attempt,
     parse_face_attempt_filename,
+    rollback_snapshot_commit,
     write_face_snapshot_artifact,
 )
 
 
 class FaceSnapshotPipelineTest(unittest.TestCase):
+    def test_reserved_and_hidden_face_names_are_rejected(self) -> None:
+        for name in ("train", "events", "staging", "face-events", ".hidden", ""):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                _sanitize_face_name(name)
+        self.assertEqual(_sanitize_face_name("Person One"), "Person_One")
+
     def test_face_library_api_exposes_only_unknown_training_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             os.makedirs(os.path.join(folder, "alice"))
@@ -371,7 +379,7 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
         processor = FaceRealTimeProcessor.__new__(FaceRealTimeProcessor)
         processed = []
         processor.face_tracks = {}
-        processor.process_frame = lambda obj, frame: processed.append(obj["id"])
+        processor.submit_frame = lambda obj, frame: processed.append(obj["id"])
         maintainer = EmbeddingMaintainer.__new__(EmbeddingMaintainer)
         people = [
             {"id": str(index), "label": "person", "box": (0, 0, 2, 2), "area": index}
@@ -520,6 +528,59 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
             self.assertLess(cv2.imread(canonical).mean(), 15)
             self.assertLess(cv2.imread(thumbnail).mean(), 25)
             self.assertFalse(os.path.exists(artifact))
+
+    def test_media_transaction_rolls_back_until_database_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            artifact = os.path.join(folder, "artifact.webp")
+            canonical = os.path.join(folder, "canonical.webp")
+            thumbnail = os.path.join(folder, "thumbnail.webp")
+            journal = os.path.join(folder, "journal")
+            cv2.imwrite(artifact, np.full((10, 10, 3), 200, dtype=np.uint8))
+            cv2.imwrite(canonical, np.full((10, 10, 3), 10, dtype=np.uint8))
+            cv2.imwrite(thumbnail, np.full((10, 10, 3), 20, dtype=np.uint8))
+            job = SnapshotCommitJob(
+                FaceRecognitionResult(
+                    **self._payload(artifact_path=artifact),
+                    transaction_id="transaction-1",
+                ),
+                canonical,
+                thumbnail,
+            )
+            with patch(
+                "frigate.util.face_snapshot.FACE_COMMIT_JOURNAL_DIR", journal
+            ):
+                completion = commit_snapshot_job(job)
+            self.assertGreater(cv2.imread(canonical).mean(), 190)
+            self.assertTrue(os.path.exists(completion.canonical_backup))
+            rollback_snapshot_commit(completion)
+            self.assertLess(cv2.imread(canonical).mean(), 15)
+            self.assertLess(cv2.imread(thumbnail).mean(), 25)
+            self.assertFalse(os.path.exists(artifact))
+
+    def test_media_transaction_finalizes_only_after_database_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            artifact = os.path.join(folder, "artifact.webp")
+            canonical = os.path.join(folder, "canonical.webp")
+            thumbnail = os.path.join(folder, "thumbnail.webp")
+            journal = os.path.join(folder, "journal")
+            cv2.imwrite(artifact, np.full((10, 10, 3), 200, dtype=np.uint8))
+            job = SnapshotCommitJob(
+                FaceRecognitionResult(
+                    **self._payload(artifact_path=artifact),
+                    transaction_id="transaction-2",
+                ),
+                canonical,
+                thumbnail,
+            )
+            with patch(
+                "frigate.util.face_snapshot.FACE_COMMIT_JOURNAL_DIR", journal
+            ):
+                completion = commit_snapshot_job(job)
+            finalize_snapshot_commit(completion)
+            self.assertTrue(os.path.exists(canonical))
+            self.assertTrue(os.path.exists(thumbnail))
+            self.assertFalse(os.path.exists(artifact))
+            self.assertFalse(os.path.exists(completion.journal_path))
 
     @staticmethod
     def _payload(frame_time: float = 10.0, artifact_path: str | None = None) -> dict:

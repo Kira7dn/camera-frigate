@@ -757,15 +757,28 @@ function TrainingGrid({
     return groups;
   }, [attemptImages]);
 
-  const eventIdsQuery = useMemo(
-    () => Object.keys(faceGroups).join(","),
+  const eventIds = useMemo(
+    () => Object.keys(faceGroups).slice(0, 200),
     [faceGroups],
   );
 
-  const { data: events } = useSWR<Event[]>([
-    "event_ids",
-    { ids: eventIdsQuery },
-  ]);
+  const { data: events } = useSWR<Event[]>(
+    eventIds.length > 0 ? ["face_event_ids", eventIds] : null,
+    async ([_key, ids]: [string, string[]]) => {
+      const batches: string[][] = [];
+      for (let index = 0; index < ids.length; index += 50) {
+        batches.push(ids.slice(index, index + 50));
+      }
+      const responses = await Promise.all(
+        batches.map((batch) =>
+          axios.get<Event[]>("/event_ids", {
+            params: { ids: batch.join(",") },
+          }),
+        ),
+      );
+      return responses.flatMap((response) => response.data);
+    },
+  );
 
   if (attemptImages.length == 0) {
     if (isLoading) {

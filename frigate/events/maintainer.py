@@ -1,5 +1,6 @@
 import logging
 import os
+import queue
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -29,6 +30,9 @@ from frigate.util.face_snapshot import (
     SnapshotFailed,
     cleanup_paths,
     commit_snapshot_job,
+    finalize_snapshot_commit,
+    load_snapshot_journal,
+    rollback_snapshot_commit,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,12 +95,18 @@ class EventProcessor(threading.Thread):
         config: FrigateConfig,
         timeline_queue: Queue,
         stop_event: MpEvent,
+        face_commit_queue: Any | None = None,
+        face_completion_queue: Any | None = None,
+        event_update_queue: Any | None = None,
     ):
         super().__init__(name="event_processor")
         self.config = config
         self.timeline_queue = timeline_queue
         self.events_in_process: dict[str, dict[str, Any]] = {}
         self.stop_event = stop_event
+        self.face_commit_queue = face_commit_queue or Queue(maxsize=4)
+        self.face_completion_queue = face_completion_queue or Queue(maxsize=8)
+        self.event_update_queue = event_update_queue
 
         self.event_receiver = EventUpdateSubscriber()
         self.event_end_publisher = EventEndPublisher()
@@ -113,20 +123,38 @@ class EventProcessor(threading.Thread):
         ] = OrderedDict()
         self.face_snapshot_metrics: Counter[str] = Counter()
         self.face_snapshot_states: dict[tuple[str, str], str] = {}
+        self.face_transactions_in_progress: set[str] = set()
+        self.deferred_face_completions: OrderedDict[
+            tuple[str, str, float], dict[str, Any]
+        ] = OrderedDict()
         self.last_face_metrics_log = time.monotonic()
+        self.recovered_face_commits = load_snapshot_journal()
 
     def run(self) -> None:
-        # set an end_time on events without an end_time on startup
-        Event.update(end_time=Event.start_time + 30).where(
-            Event.end_time == None
-        ).execute()
+        # A crash has no final end message. Close recovered events at their
+        # last persisted observation instead of inventing a fixed duration.
+        for open_event in Event.select().where(Event.end_time == None):
+            last_seen = float(
+                (open_event.data or {}).get(
+                    "last_seen_frame_time", open_event.start_time + 30
+                )
+            )
+            open_event.end_time = max(open_event.start_time, last_seen)
+            open_event.save(only=[Event.end_time])
 
         while not self.stop_event.is_set():
+            self._flush_face_completions()
             self._drain_face_snapshot_requests()
             self._retry_deferred_face_jobs()
             self._apply_snapshot_completions()
             self._log_face_snapshot_metrics()
-            update = self.event_receiver.check_for_update(timeout=1)
+            if self.event_update_queue is None:
+                update = self.event_receiver.check_for_update(timeout=1)
+            else:
+                try:
+                    update = self.event_update_queue.get(timeout=0.25)
+                except queue.Empty:
+                    update = None
 
             if update == None:
                 continue
@@ -183,6 +211,21 @@ class EventProcessor(threading.Thread):
         logger.info("Exiting event processor...")
 
     def _drain_face_snapshot_requests(self) -> None:
+        face_commit_queue = getattr(self, "face_commit_queue", None)
+        if face_commit_queue is not None:
+            while True:
+                try:
+                    item = face_commit_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item.get("type") == "cleanup":
+                    paths = tuple(str(path) for path in item.get("paths", []))
+                    if not self.face_snapshot_worker.submit_control(CleanupJob(paths)):
+                        cleanup_paths(CleanupJob(paths))
+                    self.face_snapshot_metrics["released"] += len(paths)
+                elif item.get("type") == "commit":
+                    self._accept_snapshot_payload(item.get("payload", {}))
+
         while True:
             update = self.face_snapshot_receiver.check_for_update(timeout=0)
             if not update:
@@ -192,7 +235,8 @@ class EventProcessor(threading.Thread):
                 return
             if topic.endswith(EventMetadataTypeEnum.face_snapshot_cleanup.value):
                 paths = tuple(str(path) for path in payload.get("paths", []))
-                self.face_snapshot_worker.submit_control(CleanupJob(paths))
+                if not self.face_snapshot_worker.submit_control(CleanupJob(paths)):
+                    cleanup_paths(CleanupJob(paths))
                 self.face_snapshot_metrics["released"] += len(paths)
             elif topic.endswith(EventMetadataTypeEnum.face_snapshot_commit.value):
                 self._accept_snapshot_payload(payload)
@@ -208,10 +252,18 @@ class EventProcessor(threading.Thread):
                 sub_label=str(payload["sub_label"]),
                 face_score=float(payload["face_score"]),
                 artifact_path=os.path.abspath(str(payload["artifact_path"])),
+                transaction_id=str(payload.get("transaction_id", "")),
             )
         except (KeyError, TypeError, ValueError):
             logger.warning("Ignoring malformed face snapshot commit request")
             self.face_snapshot_metrics["rejected"] += 1
+            return
+        transactions = getattr(self, "face_transactions_in_progress", None)
+        if transactions is None:
+            transactions = set()
+            self.face_transactions_in_progress = transactions
+        if result.transaction_id and result.transaction_id in transactions:
+            self.face_snapshot_metrics["duplicate"] += 1
             return
         staging_dir = os.path.abspath(FACE_EVENT_STAGING_DIR)
         if (
@@ -232,6 +284,8 @@ class EventProcessor(threading.Thread):
                 THUMB_DIR, result.camera, f"{result.event_id}.webp"
             ),
         )
+        if result.transaction_id:
+            transactions.add(result.transaction_id)
         self.face_snapshot_states[result.key] = "pending"
         self._submit_or_defer_snapshot(job)
 
@@ -290,7 +344,11 @@ class EventProcessor(threading.Thread):
             self._submit_or_defer_snapshot(job)
 
     def _apply_snapshot_completions(self) -> None:
-        for completion in self.face_snapshot_worker.drain_results():
+        completions = getattr(
+            self, "recovered_face_commits", []
+        ) + self.face_snapshot_worker.drain_results()
+        self.recovered_face_commits = []
+        for completion in completions:
             if isinstance(completion, SnapshotFailed):
                 self.face_snapshot_metrics["failed"] += 1
                 self._publish_snapshot_completion(
@@ -303,32 +361,38 @@ class EventProcessor(threading.Thread):
             try:
                 event = Event.get(Event.id == result.event_id)
             except Event.DoesNotExist:
-                cleanup_paths(
-                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
-                )
+                rollback_snapshot_commit(completion)
                 self.face_snapshot_metrics["rejected"] += 1
                 self._publish_snapshot_completion(result, "failed", "event_not_found")
                 continue
             if event.camera != result.camera:
-                cleanup_paths(
-                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
-                )
+                rollback_snapshot_commit(completion)
                 self.face_snapshot_metrics["camera_mismatch"] += 1
                 self._publish_snapshot_completion(result, "failed", "camera_mismatch")
                 continue
             data = event.data or {}
             if float(data.get("face_snapshot_frame_time", 0) or 0) >= result.frame_time:
-                cleanup_paths(
-                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
-                )
+                if (
+                    float(data.get("face_snapshot_frame_time", 0) or 0)
+                    == result.frame_time
+                    and data.get("face_snapshot_sub_label") == result.sub_label
+                ):
+                    finalize_snapshot_commit(completion)
+                    self.face_snapshot_metrics["recovered"] += 1
+                    self._publish_snapshot_completion(
+                        result,
+                        "committed",
+                        canonical_path=completion.canonical_path,
+                        thumbnail_path=completion.thumbnail_path,
+                    )
+                    continue
+                rollback_snapshot_commit(completion)
                 self.face_snapshot_metrics["stale_result"] += 1
                 self._publish_snapshot_completion(result, "failed", "stale")
                 continue
             camera_config = self.config.cameras.get(result.camera)
             if camera_config is None:
-                cleanup_paths(
-                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
-                )
+                rollback_snapshot_commit(completion)
                 self.face_snapshot_metrics["rejected"] += 1
                 self._publish_snapshot_completion(
                     result, "failed", "camera_not_configured"
@@ -337,9 +401,7 @@ class EventProcessor(threading.Thread):
             width = camera_config.detect.width
             height = camera_config.detect.height
             if width is None or height is None:
-                cleanup_paths(
-                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
-                )
+                rollback_snapshot_commit(completion)
                 self.face_snapshot_metrics["rejected"] += 1
                 self._publish_snapshot_completion(
                     result, "failed", "detect_dimensions_unavailable"
@@ -371,8 +433,10 @@ class EventProcessor(threading.Thread):
                     "Unable to save face snapshot metadata for %s", result.event_id
                 )
                 self.face_snapshot_metrics["failed"] += 1
+                rollback_snapshot_commit(completion)
                 self._publish_snapshot_completion(result, "failed", "database")
                 continue
+            finalize_snapshot_commit(completion)
             self.face_snapshot_metrics["committed"] += 1
             self._publish_snapshot_completion(
                 result,
@@ -407,6 +471,9 @@ class EventProcessor(threading.Thread):
         if not hasattr(self, "face_snapshot_states"):
             self.face_snapshot_states = {}
         self.face_snapshot_states[result.key] = status
+        transactions = getattr(self, "face_transactions_in_progress", None)
+        if transactions is not None and result.transaction_id:
+            transactions.discard(result.transaction_id)
         payload = {
             **result.as_payload(),
             "status": status,
@@ -415,11 +482,28 @@ class EventProcessor(threading.Thread):
             "thumbnail_path": thumbnail_path,
         }
         publisher = getattr(self, "face_snapshot_publisher", None)
+        completion_queue = getattr(self, "face_completion_queue", None)
+        if completion_queue is not None:
+            try:
+                completion_queue.put_nowait(payload)
+            except queue.Full:
+                deferred = getattr(self, "deferred_face_completions", None)
+                if deferred is not None:
+                    deferred[(result.camera, result.event_id, result.frame_time)] = payload
         if publisher is not None:
             publisher.publish(
                 payload, EventMetadataTypeEnum.face_snapshot_committed.value
             )
         self.face_snapshot_states.pop(result.key, None)
+
+    def _flush_face_completions(self) -> None:
+        """Retry reliable acknowledgements without blocking event persistence."""
+        for key, payload in list(self.deferred_face_completions.items()):
+            try:
+                self.face_completion_queue.put_nowait(payload)
+            except queue.Full:
+                return
+            self.deferred_face_completions.pop(key, None)
 
     def _drop_snapshot_job(self, job: SnapshotCommitJob | CleanupJob) -> None:
         if isinstance(job, CleanupJob):
@@ -580,6 +664,11 @@ class EventProcessor(threading.Thread):
                     "type": "object",
                     "max_severity": event_data.get("max_severity"),
                     "path_data": event_data.get("path_data"),
+                    "last_seen_frame_time": float(
+                        event_data.get("frame_time")
+                        or event_data.get("end_time")
+                        or event_data["start_time"]
+                    ),
                 },
             }
 

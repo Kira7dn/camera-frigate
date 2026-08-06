@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
@@ -67,12 +68,23 @@ class TrackedObjectProcessor(threading.Thread):
         tracked_objects_queue: MpQueue,
         ptz_autotracker_thread: PtzAutoTrackerThread,
         stop_event: MpEvent,
+        face_result_queue: Any | None = None,
+        face_commit_queue: Any | None = None,
+        face_completion_queue: Any | None = None,
+        event_update_queue: Any | None = None,
     ) -> None:
         super().__init__(name="detected_frames_processor")
         self.config = config
         self.dispatcher = dispatcher
         self.tracked_objects_queue = tracked_objects_queue
         self.stop_event: MpEvent = stop_event
+        self.face_result_queue = face_result_queue or MpQueue(maxsize=4)
+        self.face_commit_queue = face_commit_queue or MpQueue(maxsize=4)
+        self.face_completion_queue = face_completion_queue or MpQueue(maxsize=8)
+        self.event_update_queue = event_update_queue
+        self.face_pending: dict[
+            tuple[str, str], tuple[float, FaceRecognitionResult, int]
+        ] = {}
         self.camera_states: dict[str, CameraState] = {}
         self.frame_manager = SharedMemoryFrameManager()
         self.last_motion_detected: dict[str, float] = {}
@@ -123,7 +135,7 @@ class TrackedObjectProcessor(threading.Thread):
         """Creates a new camera state."""
 
         def start(camera: str, obj: TrackedObject, frame_name: str) -> None:
-            self.event_sender.publish(
+            self._publish_event_update(
                 (
                     EventTypeEnum.tracked_object,
                     EventStateEnum.start,
@@ -146,7 +158,7 @@ class TrackedObjectProcessor(threading.Thread):
             }
             self.dispatcher.publish("events", json.dumps(message), retain=False)
             obj.previous = after
-            self.event_sender.publish(
+            self._publish_event_update(
                 (
                     EventTypeEnum.tracked_object,
                     EventStateEnum.update,
@@ -186,7 +198,7 @@ class TrackedObjectProcessor(threading.Thread):
                 self.dispatcher.publish("events", json.dumps(message), retain=False)
                 self.ptz_autotracker_thread.ptz_autotracker.end_object(camera, obj)
 
-            self.event_sender.publish(
+            self._publish_event_update(
                 (
                     EventTypeEnum.tracked_object,
                     EventStateEnum.end,
@@ -525,6 +537,7 @@ class TrackedObjectProcessor(threading.Thread):
             "current_estimated_speed": 0,
             "face_score": float(payload["face_score"]),
             "sub_label": str(payload["sub_label"]),
+            "transaction_id": str(payload.get("transaction_id", "")),
         }
         result = FaceRecognitionResult(
             camera=camera,
@@ -535,6 +548,7 @@ class TrackedObjectProcessor(threading.Thread):
             sub_label=str(payload["sub_label"]),
             face_score=float(payload["face_score"]),
             artifact_path=artifact_path,
+            transaction_id=str(payload.get("transaction_id", "")),
         )
 
         tracked_obj: TrackedObject | None = None
@@ -560,6 +574,13 @@ class TrackedObjectProcessor(threading.Thread):
                 tracked_obj.face_snapshot_state = "failed"
                 self._queue_face_cleanup(artifact_path)
                 return
+            if not hasattr(self, "face_pending"):
+                self.face_pending = {}
+            self.face_pending[(camera, event_id)] = (
+                time.monotonic() + 10,
+                result,
+                0,
+            )
             logger.debug(
                 "Face snapshot commit pending for active event %s at frame %.3f",
                 event_id,
@@ -570,6 +591,14 @@ class TrackedObjectProcessor(threading.Thread):
         if not self._queue_face_commit(result):
             logger.warning("Face snapshot media queue full for %s", event_id)
             self._queue_face_cleanup(artifact_path)
+        else:
+            if not hasattr(self, "face_pending"):
+                self.face_pending = {}
+            self.face_pending[(camera, event_id)] = (
+                time.monotonic() + 10,
+                result,
+                0,
+            )
 
     def apply_face_snapshot_completion(self, payload: dict[str, Any]) -> None:
         """Publish identity only after canonical media and DB are complete."""
@@ -581,6 +610,7 @@ class TrackedObjectProcessor(threading.Thread):
         except (KeyError, TypeError, ValueError):
             return
         state = self.camera_states.get(camera)
+        getattr(self, "face_pending", {}).pop((camera, event_id), None)
         tracked_obj = state.tracked_objects.get(event_id) if state else None
         if tracked_obj is None or tracked_obj.face_snapshot is None:
             return
@@ -627,20 +657,94 @@ class TrackedObjectProcessor(threading.Thread):
             sub_label=str(snapshot["sub_label"]),
             face_score=float(snapshot["face_score"]),
             artifact_path=str(snapshot["path"]),
+            transaction_id=str(snapshot.get("transaction_id", "")),
         )
 
     def _queue_face_commit(self, result: FaceRecognitionResult) -> bool:
-        self.face_media_publisher.publish(
-            result.as_payload(),
-            EventMetadataTypeEnum.face_snapshot_commit.value,
-        )
-        return True
+        face_commit_queue = getattr(self, "face_commit_queue", None)
+        if face_commit_queue is None:
+            self.face_media_publisher.publish(
+                result.as_payload(),
+                EventMetadataTypeEnum.face_snapshot_commit.value,
+            )
+            return True
+        try:
+            face_commit_queue.put_nowait(
+                {"type": "commit", "payload": result.as_payload()}
+            )
+            return True
+        except queue.Full:
+            return False
+
+    def _publish_event_update(self, payload: Any) -> None:
+        """Send canonical persistence through a bounded reliable queue."""
+        event_update_queue = getattr(self, "event_update_queue", None)
+        if event_update_queue is not None:
+            try:
+                event_update_queue.put(payload, timeout=0.25)
+            except queue.Full:
+                event_state = payload[1] if len(payload) > 1 else None
+                if event_state in (EventStateEnum.start, EventStateEnum.end):
+                    while not self.stop_event.is_set():
+                        try:
+                            event_update_queue.put(payload, timeout=0.25)
+                            break
+                        except queue.Full:
+                            continue
+                else:
+                    logger.warning("Dropping coalescible event update from full queue")
+        self.event_sender.publish(payload)
 
     def _queue_face_cleanup(self, *paths: str) -> None:
-        self.face_media_publisher.publish(
-            {"paths": paths},
-            EventMetadataTypeEnum.face_snapshot_cleanup.value,
-        )
+        face_commit_queue = getattr(self, "face_commit_queue", None)
+        if face_commit_queue is None:
+            self.face_media_publisher.publish(
+                {"paths": paths},
+                EventMetadataTypeEnum.face_snapshot_cleanup.value,
+            )
+            return
+        try:
+            face_commit_queue.put_nowait({"type": "cleanup", "paths": paths})
+        except queue.Full:
+            for path in paths:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    def _drain_face_lifecycle_queues(self) -> None:
+        """Apply reliable face candidates and commit acknowledgements."""
+        while True:
+            try:
+                payload = self.face_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.set_face_snapshot(payload)
+        while True:
+            try:
+                payload = self.face_completion_queue.get_nowait()
+            except queue.Empty:
+                break
+            self.apply_face_snapshot_completion(payload)
+
+    def _expire_face_pending(self) -> None:
+        """Retry one missing acknowledgement, then restore tracking fallback."""
+        now = time.monotonic()
+        for key, (deadline, result, retries) in list(self.face_pending.items()):
+            if now < deadline:
+                continue
+            if retries == 0 and self._queue_face_commit(result):
+                self.face_pending[key] = (now + 10, result, 1)
+                continue
+            camera, event_id = key
+            state = self.camera_states.get(camera)
+            tracked_obj = state.tracked_objects.get(event_id) if state else None
+            if tracked_obj is not None and tracked_obj.face_snapshot_state == "pending":
+                tracked_obj.face_snapshot = None
+                tracked_obj.face_snapshot_state = "failed"
+                tracked_obj.has_snapshot = self.should_save_snapshot(camera, tracked_obj)
+            self._queue_face_cleanup(result.artifact_path)
+            self.face_pending.pop(key, None)
 
     def set_object_attribute(
         self,
@@ -722,7 +826,7 @@ class TrackedObjectProcessor(threading.Thread):
         )
 
         # send event to event maintainer
-        self.event_sender.publish(
+        self._publish_event_update(
             (
                 EventTypeEnum.api,
                 EventStateEnum.start,
@@ -780,7 +884,7 @@ class TrackedObjectProcessor(threading.Thread):
         ) = payload
 
         # send event to event maintainer
-        self.event_sender.publish(
+        self._publish_event_update(
             (
                 EventTypeEnum.api,
                 EventStateEnum.start,
@@ -824,7 +928,7 @@ class TrackedObjectProcessor(threading.Thread):
     def end_manual_event(self, payload: tuple) -> None:
         (event_id, end_time) = payload
 
-        self.event_sender.publish(
+        self._publish_event_update(
             (
                 EventTypeEnum.api,
                 EventStateEnum.end,
@@ -869,6 +973,8 @@ class TrackedObjectProcessor(threading.Thread):
 
     def run(self) -> None:
         while not self.stop_event.is_set():
+            self._drain_face_lifecycle_queues()
+            self._expire_face_pending()
             # check for config updates
             updated_topics = self.camera_config_subscriber.check_for_updates()
 

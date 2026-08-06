@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import threading
+from multiprocessing import Queue
 from json.decoder import JSONDecodeError
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
@@ -35,6 +36,7 @@ class EmbeddingProcess(FrigateProcess):
         config: FrigateConfig,
         metrics: DataProcessorMetrics | None,
         stop_event: MpEvent,
+        face_result_queue: Queue,
     ) -> None:
         super().__init__(
             stop_event,
@@ -44,6 +46,7 @@ class EmbeddingProcess(FrigateProcess):
         )
         self.config = config
         self.metrics = metrics
+        self.face_result_queue = face_result_queue
 
     def run(self) -> None:
         self.pre_run_setup(self.config.logger)
@@ -51,6 +54,7 @@ class EmbeddingProcess(FrigateProcess):
             self.config,
             self.metrics,
             self.stop_event,
+            self.face_result_queue,
         )
         maintainer.start()
         maintainer.join()

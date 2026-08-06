@@ -30,7 +30,6 @@ from frigate.api.defs.response.classification_response import (
 from frigate.api.defs.response.generic_response import GenericResponse
 from frigate.api.defs.tags import Tags
 from frigate.config import FrigateConfig
-from frigate.config.camera import DetectConfig
 from frigate.config.classification import ObjectClassificationType
 from frigate.const import CLIPS_DIR, FACE_DIR, MODEL_CACHE_DIR
 from frigate.embeddings import EmbeddingsContext
@@ -44,6 +43,7 @@ from frigate.util.classification import (
 )
 from frigate.util.file import get_event_snapshot
 from frigate.util.face_snapshot import (
+    EXCLUDED_FACE_DIRECTORIES,
     is_face_identity_directory,
     is_unknown_face_attempt,
     parse_face_attempt_filename,
@@ -52,6 +52,18 @@ from frigate.util.face_snapshot import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=[Tags.classification])
+
+
+def _sanitize_face_name(name: str) -> str:
+    """Return a public face identity name or reject a reserved directory."""
+    sanitized = sanitize_filename(name.replace(" ", "_"))
+    if (
+        not sanitized
+        or sanitized.startswith(".")
+        or sanitized.lower() in EXCLUDED_FACE_DIRECTORIES
+    ):
+        raise ValueError("Invalid or reserved face name")
+    return sanitized
 
 
 def _identified_face_event_ids(event_ids: set[str]) -> set[str]:
@@ -171,6 +183,7 @@ def reclassify_face(request: Request, body: dict = None):
 @router.post(
     "/faces/train/{name}/classify",
     response_model=GenericResponse,
+    dependencies=[Depends(require_role(["admin"]))],
     summary="Classify and save a face training image",
     description="""Adds a training image to a specific face name for face recognition.
     Accepts either a training file from the train directory or an event_id to extract
@@ -213,7 +226,13 @@ def train_face(request: Request, name: str, body: dict = None):
             status_code=404,
         )
 
-    sanitized_name = sanitize_filename(name)
+    try:
+        sanitized_name = _sanitize_face_name(name)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Invalid or reserved face name."},
+        )
     new_name = f"{sanitized_name}-{datetime.datetime.now().timestamp()}.webp"
     new_file_folder = os.path.join(FACE_DIR, f"{sanitized_name}")
 
@@ -236,25 +255,30 @@ def train_face(request: Request, name: str, body: dict = None):
             )
 
         snapshot = get_event_snapshot(event)
-        face_box = event.data["attributes"][0]["box"]
-        detect_config: DetectConfig = request.app.frigate_config.cameras[
-            event.camera
-        ].detect
+        data = event.data or {}
+        face_box = data.get("face_box")
+        if not face_box:
+            attributes = data.get("attributes") or []
+            face_box = attributes[0].get("box") if attributes else None
 
-        # crop onto the face box minus the bounding box itself
-        x1 = int(face_box[0] * detect_config.width) + 2
-        y1 = int(face_box[1] * detect_config.height) + 2
-        x2 = x1 + int(face_box[2] * detect_config.width) - 4
-        y2 = y1 + int(face_box[3] * detect_config.height) - 4
-        face = snapshot[y1:y2, x1:x2]
-        success = True
-
-        if face.size > 0:
-            try:
-                cv2.imwrite(os.path.join(new_file_folder, new_name), face)
-                success = True
-            except Exception:
-                pass
+        success = False
+        if snapshot is not None and face_box and len(face_box) == 4:
+            height, width = snapshot.shape[:2]
+            x1 = max(0, int(float(face_box[0]) * width) + 2)
+            y1 = max(0, int(float(face_box[1]) * height) + 2)
+            x2 = min(width, int(float(face_box[2]) * width) - 2)
+            y2 = min(height, int(float(face_box[3]) * height) - 2)
+            if x2 > x1 and y2 > y1:
+                face = snapshot[y1:y2, x1:x2]
+                if face.size > 0:
+                    try:
+                        success = bool(
+                            cv2.imwrite(
+                                os.path.join(new_file_folder, new_name), face
+                            )
+                        )
+                    except cv2.error:
+                        logger.exception("Unable to write face training image")
 
         if not success:
             return JSONResponse(
@@ -298,12 +322,17 @@ async def create_face(request: Request, name: str):
             content={"message": "Face recognition is not enabled.", "success": False},
         )
 
-    os.makedirs(
-        os.path.join(FACE_DIR, sanitize_filename(name.replace(" ", "_"))), exist_ok=True
-    )
+    try:
+        sanitized_name = _sanitize_face_name(name)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Invalid or reserved face name."},
+        )
+    os.makedirs(os.path.join(FACE_DIR, sanitized_name), exist_ok=True)
     return JSONResponse(
         status_code=200,
-        content={"success": False, "message": "Successfully created face folder."},
+        content={"success": True, "message": "Successfully created face folder."},
     )
 
 
@@ -324,8 +353,20 @@ def register_face(request: Request, name: str, file: UploadFile):
             content={"message": "Face recognition is not enabled.", "success": False},
         )
 
+    try:
+        sanitized_name = _sanitize_face_name(name)
+    except ValueError:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Invalid or reserved face name."},
+        )
+
     context: EmbeddingsContext = request.app.embeddings
-    result = None if context is None else context.register_face(name, file.file.read())
+    result = (
+        None
+        if context is None
+        else context.register_face(sanitized_name, file.file.read())
+    )
 
     if not isinstance(result, dict):
         return JSONResponse(
