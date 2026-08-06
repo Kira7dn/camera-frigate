@@ -223,7 +223,8 @@ export default function ReviewCard({
                 ]),
               ]
                 .filter(
-                  (item) => item !== undefined && !item.includes("-verified"),
+                  (item): item is string =>
+                    typeof item === "string" && !item.includes("-verified"),
                 )
                 .map((text) => getTranslatedLabel(text, getEventType(text)))
                 .sort(),

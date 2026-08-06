@@ -6,7 +6,8 @@ import json
 import logging
 import os
 import shutil
-from pathlib import Path
+import time
+from collections import Counter
 from typing import Any
 
 import cv2
@@ -27,6 +28,18 @@ from frigate.data_processing.common.face.model import (
 )
 from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
+from frigate.util.face_snapshot import (
+    FaceAttemptJob,
+    FaceRecognitionResult,
+    FaceSnapshotJob,
+    FaceTrackState,
+    FaceVote,
+    LatestPerObjectWorker,
+    is_track_discontinuity,
+    reap_stale_staging,
+    write_face_attempt,
+    write_face_snapshot_artifact,
+)
 from frigate.util.image import area
 
 from ..types import DataProcessorMetrics
@@ -38,6 +51,7 @@ logger = logging.getLogger(__name__)
 MAX_DETECTION_HEIGHT = 1080
 MAX_FACES_ATTEMPTS_AFTER_REC = 6
 MAX_FACE_ATTEMPTS = 12
+FACE_METRICS_LOG_INTERVAL = 30
 
 
 class FaceRealTimeProcessor(RealTimeProcessorApi):
@@ -54,10 +68,21 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.sub_label_publisher = sub_label_publisher
         self.face_detector: cv2.FaceDetectorYN | None = None
         self.requires_face_detection = "face" not in self.config.objects.all_objects
-        self.person_face_history: dict[str, list[tuple[str, float, int]]] = {}
-        self.camera_current_people: dict[str, list[str]] = {}
-        self.person_face_boxes: dict[str, tuple[tuple[int, int, int, int], float]] = {}
-        self.face_snapshot_frames: dict[str, float] = {}
+        self.face_tracks: dict[tuple[str, str], FaceTrackState] = {}
+        self.face_counters: Counter[str] = Counter()
+        self.last_face_metrics_log = time.monotonic()
+        removed = reap_stale_staging(FACE_DIR)
+        if removed:
+            logger.info("Removed %d stale face staging artifacts", removed)
+        self.face_snapshot_worker = LatestPerObjectWorker(
+            lambda job: write_face_snapshot_artifact(job, FACE_DIR),
+            max_objects=4,
+        )
+        self.face_attempt_worker = LatestPerObjectWorker(
+            write_face_attempt,
+            max_objects=4,
+            name="face_attempt_worker",
+        )
         self.recognizer: FaceRecognizer
         self.faces_per_second = EventsPerSecond()
         self.inference_speed = InferenceSpeed(self.metrics.face_rec_speed)
@@ -96,6 +121,22 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             self.recognizer = ArcFaceRecognizer(self.config)
 
         self.recognizer.build()
+        identities, training_images = self.__face_library_stats()
+        logger.info(
+            "Face recognition initialized model=%s device=%s "
+            "library_identities=%d training_images=%d face_dir=%s",
+            self.face_config.model_size,
+            self.face_config.device,
+            identities,
+            training_images,
+            FACE_DIR,
+        )
+        if identities == 0 or training_images == 0:
+            logger.warning(
+                "Face recognition library is empty; detected faces cannot be "
+                "matched until training images are added under %s/<identity>",
+                FACE_DIR,
+            )
 
     CONFIG_UPDATE_TOPIC = "config/face_recognition"
 
@@ -179,8 +220,59 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.faces_per_second.update()
         self.inference_speed.update(duration)
 
+    def __face_library_stats(self) -> tuple[int, int]:
+        identities = 0
+        training_images = 0
+        try:
+            for name in os.listdir(FACE_DIR):
+                identity_dir = os.path.join(FACE_DIR, name)
+                if name == "train" or not os.path.isdir(identity_dir):
+                    continue
+                images = sum(
+                    os.path.isfile(os.path.join(identity_dir, file_name))
+                    for file_name in os.listdir(identity_dir)
+                )
+                if images:
+                    identities += 1
+                    training_images += images
+        except OSError as error:
+            logger.warning("Unable to inspect face recognition library: %s", error)
+        return identities, training_images
+
+    def __log_pipeline_metrics(self) -> None:
+        now = time.monotonic()
+        if now - self.last_face_metrics_log < FACE_METRICS_LOG_INTERVAL:
+            return
+        identities, training_images = self.__face_library_stats()
+        logger.info(
+            "Face recognition pipeline frames=%d no_face=%d too_small=%d "
+            "empty_crop=%d classifier_unavailable=%d classified=%d unknown=%d "
+            "matched=%d vote_pending=%d snapshot_queued=%d snapshot_rejected=%d "
+            "stale=%d discontinuity=%d active_tracks=%d "
+            "library_identities=%d training_images=%d",
+            self.face_counters["frames"],
+            self.face_counters["no_face"],
+            self.face_counters["too_small"],
+            self.face_counters["empty_crop"],
+            self.face_counters["classifier_unavailable"],
+            self.face_counters["classified"],
+            self.face_counters["unknown"],
+            self.face_counters["matched"],
+            self.face_counters["vote_pending"],
+            self.face_counters["snapshot_queued"],
+            self.face_counters["face_snapshot_rejected"],
+            self.face_counters["stale_result"],
+            self.face_counters["face_track_discontinuity"],
+            len(self.face_tracks),
+            identities,
+            training_images,
+        )
+        self.last_face_metrics_log = now
+
     def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
         """Look for faces in image."""
+        self.face_counters["frames"] += 1
+        self.__log_pipeline_metrics()
         self.metrics.face_rec_fps.value = self.faces_per_second.eps()
         camera = obj_data["camera"]
 
@@ -191,6 +283,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         start = datetime.datetime.now().timestamp()
         id = obj_data["id"]
         frame_time = float(obj_data["frame_time"])
+        key = (camera, id)
 
         # don't run for non person objects
         if obj_data.get("label") != "person":
@@ -201,31 +294,74 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         # the tracker jumps to a different person, discard the old voting
         # history before processing the new crop.
         person_box = tuple(int(v) for v in obj_data["box"])
-        previous_box = self.person_face_boxes.get(id)
-        if previous_box is not None:
-            old_box, old_frame_time = previous_box
-            if frame_time <= old_frame_time:
-                logger.debug("Ignoring stale face frame for %s", id)
+        track_state = self.face_tracks.get(key)
+        if track_state is not None:
+            if frame_time <= track_state.last_frame_time:
+                self.face_counters["stale_result"] += 1
                 return
-            if self._is_track_discontinuity(old_box, person_box, frame_time - old_frame_time):
-                logger.info("Resetting face history after track discontinuity for %s", id)
-                self.person_face_history.pop(id, None)
-                self.face_snapshot_frames.pop(id, None)
-        self.person_face_boxes[id] = (person_box, frame_time)
+            if is_track_discontinuity(
+                track_state.last_box,
+                person_box,
+                frame_time - track_state.last_frame_time,
+            ):
+                self.face_counters["face_track_discontinuity"] += 1
+                logger.info(
+                    "Resetting face history after track discontinuity for %s/%s",
+                    camera,
+                    id,
+                )
+                track_state = FaceTrackState(
+                    last_frame_time=frame_time,
+                    last_box=person_box,
+                    last_snapshot_time=0,
+                    votes=[],
+                )
+                self.face_tracks[key] = track_state
+                # Clear the previous face-derived identity before evaluating
+                # the new track segment. The current obj_data is a local event
+                # copy, so clearing it also prevents the non-face guard below
+                # from preserving the old person on this frame.
+                obj_data["sub_label"] = None
+                self.sub_label_publisher.publish(
+                    (id, None, None),
+                    EventMetadataTypeEnum.sub_label.value,
+                )
+                self.requestor.send_data(
+                    "tracked_object_update",
+                    json.dumps(
+                        {
+                            "type": TrackedObjectUpdateTypesEnum.face,
+                            "name": None,
+                            "score": 0.0,
+                            "id": id,
+                            "camera": camera,
+                            "timestamp": frame_time,
+                            "source_frame_time": frame_time,
+                        }
+                    ),
+                )
+            else:
+                track_state.last_frame_time = frame_time
+                track_state.last_box = person_box
+        else:
+            track_state = FaceTrackState(
+                last_frame_time=frame_time,
+                last_box=person_box,
+                last_snapshot_time=0,
+                votes=[],
+            )
+            self.face_tracks[key] = track_state
 
         # don't overwrite sub label for objects that have a sub label
         # that is not a face
-        if obj_data.get("sub_label") and id not in self.person_face_history:
+        if obj_data.get("sub_label") and not track_state.votes:
             logger.debug(
                 f"Not processing face due to existing sub label: {obj_data.get('sub_label')}."
             )
             return
 
         # check if we have hit limits
-        if (
-            id in self.person_face_history
-            and len(self.person_face_history[id]) >= MAX_FACES_ATTEMPTS_AFTER_REC
-        ):
+        if len(track_state.votes) >= MAX_FACES_ATTEMPTS_AFTER_REC:
             # if we are at max attempts after rec and we have a rec
             if obj_data.get("sub_label"):
                 logger.debug(
@@ -234,7 +370,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 return
 
             # if we don't have a rec and are at max attempts
-            if len(self.person_face_history[id]) >= MAX_FACE_ATTEMPTS:
+            if len(track_state.votes) >= MAX_FACE_ATTEMPTS:
                 logger.debug("Not processing due to hitting max rec attempts.")
                 return
 
@@ -255,16 +391,25 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             face_box = self.__detect_face(person, self.face_config.detection_threshold)
 
             if not face_box:
+                self.face_counters["no_face"] += 1
                 logger.debug("Detected no faces for person object.")
                 return
 
-            face_frame = person[
-                max(0, face_box[1]) : min(frame.shape[0], face_box[3]),
-                max(0, face_box[0]) : min(frame.shape[1], face_box[2]),
+            face_box = (
+                face_box[0] + person_box[0],
+                face_box[1] + person_box[1],
+                face_box[2] + person_box[0],
+                face_box[3] + person_box[1],
+            )
+
+            face_frame = bgr[
+                max(0, face_box[1]) : min(bgr.shape[0], face_box[3]),
+                max(0, face_box[0]) : min(bgr.shape[1], face_box[2]),
             ]
 
             # check that face is correct size
             if area(face_box) < self.config.cameras[camera].face_recognition.min_area:
+                self.face_counters["too_small"] += 1
                 logger.debug(
                     f"Detected face that is smaller than the min_area {face} < {self.config.cameras[camera].face_recognition.min_area}"
                 )
@@ -308,43 +453,45 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             ]
 
         if face_frame.size == 0:
+            self.face_counters["empty_crop"] += 1
             logger.debug(f"Empty face crop for {id}")
             return
 
         res = self.recognizer.classify(face_frame)
 
         if not res:
+            self.face_counters["classifier_unavailable"] += 1
             logger.debug(f"Face recognizer returned no result for {id}")
             self.__update_metrics(datetime.datetime.now().timestamp() - start)
             return
 
         sub_label, score = res
+        self.face_counters["classified"] += 1
 
         if score <= self.face_config.unknown_score:
             sub_label = "unknown"
+            self.face_counters["unknown"] += 1
+        else:
+            self.face_counters["matched"] += 1
 
         logger.debug(
             f"Detected best face for person as: {sub_label} with probability {score}"
         )
 
-        self.write_face_attempt(
-            face_frame, id, datetime.datetime.now().timestamp(), sub_label, score
+        self.queue_face_attempt(
+            camera,
+            face_frame,
+            id,
+            datetime.datetime.now().timestamp(),
+            sub_label,
+            score,
         )
-
-        if id not in self.person_face_history:
-            self.person_face_history[id] = []
-
-            if camera not in self.camera_current_people:
-                self.camera_current_people[camera] = []
-
-            self.camera_current_people[camera].append(id)
-
-        self.person_face_history[id].append(
-            (sub_label, score, face_frame.shape[0] * face_frame.shape[1])
+        track_state.votes.append(
+            FaceVote(sub_label, score, face_frame.shape[0] * face_frame.shape[1])
         )
-        (weighted_sub_label, weighted_score) = self.weighted_average(
-            self.person_face_history[id]
-        )
+        (weighted_sub_label, weighted_score) = self.weighted_average(track_state.votes)
+        if weighted_sub_label is None:
+            self.face_counters["vote_pending"] += 1
 
         self.requestor.send_data(
             "tracked_object_update",
@@ -362,36 +509,28 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         )
 
         if weighted_score >= self.face_config.recognition_threshold:
-            self.sub_label_publisher.publish(
-                (id, weighted_sub_label, weighted_score),
-                EventMetadataTypeEnum.sub_label.value,
-            )
-
-            if weighted_sub_label is not None and frame_time > self.face_snapshot_frames.get(id, 0):
-                artifact_path = self._write_face_snapshot(
-                    frame,
-                    camera,
-                    id,
-                    frame_time,
-                    weighted_score,
+            if (
+                weighted_sub_label is not None
+                and frame_time > track_state.last_snapshot_time
+            ):
+                queued = self.face_snapshot_worker.submit(
+                    (camera, id),
+                    FaceSnapshotJob(
+                        camera=camera,
+                        event_id=id,
+                        frame_time=frame_time,
+                        person_box=person_box,
+                        face_box=tuple(int(value) for value in face_box),
+                        sub_label=weighted_sub_label,
+                        face_score=weighted_score,
+                        frame=frame.copy(),
+                    ),
                 )
-                if artifact_path is not None:
-                    self.face_snapshot_frames[id] = frame_time
-                    self.sub_label_publisher.publish(
-                        {
-                            "event_id": id,
-                            "camera": camera,
-                            "frame_time": frame_time,
-                            "path": artifact_path,
-                            "box": person_box,
-                            "area": int(obj_data.get("area", area(person_box))),
-                            "score": float(obj_data.get("score", 0.0)),
-                            "attributes": obj_data.get("attributes", []),
-                            "face_score": weighted_score,
-                            "sub_label": weighted_sub_label,
-                        },
-                        EventMetadataTypeEnum.face_snapshot.value,
-                    )
+                if queued:
+                    track_state.last_snapshot_time = frame_time
+                    self.face_counters["snapshot_queued"] += 1
+                else:
+                    self.face_counters["face_snapshot_rejected"] += 1
 
         self.__update_metrics(datetime.datetime.now().timestamp() - start)
 
@@ -520,82 +659,30 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         return None
 
     def expire_object(self, object_id: str, camera: str) -> None:
-        if object_id in self.person_face_history:
-            self.person_face_history.pop(object_id)
+        self.face_tracks.pop((camera, object_id), None)
 
-            if object_id in self.camera_current_people.get(camera, []):
-                self.camera_current_people[camera].remove(object_id)
-        self.person_face_boxes.pop(object_id, None)
-        self.face_snapshot_frames.pop(object_id, None)
+    def drain_results(self) -> list[dict[str, Any]]:
+        """Return snapshot artifacts completed by the background worker."""
+        payloads = []
+        for result in self.face_snapshot_worker.drain_results():
+            if not isinstance(result, FaceRecognitionResult):
+                continue
+            state = self.face_tracks.get(result.key)
+            if state is not None and (
+                state.candidate is None
+                or result.frame_time > state.candidate.frame_time
+            ):
+                state.candidate = result
+            payloads.append({"type": "face_snapshot", **result.as_payload()})
+        return payloads
 
-    @staticmethod
-    def _box_iou(
-        first: tuple[int, int, int, int], second: tuple[int, int, int, int]
-    ) -> float:
-        left = max(first[0], second[0])
-        top = max(first[1], second[1])
-        right = min(first[2], second[2])
-        bottom = min(first[3], second[3])
-        intersection = max(0, right - left) * max(0, bottom - top)
-        if intersection == 0:
-            return 0.0
-        first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
-        second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
-        union = first_area + second_area - intersection
-        return intersection / union if union else 0.0
-
-    @classmethod
-    def _is_track_discontinuity(
-        cls,
-        previous: tuple[int, int, int, int],
-        current: tuple[int, int, int, int],
-        frame_gap: float,
-    ) -> bool:
-        if frame_gap > 2.0:
-            return True
-        if cls._box_iou(previous, current) >= 0.05:
-            return False
-
-        previous_center = ((previous[0] + previous[2]) / 2, (previous[1] + previous[3]) / 2)
-        current_center = ((current[0] + current[2]) / 2, (current[1] + current[3]) / 2)
-        previous_diagonal = max(
-            1.0,
-            ((previous[2] - previous[0]) ** 2 + (previous[3] - previous[1]) ** 2) ** 0.5,
-        )
-        center_distance = (
-            (current_center[0] - previous_center[0]) ** 2
-            + (current_center[1] - previous_center[1]) ** 2
-        ) ** 0.5
-        return center_distance > previous_diagonal * 1.5
-
-    @staticmethod
-    def _write_face_snapshot(
-        frame: np.ndarray,
-        camera: str,
-        event_id: str,
-        frame_time: float,
-        face_score: float,
-    ) -> str | None:
-        try:
-            bgr_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-            folder = os.path.join(FACE_DIR, "events")
-            os.makedirs(folder, exist_ok=True)
-            path = os.path.join(folder, f"{camera}-{event_id}-{frame_time}.webp")
-            temporary_path = f"{path}.tmp.webp"
-            if not cv2.imwrite(temporary_path, bgr_frame):
-                return None
-            os.replace(temporary_path, path)
-            return path
-        except Exception:
-            logger.exception(
-                "Unable to persist face recognition frame for %s (score=%.3f)",
-                event_id,
-                face_score,
-            )
-            return None
+    def shutdown(self) -> None:
+        """Stop snapshot encoding during embeddings shutdown."""
+        self.face_snapshot_worker.stop()
+        self.face_attempt_worker.stop()
 
     def weighted_average(
-        self, results_list: list[tuple[str, float, int]], max_weight: int = 4000
+        self, results_list: list[FaceVote], max_weight: int = 4000
     ) -> tuple[str | None, float]:
         """
         Calculates a robust weighted average, capping the area weight and giving more weight to higher scores.
@@ -614,7 +701,10 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         weighted_scores: dict[str, float] = {}
         total_weights: dict[str, float] = {}
 
-        for name, score, face_area in results_list:
+        for vote in results_list:
+            name = vote.sub_label
+            score = vote.score
+            face_area = vote.face_area
             if name == "unknown":
                 continue
 
@@ -652,8 +742,9 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
 
         return best_name, weighted_average
 
-    def write_face_attempt(
+    def queue_face_attempt(
         self,
+        camera: str,
         frame: np.ndarray,
         event_id: str,
         timestamp: float,
@@ -661,24 +752,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         score: float,
     ) -> None:
         if self.config.face_recognition.save_attempts:
-            # write face to library
-            folder = os.path.join(FACE_DIR, "train")
-
-            if "-" in sub_label:
-                sub_label = sub_label.replace("-", "_")
-
-            file = os.path.join(
-                folder, f"{event_id}-{timestamp}-{sub_label}-{score}.webp"
+            self.face_attempt_worker.submit(
+                (camera, event_id),
+                FaceAttemptJob(
+                    frame=frame.copy(),
+                    event_id=event_id,
+                    timestamp=timestamp,
+                    sub_label=sub_label,
+                    score=score,
+                    face_dir=FACE_DIR,
+                    max_files=self.config.face_recognition.save_attempts,
+                ),
             )
-            os.makedirs(folder, exist_ok=True)
-            cv2.imwrite(file, frame)
-
-            files = sorted(
-                filter(lambda f: f.endswith(".webp"), os.listdir(folder)),
-                key=lambda f: os.path.getctime(os.path.join(folder, f)),
-                reverse=True,
-            )
-
-            # delete oldest face image if maximum is reached
-            if len(files) > self.config.face_recognition.save_attempts:
-                Path(os.path.join(folder, files[-1])).unlink(missing_ok=True)

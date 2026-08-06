@@ -265,40 +265,6 @@ def post_process_yolo(output: list[np.ndarray], width: int, height: int) -> np.n
         return __post_process_nms_yolo(output[0], width, height)
 
 
-def post_process_yolov8(output: list[np.ndarray], width: int, height: int) -> np.ndarray:
-    """Post-process Ultralytics YOLOv8 detect output (no objectness column)."""
-    predictions = np.asarray(output[0])
-    predictions = np.squeeze(predictions)
-    if predictions.ndim != 2:
-        return np.zeros((20, 6), np.float32)
-    if predictions.shape[0] < predictions.shape[1]:
-        predictions = predictions.T
-
-    scores = np.max(predictions[:, 4:], axis=1)
-    class_ids = np.argmax(predictions[:, 4:], axis=1)
-    keep = scores > 0.4
-    if not np.any(keep):
-        return np.zeros((20, 6), np.float32)
-
-    boxes = predictions[keep, :4]
-    scores = scores[keep]
-    class_ids = class_ids[keep]
-    boxes_xyxy = np.column_stack(
-        (boxes[:, 0] - boxes[:, 2] / 2,
-         boxes[:, 1] - boxes[:, 3] / 2,
-         boxes[:, 0] + boxes[:, 2] / 2,
-         boxes[:, 1] + boxes[:, 3] / 2)
-    )
-    indices = cv2.dnn.NMSBoxes(
-        xyxy_to_xywh_for_nms(boxes_xyxy), scores, score_threshold=0.4, nms_threshold=0.45
-    )
-    detections = np.zeros((20, 6), np.float32)
-    for i, idx in enumerate(np.asarray(indices).flatten()[:20]):
-        x1, y1, x2, y2 = boxes_xyxy[idx]
-        detections[i] = [class_ids[idx], scores[idx], y1 / height, x1 / width, y2 / height, x2 / width]
-    return detections
-
-
 def post_process_yolox(
     predictions: np.ndarray,
     width: int,

@@ -296,7 +296,7 @@ class FaceRecognitionConfig(FrigateBaseModel):
         description="Minimum number of face recognitions required before applying a recognized sub-label to a person.",
     )
     save_attempts: int = Field(
-        default=200,
+        default=0,
         ge=0,
         title="Save attempts",
         description="Number of face recognition attempts to retain for recent recognition UI.",

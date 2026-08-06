@@ -19,7 +19,7 @@ export type TrackingDetailsSequence = {
     score: number;
     computed_score?: number;
     top_score?: number;
-    sub_label: string;
+    sub_label: string | [string | null, number | null] | null;
     box?: [number, number, number, number];
     region: [number, number, number, number];
     attribute: string;

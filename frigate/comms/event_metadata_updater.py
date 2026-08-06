@@ -19,6 +19,9 @@ class EventMetadataTypeEnum(str, Enum):
     lpr_event_create = "lpr_event_create"
     save_lpr_snapshot = "save_lpr_snapshot"
     face_snapshot = "face_snapshot"
+    face_snapshot_commit = "face_snapshot_commit"
+    face_snapshot_cleanup = "face_snapshot_cleanup"
+    face_snapshot_committed = "face_snapshot_committed"
 
 
 class EventMetadataPublisher(Publisher):

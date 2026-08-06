@@ -400,9 +400,7 @@ class TrackedObject:
         if snapshot is not None:
             # Do not expose the internal staging path over MQTT/API event
             # messages. The event maintainer only needs frame/box metadata.
-            snapshot = {
-                key: value for key, value in snapshot.items() if key != "path"
-            }
+            snapshot = {key: value for key, value in snapshot.items() if key != "path"}
 
         event: dict[str, Any] = {
             "id": self.obj_data["id"],
@@ -526,35 +524,36 @@ class TrackedObject:
             estimated_speed=snapshot_data.get("current_estimated_speed", 0),
         )
 
-    def set_face_snapshot(self, snapshot: dict[str, Any]) -> None:
+    def set_face_snapshot(self, snapshot: dict[str, Any]) -> str | None:
         """Use a face-recognition frame as the event snapshot candidate."""
         current = self.face_snapshot
         if current and snapshot["frame_time"] <= current["frame_time"]:
-            return
+            return snapshot.get("path")
 
         self.face_snapshot = snapshot
+        return current.get("path") if current else None
 
     def write_snapshot_to_disk(self) -> None:
         webp_bytes = self.get_clean_webp()
         if webp_bytes is None:
             logger.warning(f"Unable to save snapshot for {self.obj_data['id']}.")
+            self.cleanup_face_snapshot_artifact()
         else:
-            with open(
-                os.path.join(
-                    CLIPS_DIR,
-                    f"{self.camera_config.name}-{self.obj_data['id']}-clean.webp",
-                ),
-                "wb",
-            ) as p:
-                p.write(webp_bytes)
-            if self.face_snapshot and self.face_snapshot.get("path"):
+            path = os.path.join(
+                CLIPS_DIR,
+                f"{self.camera_config.name}-{self.obj_data['id']}-clean.webp",
+            )
+            temporary_path = f"{path}.tmp-{os.getpid()}"
+            try:
+                with open(temporary_path, "wb") as p:
+                    p.write(webp_bytes)
+                os.replace(temporary_path, path)
+            finally:
                 try:
-                    os.unlink(self.face_snapshot["path"])
-                except OSError:
-                    logger.debug(
-                        "Unable to remove staged face snapshot for %s",
-                        self.obj_data["id"],
-                    )
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+            self.cleanup_face_snapshot_artifact()
 
     def write_thumbnail_to_disk(self) -> None:
         if not self.camera_config.name:
@@ -570,10 +569,26 @@ class TrackedObject:
         thumb_bytes = self.get_thumbnail("webp")
 
         if thumb_bytes:
-            with open(
-                os.path.join(directory, f"{self.obj_data['id']}.webp"), "wb"
-            ) as f:
-                f.write(thumb_bytes)
+            path = os.path.join(directory, f"{self.obj_data['id']}.webp")
+            temporary_path = f"{path}.tmp-{os.getpid()}"
+            try:
+                with open(temporary_path, "wb") as f:
+                    f.write(thumb_bytes)
+                os.replace(temporary_path, path)
+            finally:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
+
+    def cleanup_face_snapshot_artifact(self) -> None:
+        """Remove the internal face snapshot staging artifact if present."""
+        if not self.face_snapshot or not self.face_snapshot.get("path"):
+            return
+        try:
+            os.unlink(self.face_snapshot["path"])
+        except FileNotFoundError:
+            pass
 
 
 def zone_filtered(obj: TrackedObject, object_config: dict[str, FilterConfig]) -> bool:

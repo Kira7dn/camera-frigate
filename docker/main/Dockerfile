@@ -287,6 +287,11 @@ RUN --mount=type=bind,source=docker/main/install_memryx.sh,target=/deps/install_
 
 COPY --from=deps-rootfs / /
 
+# Git checkouts on Windows can supply CRLF in s6 control files. s6 parses
+# service type and dependency files as exact tokens, so normalize them in the
+# immutable image rather than relying on host Git configuration.
+RUN find /etc/s6-overlay/s6-rc.d -type f -exec sed -i 's/\r$//' {} +
+
 RUN ldconfig
 
 EXPOSE 5000

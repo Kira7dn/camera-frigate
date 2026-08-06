@@ -244,6 +244,36 @@ class RestreamConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class RuntimeReplayConfig(FrigateBaseModel):
+    """Host replay sources managed by the Camera runtime launcher."""
+
+    loop: bool = True
+    sources: dict[str, str] = Field(default_factory=dict)
+
+
+class RuntimeIntegrationsConfig(FrigateBaseModel):
+    """Optional deployment integrations managed outside the Frigate process."""
+
+    enabled: bool = False
+
+
+class RuntimeDeploymentConfig(FrigateBaseModel):
+    """Deployment settings read by deploy/run.ps1 from the same config file."""
+
+    image: str = "camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt"
+    build_base_image: str = "camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt"
+    cpu_limit: float = Field(default=4, gt=0, le=4)
+    model_path: str = "models/yolov9-t-320.onnx"
+    config_dir: str = "runtime/config"
+    media_dir: str = "runtime/media"
+    data_dir: str = "runtime/data"
+    rtsp_transport: str = Field(default="tcp", pattern="^(tcp|udp)$")
+    replay: RuntimeReplayConfig = Field(default_factory=RuntimeReplayConfig)
+    integrations: RuntimeIntegrationsConfig = Field(
+        default_factory=RuntimeIntegrationsConfig
+    )
+
+
 def verify_config_roles(camera_config: CameraConfig) -> None:
     """Verify that roles are setup in the config correctly."""
     assigned_roles = list(
@@ -431,6 +461,11 @@ class FrigateConfig(FrigateBaseModel):
         default=False,
         title="Safe mode",
         description="When enabled, start Frigate in safe mode with reduced features for troubleshooting.",
+    )
+    runtime: RuntimeDeploymentConfig = Field(
+        default_factory=RuntimeDeploymentConfig,
+        title="Camera runtime deployment",
+        description="Host deployment settings consumed by deploy/run.ps1.",
     )
 
     # Fields that install global state should be defined first, so that their validators run first.

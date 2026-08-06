@@ -448,7 +448,7 @@ class ReviewSegmentMaintainer(threading.Thread):
                     if object["start_time"] > segment.last_alert_time:
                         continue
 
-                if not object["sub_label"]:
+                if not object["sub_label"] or not object["sub_label"][0]:
                     segment.detections[object["id"]] = object["label"]
                 elif object["sub_label"][0] in self.config.model.all_attributes:
                     segment.detections[object["id"]] = object["sub_label"][0]
@@ -586,7 +586,7 @@ class ReviewSegmentMaintainer(threading.Thread):
                 severity = SeverityEnum.detection
 
             for object in activity.get_all_objects():
-                if not object["sub_label"]:
+                if not object["sub_label"] or not object["sub_label"][0]:
                     detections[object["id"]] = object["label"]
                 elif object["sub_label"][0] in self.config.model.all_attributes:
                     detections[object["id"]] = object["sub_label"][0]

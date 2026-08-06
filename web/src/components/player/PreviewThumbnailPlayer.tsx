@@ -304,8 +304,9 @@ export default function PreviewThumbnailPlayer({
                       ]),
                     ]
                       .filter(
-                        (item) =>
-                          item !== undefined && !item.includes("-verified"),
+                        (item): item is string =>
+                          typeof item === "string" &&
+                          !item.includes("-verified"),
                       )
                       .map((text) =>
                         getTranslatedLabel(text, getEventType(text)),

@@ -577,7 +577,11 @@ class RKNNModelRunner(BaseModelRunner):
 
 
 def get_optimized_runner(
-    model_path: str, device: str | None, model_type: str, **kwargs
+    model_path: str,
+    device: str | None,
+    model_type: str,
+    session_options: ort.SessionOptions | None = None,
+    **kwargs,
 ) -> BaseModelRunner:
     """Get an optimized runner for the hardware."""
     device = device or "AUTO"
@@ -608,6 +612,7 @@ def get_optimized_runner(
         return CudaGraphRunner(
             ort.InferenceSession(
                 model_path,
+                sess_options=session_options,
                 providers=providers,
                 provider_options=options,
             ),
@@ -626,7 +631,8 @@ def get_optimized_runner(
     return ONNXModelRunner(
         ort.InferenceSession(
             model_path,
-            sess_options=get_ort_session_options(
+            sess_options=session_options
+            or get_ort_session_options(
                 ONNXModelRunner.is_cpu_complex_model(model_type)
             ),
             providers=providers,

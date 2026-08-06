@@ -6,12 +6,17 @@ import { capitalizeFirstLetter, formatList } from "./stringUtil";
 export function getLifecycleItemDescription(
   lifecycleItem: TrackingDetailsSequence,
 ) {
-  const rawLabel = Array.isArray(lifecycleItem.data.sub_label)
+  const rawSubLabel = Array.isArray(lifecycleItem.data.sub_label)
     ? lifecycleItem.data.sub_label[0]
-    : lifecycleItem.data.sub_label || lifecycleItem.data.label;
+    : lifecycleItem.data.sub_label;
+  const subLabel =
+    typeof rawSubLabel === "string" && rawSubLabel.length > 0
+      ? rawSubLabel
+      : undefined;
+  const rawLabel = subLabel ?? lifecycleItem.data.label;
 
-  const label = lifecycleItem.data.sub_label
-    ? capitalizeFirstLetter(rawLabel)
+  const label = subLabel
+    ? capitalizeFirstLetter(subLabel)
     : getTranslatedLabel(
         rawLabel,
         lifecycleItem.class_type === "heard" ? "audio" : "object",

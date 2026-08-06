@@ -1,16 +1,32 @@
 import logging
+import os
 import threading
+import time
+from collections import Counter, OrderedDict
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
+from frigate.comms.event_metadata_updater import (
+    EventMetadataSubscriber,
+    EventMetadataTypeEnum,
+)
 from frigate.comms.events_updater import EventEndPublisher, EventUpdateSubscriber
 from frigate.config import FrigateConfig
 from frigate.config.classification import ObjectClassificationType
-from frigate.const import REPLAY_CAMERA_PREFIX
+from frigate.const import CLIPS_DIR, FACE_DIR, REPLAY_CAMERA_PREFIX, THUMB_DIR
 from frigate.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event
 from frigate.util.builtin import to_relative_box
+from frigate.util.face_snapshot import (
+    CleanupJob,
+    FaceRecognitionResult,
+    LatestPerObjectWorker,
+    SnapshotCommitJob,
+    SnapshotCommitted,
+    cleanup_paths,
+    commit_snapshot_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +97,18 @@ class EventProcessor(threading.Thread):
 
         self.event_receiver = EventUpdateSubscriber()
         self.event_end_publisher = EventEndPublisher()
+        self.face_snapshot_receiver = EventMetadataSubscriber(EventMetadataTypeEnum.all)
+        self.face_snapshot_worker = LatestPerObjectWorker(
+            self._process_snapshot_job,
+            max_objects=4,
+            name="event_face_media_committer",
+            drop_handler=self._drop_snapshot_job,
+        )
+        self.deferred_face_jobs: OrderedDict[
+            tuple[str, str], tuple[SnapshotCommitJob, float]
+        ] = OrderedDict()
+        self.face_snapshot_metrics: Counter[str] = Counter()
+        self.last_face_metrics_log = time.monotonic()
 
     def run(self) -> None:
         # set an end_time on events without an end_time on startup
@@ -89,6 +117,10 @@ class EventProcessor(threading.Thread):
         ).execute()
 
         while not self.stop_event.is_set():
+            self._drain_face_snapshot_requests()
+            self._retry_deferred_face_jobs()
+            self._apply_snapshot_completions()
+            self._log_face_snapshot_metrics()
             update = self.event_receiver.check_for_update(timeout=1)
 
             if update == None:
@@ -136,7 +168,201 @@ class EventProcessor(threading.Thread):
 
         self.event_receiver.stop()
         self.event_end_publisher.stop()
+        for job, _ in self.deferred_face_jobs.values():
+            self._drop_snapshot_job(job)
+        self.deferred_face_jobs.clear()
+        self.face_snapshot_worker.stop()
+        self._apply_snapshot_completions()
+        self.face_snapshot_receiver.stop()
         logger.info("Exiting event processor...")
+
+    def _drain_face_snapshot_requests(self) -> None:
+        while True:
+            update = self.face_snapshot_receiver.check_for_update(timeout=0)
+            if not update:
+                return
+            topic, payload = update
+            if not topic or payload is None:
+                return
+            if topic.endswith(EventMetadataTypeEnum.face_snapshot_cleanup.value):
+                paths = tuple(str(path) for path in payload.get("paths", []))
+                self.face_snapshot_worker.submit_control(CleanupJob(paths))
+                self.face_snapshot_metrics["released"] += len(paths)
+            elif topic.endswith(EventMetadataTypeEnum.face_snapshot_commit.value):
+                self._accept_snapshot_payload(payload)
+
+    def _accept_snapshot_payload(self, payload: dict[str, Any]) -> None:
+        try:
+            result = FaceRecognitionResult(
+                camera=str(payload["camera"]),
+                event_id=str(payload["event_id"]),
+                frame_time=float(payload["frame_time"]),
+                person_box=tuple(int(value) for value in payload["person_box"]),
+                face_box=tuple(int(value) for value in payload["face_box"]),
+                sub_label=str(payload["sub_label"]),
+                face_score=float(payload["face_score"]),
+                artifact_path=os.path.abspath(str(payload["artifact_path"])),
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Ignoring malformed face snapshot commit request")
+            self.face_snapshot_metrics["rejected"] += 1
+            return
+        face_dir = os.path.abspath(FACE_DIR)
+        if (
+            len(result.person_box) != 4
+            or len(result.face_box) != 4
+            or result.frame_time <= 0
+            or not result.artifact_path.startswith(face_dir + os.sep)
+        ):
+            self.face_snapshot_metrics["rejected"] += 1
+            return
+        job = SnapshotCommitJob(
+            result=result,
+            canonical_path=os.path.join(
+                CLIPS_DIR, f"{result.camera}-{result.event_id}-clean.webp"
+            ),
+            thumbnail_path=os.path.join(
+                THUMB_DIR, result.camera, f"{result.event_id}.webp"
+            ),
+        )
+        self._submit_or_defer_snapshot(job)
+
+    def _submit_or_defer_snapshot(self, job: SnapshotCommitJob) -> None:
+        try:
+            event = Event.get(Event.id == job.result.event_id)
+        except Event.DoesNotExist:
+            previous = self.deferred_face_jobs.pop(job.result.key, None)
+            if previous is not None:
+                self._drop_snapshot_job(previous[0])
+                self.face_snapshot_metrics["replaced"] += 1
+            elif len(self.deferred_face_jobs) >= 4:
+                self._drop_snapshot_job(job)
+                self.face_snapshot_metrics["rejected"] += 1
+                return
+            self.deferred_face_jobs[job.result.key] = (job, time.monotonic() + 5)
+            self.face_snapshot_metrics["late_result"] += 1
+            return
+        if event.camera != job.result.camera:
+            self._drop_snapshot_job(job)
+            self.face_snapshot_metrics["camera_mismatch"] += 1
+            return
+        existing = (event.data or {}).get("face_snapshot_frame_time", 0)
+        if float(existing or 0) >= job.result.frame_time:
+            self._drop_snapshot_job(job)
+            self.face_snapshot_metrics["stale_result"] += 1
+            return
+        if not self.face_snapshot_worker.submit(job.result.key, job):
+            self._drop_snapshot_job(job)
+            self.face_snapshot_metrics["rejected"] += 1
+
+    def _retry_deferred_face_jobs(self) -> None:
+        now = time.monotonic()
+        for key, (job, deadline) in list(self.deferred_face_jobs.items()):
+            try:
+                Event.get(Event.id == job.result.event_id)
+            except Event.DoesNotExist:
+                if now >= deadline:
+                    self.deferred_face_jobs.pop(key, None)
+                    self._drop_snapshot_job(job)
+                    self.face_snapshot_metrics["rejected"] += 1
+                continue
+            self.deferred_face_jobs.pop(key, None)
+            self._submit_or_defer_snapshot(job)
+
+    def _apply_snapshot_completions(self) -> None:
+        for completion in self.face_snapshot_worker.drain_results():
+            if not isinstance(completion, SnapshotCommitted):
+                continue
+            result = completion.result
+            try:
+                event = Event.get(Event.id == result.event_id)
+            except Event.DoesNotExist:
+                cleanup_paths(
+                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
+                )
+                self.face_snapshot_metrics["rejected"] += 1
+                continue
+            if event.camera != result.camera:
+                cleanup_paths(
+                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
+                )
+                self.face_snapshot_metrics["camera_mismatch"] += 1
+                continue
+            data = event.data or {}
+            if float(data.get("face_snapshot_frame_time", 0) or 0) >= result.frame_time:
+                cleanup_paths(
+                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
+                )
+                self.face_snapshot_metrics["stale_result"] += 1
+                continue
+            camera_config = self.config.cameras.get(result.camera)
+            if camera_config is None:
+                cleanup_paths(
+                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
+                )
+                self.face_snapshot_metrics["rejected"] += 1
+                continue
+            width = camera_config.detect.width
+            height = camera_config.detect.height
+            if width is None or height is None:
+                cleanup_paths(
+                    CleanupJob((completion.canonical_path, completion.thumbnail_path))
+                )
+                self.face_snapshot_metrics["rejected"] += 1
+                continue
+            data["box"] = to_relative_box(width, height, result.person_box)
+            data["face_box"] = to_relative_box(width, height, result.face_box)
+            data["snapshot_frame_time"] = result.frame_time
+            data["face_snapshot_frame_time"] = result.frame_time
+            data["snapshot_area"] = max(
+                0, result.person_box[2] - result.person_box[0]
+            ) * max(0, result.person_box[3] - result.person_box[1])
+            data["snapshot_estimated_speed"] = 0
+            data["snapshot_clean"] = True
+            data["snapshot_source"] = "face_recognition"
+            data["face_snapshot_score"] = result.face_score
+            data["face_snapshot_sub_label"] = result.sub_label
+            data["sub_label_score"] = result.face_score
+            event.data = data
+            event.sub_label = result.sub_label
+            event.has_snapshot = True
+            event.save()
+            self.face_snapshot_metrics["committed"] += 1
+
+    @staticmethod
+    def _process_snapshot_job(
+        job: SnapshotCommitJob | CleanupJob,
+    ) -> SnapshotCommitted | None:
+        if isinstance(job, CleanupJob):
+            cleanup_paths(job)
+            return None
+        return commit_snapshot_job(job)
+
+    def _drop_snapshot_job(self, job: SnapshotCommitJob | CleanupJob) -> None:
+        if isinstance(job, CleanupJob):
+            cleanup_paths(job)
+        else:
+            cleanup_paths(CleanupJob((job.result.artifact_path,)))
+        self.face_snapshot_metrics["released"] += 1
+
+    def _log_face_snapshot_metrics(self) -> None:
+        now = time.monotonic()
+        if now - self.last_face_metrics_log < 60:
+            return
+        worker = self.face_snapshot_worker.stats()
+        logger.info(
+            "Face snapshot metrics pending=%d replaced=%d rejected=%d committed=%d failed=%d released=%d stale=%d late=%d camera_mismatch=%d",
+            worker.get("pending", 0) + len(self.deferred_face_jobs),
+            worker.get("replaced", 0) + self.face_snapshot_metrics["replaced"],
+            worker.get("rejected", 0) + self.face_snapshot_metrics["rejected"],
+            self.face_snapshot_metrics["committed"],
+            worker.get("failed", 0),
+            self.face_snapshot_metrics["released"],
+            self.face_snapshot_metrics["stale_result"],
+            self.face_snapshot_metrics["late_result"],
+            self.face_snapshot_metrics["camera_mismatch"],
+        )
+        self.last_face_metrics_log = now
 
     def handle_object_detection(
         self,
@@ -166,12 +392,17 @@ class EventProcessor(threading.Thread):
                 None if event_data["end_time"] is None else event_data["end_time"]
             )
             snapshot = event_data["snapshot"]
+            face_snapshot_pending = (
+                snapshot is not None and snapshot.get("face_score") is not None
+            )
             # score of the snapshot
-            score = None if snapshot is None else snapshot["score"]
+            score = (
+                None if snapshot is None or face_snapshot_pending else snapshot["score"]
+            )
             # detection region in the snapshot
             region = (
                 None
-                if snapshot is None
+                if snapshot is None or face_snapshot_pending
                 else to_relative_box(
                     width,
                     height,
@@ -181,7 +412,7 @@ class EventProcessor(threading.Thread):
             # bounding box for the snapshot
             box = (
                 None
-                if snapshot is None
+                if snapshot is None or face_snapshot_pending
                 else to_relative_box(
                     width,
                     height,
@@ -191,7 +422,7 @@ class EventProcessor(threading.Thread):
 
             attributes = (
                 None
-                if snapshot is None
+                if snapshot is None or face_snapshot_pending
                 else [
                     {
                         "box": to_relative_box(
@@ -205,10 +436,18 @@ class EventProcessor(threading.Thread):
                     for a in snapshot["attributes"]
                 ]
             )
-            snapshot_frame_time = None if snapshot is None else snapshot["frame_time"]
-            snapshot_area = None if snapshot is None else snapshot["area"]
+            snapshot_frame_time = (
+                None
+                if snapshot is None or face_snapshot_pending
+                else snapshot["frame_time"]
+            )
+            snapshot_area = (
+                None if snapshot is None or face_snapshot_pending else snapshot["area"]
+            )
             snapshot_estimated_speed = (
-                None if snapshot is None else snapshot["current_estimated_speed"]
+                None
+                if snapshot is None or face_snapshot_pending
+                else snapshot["current_estimated_speed"]
             )
 
             # keep these from being set back to false because the event
@@ -228,7 +467,9 @@ class EventProcessor(threading.Thread):
                 Event.zones: list(event_data["entered_zones"]),
                 Event.thumbnail: event_data.get("thumbnail"),
                 Event.has_clip: event_data["has_clip"],
-                Event.has_snapshot: event_data["has_snapshot"],
+                Event.has_snapshot: event_data["has_snapshot"]
+                if not face_snapshot_pending
+                else False,
                 Event.model_hash: first_detector.model.model_hash
                 if first_detector.model
                 else None,
@@ -246,6 +487,11 @@ class EventProcessor(threading.Thread):
                     "snapshot_frame_time": snapshot_frame_time,
                     "snapshot_area": snapshot_area,
                     "snapshot_estimated_speed": snapshot_estimated_speed,
+                    "snapshot_source": "tracking"
+                    if snapshot is not None and not face_snapshot_pending
+                    else None,
+                    "face_snapshot_score": None,
+                    "face_snapshot_sub_label": None,
                     "average_estimated_speed": event_data["average_estimated_speed"],
                     "velocity_angle": event_data["velocity_angle"],
                     "type": "object",
@@ -255,7 +501,7 @@ class EventProcessor(threading.Thread):
             }
 
             # only overwrite the sub_label in the database if it's set
-            if event_data.get("sub_label") is not None:
+            if event_data.get("sub_label") is not None and not face_snapshot_pending:
                 event[Event.sub_label] = event_data["sub_label"][0]
                 event[Event.data]["sub_label_score"] = event_data["sub_label"][1]
 

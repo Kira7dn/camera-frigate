@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import queue
-import shutil
 import threading
 from collections import defaultdict
 from enum import Enum
@@ -20,6 +19,7 @@ from frigate.camera.state import CameraState
 from frigate.comms.detections_updater import DetectionPublisher, DetectionTypeEnum
 from frigate.comms.dispatcher import Dispatcher
 from frigate.comms.event_metadata_updater import (
+    EventMetadataPublisher,
     EventMetadataSubscriber,
     EventMetadataTypeEnum,
 )
@@ -36,10 +36,8 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateSubscriber,
 )
 from frigate.const import (
-    CLIPS_DIR,
     FACE_DIR,
     FAST_QUEUE_TIMEOUT,
-    THUMB_DIR,
     UPDATE_CAMERA_ACTIVITY,
     UPSERT_REVIEW_SEGMENT,
 )
@@ -47,7 +45,9 @@ from frigate.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event, ReviewSegment, Timeline
 from frigate.ptz.autotrack import PtzAutoTrackerThread
 from frigate.track.tracked_object import TrackedObject
-from frigate.util.builtin import to_relative_box
+from frigate.util.face_snapshot import (
+    FaceRecognitionResult,
+)
 from frigate.util.image import SharedMemoryFrameManager
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,7 @@ class TrackedObjectProcessor(threading.Thread):
         self.event_sender = EventUpdatePublisher()
         self.event_end_subscriber = EventEndSubscriber()
         self.sub_label_subscriber = EventMetadataSubscriber(EventMetadataTypeEnum.all)
+        self.face_media_publisher = EventMetadataPublisher()
 
         self.camera_activity: dict[str, dict[str, Any]] = {}
         self.ongoing_manual_events: dict[str, str] = {}
@@ -133,7 +134,9 @@ class TrackedObjectProcessor(threading.Thread):
             )
 
         def update(camera: str, obj: TrackedObject, frame_name: str) -> None:
-            obj.has_snapshot = self.should_save_snapshot(camera, obj)
+            obj.has_snapshot = self.should_save_snapshot(camera, obj) or (
+                obj.face_snapshot is not None
+            )
             obj.has_clip = self.should_retain_recording(camera, obj)
             after = obj.to_dict()
             message = {
@@ -158,16 +161,26 @@ class TrackedObjectProcessor(threading.Thread):
 
         def end(camera: str, obj: TrackedObject, frame_name: str) -> None:
             # populate has_snapshot
-            obj.has_snapshot = self.should_save_snapshot(camera, obj)
+            obj.has_snapshot = self.should_save_snapshot(camera, obj) or (
+                obj.face_snapshot is not None
+            )
             obj.has_clip = self.should_retain_recording(camera, obj)
 
-            # write thumbnail to disk if it will be saved as an event
-            if obj.has_snapshot or obj.has_clip:
-                obj.write_thumbnail_to_disk()
-
-            # write the snapshot to disk
-            if obj.has_snapshot:
-                obj.write_snapshot_to_disk()
+            if obj.face_snapshot:
+                result = self._result_from_snapshot(
+                    camera, obj.obj_data["id"], obj.face_snapshot
+                )
+                queued = self._queue_face_commit(result)
+                if not queued:
+                    logger.warning(
+                        "Face snapshot media queue full for %s", obj.obj_data["id"]
+                    )
+            else:
+                # Existing snapshots retain their normal synchronous path.
+                if obj.has_snapshot or obj.has_clip:
+                    obj.write_thumbnail_to_disk()
+                if obj.has_snapshot:
+                    obj.write_snapshot_to_disk()
 
             if not obj.false_positive:
                 message = {
@@ -460,49 +473,72 @@ class TrackedObjectProcessor(threading.Thread):
                 )
 
     def set_face_snapshot(self, payload: dict[str, Any]) -> None:
-        """Apply the exact face-recognition frame as the event snapshot."""
-        event_id = str(payload.get("event_id", ""))
-        camera = str(payload.get("camera", ""))
-        source_frame_time = float(payload.get("frame_time", 0))
-        artifact_path = str(payload.get("path", ""))
-        box = tuple(int(value) for value in payload.get("box", ()))
+        """Validate and attach snapshot metadata without filesystem I/O."""
+        required = {
+            "camera",
+            "event_id",
+            "frame_time",
+            "person_box",
+            "face_box",
+            "sub_label",
+            "face_score",
+            "artifact_path",
+        }
+        if not required.issubset(payload):
+            logger.warning("Ignoring malformed face snapshot payload: %s", payload)
+            return
 
-        if not event_id or not camera or len(box) != 4 or source_frame_time <= 0:
+        event_id = str(payload["event_id"])
+        camera = str(payload["camera"])
+        source_frame_time = float(payload["frame_time"])
+        artifact_path = os.path.abspath(str(payload["artifact_path"]))
+        person_box = tuple(int(value) for value in payload["person_box"])
+        face_box = tuple(int(value) for value in payload["face_box"])
+
+        if (
+            not event_id
+            or not camera
+            or source_frame_time <= 0
+            or len(person_box) != 4
+            or len(face_box) != 4
+        ):
             logger.warning("Ignoring malformed face snapshot payload: %s", payload)
             return
 
         configured_camera = self.config.cameras.get(camera)
         if configured_camera is None or not configured_camera.snapshots.enabled:
+            self._queue_face_cleanup(artifact_path)
             return
 
         # The producer is an internal Frigate process, but keep the path
         # constrained to the face artifact directory before touching media.
-        artifact_path = os.path.abspath(artifact_path)
         face_dir = os.path.abspath(FACE_DIR)
-        if not artifact_path.startswith(face_dir + os.sep) or not os.path.isfile(
-            artifact_path
-        ):
+        if not artifact_path.startswith(face_dir + os.sep):
             logger.warning("Ignoring invalid face snapshot artifact: %s", artifact_path)
             return
-
-        image = cv2.imread(artifact_path)
-        if image is None:
-            logger.warning("Ignoring unreadable face snapshot artifact: %s", artifact_path)
-            return
-
-        height, width = image.shape[:2]
         snapshot = {
             "path": artifact_path,
             "frame_time": source_frame_time,
-            "box": box,
-            "area": int(payload.get("area", max(0, box[2] - box[0]) * max(0, box[3] - box[1]))),
-            "region": (0, 0, width, height),
-            "score": float(payload.get("score", 0.0)),
-            "attributes": payload.get("attributes", []),
+            "box": person_box,
+            "face_box": face_box,
+            "area": max(0, person_box[2] - person_box[0])
+            * max(0, person_box[3] - person_box[1]),
+            "score": float(payload["face_score"]),
+            "attributes": [],
             "current_estimated_speed": 0,
-            "face_score": float(payload.get("face_score", 0.0)),
-            "sub_label": payload.get("sub_label"),
+            "face_score": float(payload["face_score"]),
+            "sub_label": str(payload["sub_label"]),
         }
+        result = FaceRecognitionResult(
+            camera=camera,
+            event_id=event_id,
+            frame_time=source_frame_time,
+            person_box=person_box,
+            face_box=face_box,
+            sub_label=str(payload["sub_label"]),
+            face_score=float(payload["face_score"]),
+            artifact_path=artifact_path,
+        )
 
         tracked_obj: TrackedObject | None = None
         state = self.camera_states.get(camera)
@@ -510,9 +546,22 @@ class TrackedObjectProcessor(threading.Thread):
             tracked_obj = state.tracked_objects.get(event_id)
 
         if tracked_obj is not None:
-            if tracked_obj.obj_data.get("camera") not in (None, camera):
+            track_start = float(tracked_obj.obj_data.get("start_time", 0))
+            track_frame = float(tracked_obj.obj_data.get("frame_time", 0))
+            if "end_time" in tracked_obj.obj_data:
+                if not self._queue_face_commit(result):
+                    self._queue_face_cleanup(artifact_path)
                 return
-            tracked_obj.set_face_snapshot(snapshot)
+            if source_frame_time < track_start or source_frame_time > track_frame:
+                self._queue_face_cleanup(artifact_path)
+                return
+            obsolete_artifact = tracked_obj.set_face_snapshot(snapshot)
+            if obsolete_artifact:
+                self._queue_face_cleanup(obsolete_artifact)
+            tracked_obj.obj_data["sub_label"] = (
+                result.sub_label,
+                result.face_score,
+            )
             tracked_obj.has_snapshot = True
             logger.debug(
                 "Face snapshot attached to active event %s at frame %.3f",
@@ -521,61 +570,37 @@ class TrackedObjectProcessor(threading.Thread):
             )
             return
 
-        # Face recognition can finish after tracking has already ended. In
-        # that case update the persisted event and canonical media directly.
-        try:
-            event = Event.get(Event.id == event_id)
-        except DoesNotExist:
-            logger.debug("Dropping face snapshot for missing event %s", event_id)
-            return
+        if not self._queue_face_commit(result):
+            logger.warning("Face snapshot media queue full for %s", event_id)
+            self._queue_face_cleanup(artifact_path)
 
-        if event.camera != camera:
-            logger.warning("Dropping face snapshot with camera mismatch for %s", event_id)
-            return
-
-        existing_frame_time = (event.data or {}).get("snapshot_frame_time")
-        if existing_frame_time is not None and source_frame_time <= float(existing_frame_time):
-            return
-
-        canonical_path = os.path.join(
-            CLIPS_DIR, f"{event.camera}-{event.id}-clean.webp"
+    @staticmethod
+    def _result_from_snapshot(
+        camera: str, event_id: str, snapshot: dict[str, Any]
+    ) -> FaceRecognitionResult:
+        return FaceRecognitionResult(
+            camera=camera,
+            event_id=event_id,
+            frame_time=float(snapshot["frame_time"]),
+            person_box=tuple(snapshot["box"]),
+            face_box=tuple(snapshot["face_box"]),
+            sub_label=str(snapshot["sub_label"]),
+            face_score=float(snapshot["face_score"]),
+            artifact_path=str(snapshot["path"]),
         )
-        temporary_path = f"{canonical_path}.tmp-{os.getpid()}"
-        try:
-            shutil.copyfile(artifact_path, temporary_path)
-            os.replace(temporary_path, canonical_path)
 
-            thumb_dir = os.path.join(THUMB_DIR, event.camera)
-            os.makedirs(thumb_dir, exist_ok=True)
-            thumb_height = 175
-            thumb_width = max(1, int(width * thumb_height / height))
-            thumbnail = cv2.resize(
-                image, (thumb_width, thumb_height), interpolation=cv2.INTER_AREA
-            )
-            cv2.imwrite(os.path.join(thumb_dir, f"{event.id}.webp"), thumbnail)
+    def _queue_face_commit(self, result: FaceRecognitionResult) -> bool:
+        self.face_media_publisher.publish(
+            result.as_payload(),
+            EventMetadataTypeEnum.face_snapshot_commit.value,
+        )
+        return True
 
-            data = event.data or {}
-            data["box"] = to_relative_box(width, height, box)
-            data["snapshot_frame_time"] = source_frame_time
-            data["snapshot_area"] = snapshot["area"]
-            data["snapshot_estimated_speed"] = 0
-            data["snapshot_clean"] = True
-            data["face_snapshot_score"] = snapshot["face_score"]
-            event.data = data
-            event.has_snapshot = True
-            event.save()
-            os.unlink(artifact_path)
-            logger.debug(
-                "Replaced completed event snapshot with face frame for %s at %.3f",
-                event_id,
-                source_frame_time,
-            )
-        except OSError:
-            logger.exception("Unable to commit face snapshot for event %s", event_id)
-            try:
-                os.unlink(temporary_path)
-            except OSError:
-                pass
+    def _queue_face_cleanup(self, *paths: str) -> None:
+        self.face_media_publisher.publish(
+            {"paths": paths},
+            EventMetadataTypeEnum.face_snapshot_cleanup.value,
+        )
 
     def set_object_attribute(
         self,
@@ -941,6 +966,10 @@ class TrackedObjectProcessor(threading.Thread):
 
         # shut down camera states
         for state in self.camera_states.values():
+            for tracked_obj in state.tracked_objects.values():
+                snapshot = tracked_obj.face_snapshot
+                if snapshot and snapshot.get("path"):
+                    self._queue_face_cleanup(str(snapshot["path"]))
             state.shutdown()
 
         self.requestor.stop()
@@ -948,6 +977,7 @@ class TrackedObjectProcessor(threading.Thread):
         self.event_sender.stop()
         self.event_end_subscriber.stop()
         self.sub_label_subscriber.stop()
+        self.face_media_publisher.stop()
         self.camera_config_subscriber.stop()
 
         logger.info("Exiting object processor...")

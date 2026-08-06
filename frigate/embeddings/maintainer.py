@@ -759,6 +759,26 @@ class EmbeddingMaintainer(threading.Thread):
             results = processor.drain_results()
 
             for result in results:
+                if result.get("type") == "face_snapshot":
+                    payload = {
+                        key: result[key]
+                        for key in (
+                            "camera",
+                            "event_id",
+                            "frame_time",
+                            "person_box",
+                            "face_box",
+                            "sub_label",
+                            "face_score",
+                            "artifact_path",
+                        )
+                    }
+                    self.event_metadata_publisher.publish(
+                        payload,
+                        EventMetadataTypeEnum.face_snapshot.value,
+                    )
+                    continue
+
                 if result.get("type") != "classification":
                     continue
 

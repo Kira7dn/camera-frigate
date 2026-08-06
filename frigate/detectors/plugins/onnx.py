@@ -2,6 +2,7 @@ import logging
 from typing import Literal
 
 import numpy as np
+import onnxruntime as ort
 from pydantic import ConfigDict, Field
 
 from frigate.detectors.detection_api import DetectionApi
@@ -16,7 +17,6 @@ from frigate.util.model import (
     post_process_dfine,
     post_process_rfdetr,
     post_process_yolo,
-    post_process_yolov8,
     post_process_yolox,
 )
 
@@ -38,6 +38,62 @@ class ONNXDetectorConfig(BaseDetectorConfig):
         title="Device Type",
         description="The device to use for ONNX inference (e.g. 'AUTO', 'CPU', 'GPU').",
     )
+    intra_op_num_threads: int | None = Field(
+        default=None,
+        ge=1,
+        title="Intra-op thread count",
+        description="ONNX Runtime threads used within an operator.",
+    )
+    inter_op_num_threads: int | None = Field(
+        default=None,
+        ge=1,
+        title="Inter-op thread count",
+        description="ONNX Runtime threads used across operators.",
+    )
+    allow_spinning: bool | None = Field(
+        default=None,
+        title="Allow thread spinning",
+        description="Whether ONNX Runtime worker threads may spin while idle.",
+    )
+    execution_mode: Literal["sequential", "parallel"] | None = Field(
+        default=None,
+        title="Execution mode",
+        description="Run graph nodes sequentially or in parallel.",
+    )
+
+
+def create_session_options(
+    detector_config: ONNXDetectorConfig,
+) -> ort.SessionOptions | None:
+    """Build explicit ONNX Runtime CPU controls when configured."""
+    configured = any(
+        value is not None
+        for value in (
+            detector_config.intra_op_num_threads,
+            detector_config.inter_op_num_threads,
+            detector_config.allow_spinning,
+            detector_config.execution_mode,
+        )
+    )
+    if not configured:
+        return None
+
+    options = ort.SessionOptions()
+    if detector_config.intra_op_num_threads is not None:
+        options.intra_op_num_threads = detector_config.intra_op_num_threads
+    if detector_config.inter_op_num_threads is not None:
+        options.inter_op_num_threads = detector_config.inter_op_num_threads
+    if detector_config.allow_spinning is not None:
+        spinning = "1" if detector_config.allow_spinning else "0"
+        options.add_session_config_entry("session.intra_op.allow_spinning", spinning)
+        options.add_session_config_entry("session.inter_op.allow_spinning", spinning)
+    if detector_config.execution_mode is not None:
+        options.execution_mode = (
+            ort.ExecutionMode.ORT_SEQUENTIAL
+            if detector_config.execution_mode == "sequential"
+            else ort.ExecutionMode.ORT_PARALLEL
+        )
+    return options
 
 
 class ONNXDetector(DetectionApi):
@@ -53,6 +109,15 @@ class ONNXDetector(DetectionApi):
             path,
             detector_config.device,
             model_type=detector_config.model.model_type,
+            session_options=create_session_options(detector_config),
+        )
+
+        logger.info(
+            "ONNX thread budget: intra=%s inter=%s spinning=%s mode=%s",
+            detector_config.intra_op_num_threads,
+            detector_config.inter_op_num_threads,
+            detector_config.allow_spinning,
+            detector_config.execution_mode,
         )
 
         self.onnx_model_type = detector_config.model.model_type
@@ -128,8 +193,6 @@ class ONNXDetector(DetectionApi):
                     x_max / self.width,
                 ]
             return detections
-        elif self.onnx_model_type == ModelTypeEnum.yolov8:
-            return post_process_yolov8(tensor_output, self.width, self.height)
         elif self.onnx_model_type == ModelTypeEnum.yologeneric:
             return post_process_yolo(tensor_output, self.width, self.height)
         elif self.onnx_model_type == ModelTypeEnum.yolox:

@@ -78,7 +78,10 @@ export function AnimatedEventCard({
             ...(event.data.audio || []),
           ]),
         ]
-          .filter((item) => item !== undefined && !item.includes("-verified"))
+          .filter(
+            (item): item is string =>
+              typeof item === "string" && !item.includes("-verified"),
+          )
           .map((text) => getTranslatedLabel(text, getEventType(text)))
           .sort(),
       )} ` + t("detected")

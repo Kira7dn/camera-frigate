@@ -1,6 +1,9 @@
 import { t } from "i18next";
 
-export const capitalizeFirstLetter = (text: string): string => {
+export const capitalizeFirstLetter = (
+  text: string | null | undefined,
+): string => {
+  if (typeof text !== "string" || text.length === 0) return "";
   return text.charAt(0).toUpperCase() + text.slice(1);
 };
 
