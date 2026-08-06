@@ -2,7 +2,6 @@
 
 import base64
 import datetime
-import json
 import logging
 import os
 import shutil
@@ -14,10 +13,7 @@ import cv2
 import numpy as np
 
 from frigate.comms.embeddings_updater import EmbeddingsRequestEnum
-from frigate.comms.event_metadata_updater import (
-    EventMetadataPublisher,
-    EventMetadataTypeEnum,
-)
+from frigate.comms.event_metadata_updater import EventMetadataPublisher
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.const import FACE_DIR, MODEL_CACHE_DIR
@@ -26,15 +22,17 @@ from frigate.data_processing.common.face.model import (
     FaceNetRecognizer,
     FaceRecognizer,
 )
-from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.face_snapshot import (
+    FACE_PROCESS_INTERVAL,
     FaceAttemptJob,
     FaceRecognitionResult,
     FaceSnapshotJob,
     FaceTrackState,
     FaceVote,
     LatestPerObjectWorker,
+    cleanup_legacy_face_events,
+    is_face_identity_directory,
     is_track_discontinuity,
     reap_stale_staging,
     write_face_attempt,
@@ -71,11 +69,14 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.face_tracks: dict[tuple[str, str], FaceTrackState] = {}
         self.face_counters: Counter[str] = Counter()
         self.last_face_metrics_log = time.monotonic()
-        removed = reap_stale_staging(FACE_DIR)
+        removed = reap_stale_staging()
         if removed:
             logger.info("Removed %d stale face staging artifacts", removed)
+        legacy_removed = cleanup_legacy_face_events(FACE_DIR)
+        if legacy_removed:
+            logger.info("Removed %d obsolete FACE_DIR/events artifacts", legacy_removed)
         self.face_snapshot_worker = LatestPerObjectWorker(
-            lambda job: write_face_snapshot_artifact(job, FACE_DIR),
+            write_face_snapshot_artifact,
             max_objects=4,
         )
         self.face_attempt_worker = LatestPerObjectWorker(
@@ -226,7 +227,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         try:
             for name in os.listdir(FACE_DIR):
                 identity_dir = os.path.join(FACE_DIR, name)
-                if name == "train" or not os.path.isdir(identity_dir):
+                if not is_face_identity_directory(name, identity_dir):
                     continue
                 images = sum(
                     os.path.isfile(os.path.join(identity_dir, file_name))
@@ -317,29 +318,6 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                     votes=[],
                 )
                 self.face_tracks[key] = track_state
-                # Clear the previous face-derived identity before evaluating
-                # the new track segment. The current obj_data is a local event
-                # copy, so clearing it also prevents the non-face guard below
-                # from preserving the old person on this frame.
-                obj_data["sub_label"] = None
-                self.sub_label_publisher.publish(
-                    (id, None, None),
-                    EventMetadataTypeEnum.sub_label.value,
-                )
-                self.requestor.send_data(
-                    "tracked_object_update",
-                    json.dumps(
-                        {
-                            "type": TrackedObjectUpdateTypesEnum.face,
-                            "name": None,
-                            "score": 0.0,
-                            "id": id,
-                            "camera": camera,
-                            "timestamp": frame_time,
-                            "source_frame_time": frame_time,
-                        }
-                    ),
-                )
             else:
                 track_state.last_frame_time = frame_time
                 track_state.last_box = person_box
@@ -351,6 +329,14 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 votes=[],
             )
             self.face_tracks[key] = track_state
+
+        if frame_time - track_state.last_attempt_time < FACE_PROCESS_INTERVAL:
+            self.face_counters["rate_limited"] += 1
+            return
+        track_state.last_attempt_time = frame_time
+
+        if track_state.result_emitted:
+            return
 
         # don't overwrite sub label for objects that have a sub label
         # that is not a face
@@ -445,11 +431,11 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 logger.debug(f"Invalid face box {face}")
                 return
 
-            face_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
 
-            face_frame = face_frame[
-                max(0, face_box[1]) : min(frame.shape[0], face_box[3]),
-                max(0, face_box[0]) : min(frame.shape[1], face_box[2]),
+            face_frame = bgr[
+                max(0, face_box[1]) : min(bgr.shape[0], face_box[3]),
+                max(0, face_box[0]) : min(bgr.shape[1], face_box[2]),
             ]
 
         if face_frame.size == 0:
@@ -493,44 +479,30 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         if weighted_sub_label is None:
             self.face_counters["vote_pending"] += 1
 
-        self.requestor.send_data(
-            "tracked_object_update",
-            json.dumps(
-                {
-                    "type": TrackedObjectUpdateTypesEnum.face,
-                    "name": weighted_sub_label,
-                    "score": weighted_score,
-                    "id": id,
-                    "camera": camera,
-                    "timestamp": frame_time,
-                    "source_frame_time": frame_time,
-                }
-            ),
-        )
-
-        if weighted_score >= self.face_config.recognition_threshold:
-            if (
-                weighted_sub_label is not None
-                and frame_time > track_state.last_snapshot_time
-            ):
-                queued = self.face_snapshot_worker.submit(
-                    (camera, id),
-                    FaceSnapshotJob(
-                        camera=camera,
-                        event_id=id,
-                        frame_time=frame_time,
-                        person_box=person_box,
-                        face_box=tuple(int(value) for value in face_box),
-                        sub_label=weighted_sub_label,
-                        face_score=weighted_score,
-                        frame=frame.copy(),
-                    ),
-                )
-                if queued:
-                    track_state.last_snapshot_time = frame_time
-                    self.face_counters["snapshot_queued"] += 1
-                else:
-                    self.face_counters["face_snapshot_rejected"] += 1
+        if (
+            weighted_score >= self.face_config.recognition_threshold
+            and weighted_sub_label is not None
+            and not track_state.result_emitted
+        ):
+            queued = self.face_snapshot_worker.submit(
+                (camera, id),
+                FaceSnapshotJob(
+                    camera=camera,
+                    event_id=id,
+                    frame_time=frame_time,
+                    person_box=person_box,
+                    face_box=tuple(int(value) for value in face_box),
+                    sub_label=weighted_sub_label,
+                    face_score=weighted_score,
+                    frame=frame.copy(),
+                ),
+            )
+            if queued:
+                track_state.last_snapshot_time = frame_time
+                track_state.result_emitted = True
+                self.face_counters["snapshot_queued"] += 1
+            else:
+                self.face_counters["face_snapshot_rejected"] += 1
 
         self.__update_metrics(datetime.datetime.now().timestamp() - start)
 
@@ -661,6 +633,12 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
     def expire_object(self, object_id: str, camera: str) -> None:
         self.face_tracks.pop((camera, object_id), None)
 
+    def expire_missing_objects(self, camera: str, active_ids: set[str]) -> None:
+        """Reconcile face state with the authoritative active detection set."""
+        for key in list(self.face_tracks):
+            if key[0] == camera and key[1] not in active_ids:
+                self.face_tracks.pop(key, None)
+
     def drain_results(self) -> list[dict[str, Any]]:
         """Return snapshot artifacts completed by the background worker."""
         payloads = []
@@ -751,7 +729,10 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         sub_label: str,
         score: float,
     ) -> None:
-        if self.config.face_recognition.save_attempts:
+        if (
+            self.config.face_recognition.save_attempts
+            and sub_label == "unknown"
+        ):
             self.face_attempt_worker.submit(
                 (camera, event_id),
                 FaceAttemptJob(

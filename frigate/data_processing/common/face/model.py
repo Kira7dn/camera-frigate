@@ -12,6 +12,7 @@ from frigate.config import FrigateConfig
 from frigate.const import FACE_DIR, MODEL_CACHE_DIR
 from frigate.embeddings.onnx.face_embedding import ArcfaceEmbedding, FaceNetEmbedding
 from frigate.log import redirect_output_to_logger
+from frigate.util.face_snapshot import is_face_identity_directory
 
 logger = logging.getLogger(__name__)
 
@@ -235,12 +236,9 @@ class FaceNetRecognizer(FaceRecognizer):
 
             dir = FACE_DIR
             for name in os.listdir(dir):
-                if name == "train":
-                    continue
-
                 face_folder = os.path.join(dir, name)
 
-                if not os.path.isdir(face_folder):
+                if not is_face_identity_directory(name, face_folder):
                     continue
 
                 face_embeddings_map[name] = []
@@ -346,12 +344,9 @@ class ArcFaceRecognizer(FaceRecognizer):
 
             dir = FACE_DIR
             for name in os.listdir(dir):
-                if name == "train":
-                    continue
-
                 face_folder = os.path.join(dir, name)
 
-                if not os.path.isdir(face_folder):
+                if not is_face_identity_directory(name, face_folder):
                     continue
 
                 face_embeddings_map[name] = []

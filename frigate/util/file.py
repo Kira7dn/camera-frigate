@@ -97,7 +97,7 @@ def _get_event_snapshot_overlay_boxes(
         overlay_boxes.append(
             {
                 "box": box,
-                "label": event.label,
+                "label": getattr(event, "sub_label", None) or event.label,
                 "score": draw_box.get("score"),
                 "color": color,
             }
@@ -144,7 +144,7 @@ def get_event_snapshot_bytes(
         crop=crop and is_clean_snapshot,
         height=height,
         quality=quality,
-        label=event.label,
+        label=getattr(event, "sub_label", None) or event.label,
         box=box,
         score=_get_event_snapshot_score(event),
         area=_get_event_snapshot_area(event),

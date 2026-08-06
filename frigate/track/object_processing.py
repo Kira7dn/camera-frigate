@@ -36,7 +36,6 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateSubscriber,
 )
 from frigate.const import (
-    FACE_DIR,
     FAST_QUEUE_TIMEOUT,
     UPDATE_CAMERA_ACTIVITY,
     UPSERT_REVIEW_SEGMENT,
@@ -46,6 +45,7 @@ from frigate.models import Event, ReviewSegment, Timeline
 from frigate.ptz.autotrack import PtzAutoTrackerThread
 from frigate.track.tracked_object import TrackedObject
 from frigate.util.face_snapshot import (
+    FACE_EVENT_STAGING_DIR,
     FaceRecognitionResult,
 )
 from frigate.util.image import SharedMemoryFrameManager
@@ -166,15 +166,10 @@ class TrackedObjectProcessor(threading.Thread):
             )
             obj.has_clip = self.should_retain_recording(camera, obj)
 
-            if obj.face_snapshot:
-                result = self._result_from_snapshot(
-                    camera, obj.obj_data["id"], obj.face_snapshot
-                )
-                queued = self._queue_face_commit(result)
-                if not queued:
-                    logger.warning(
-                        "Face snapshot media queue full for %s", obj.obj_data["id"]
-                    )
+            if obj.face_snapshot_state in ("pending", "committed"):
+                # The recognition result was already queued when it arrived.
+                # Never let the end callback replace recognition media.
+                pass
             else:
                 # Existing snapshots retain their normal synchronous path.
                 if obj.has_snapshot or obj.has_clip:
@@ -512,8 +507,10 @@ class TrackedObjectProcessor(threading.Thread):
 
         # The producer is an internal Frigate process, but keep the path
         # constrained to the face artifact directory before touching media.
-        face_dir = os.path.abspath(FACE_DIR)
-        if not artifact_path.startswith(face_dir + os.sep):
+        staging_dir = os.path.abspath(FACE_EVENT_STAGING_DIR)
+        if not artifact_path.startswith(staging_dir + os.sep) or not os.path.isfile(
+            artifact_path
+        ):
             logger.warning("Ignoring invalid face snapshot artifact: %s", artifact_path)
             return
         snapshot = {
@@ -548,23 +545,23 @@ class TrackedObjectProcessor(threading.Thread):
         if tracked_obj is not None:
             track_start = float(tracked_obj.obj_data.get("start_time", 0))
             track_frame = float(tracked_obj.obj_data.get("frame_time", 0))
-            if "end_time" in tracked_obj.obj_data:
-                if not self._queue_face_commit(result):
-                    self._queue_face_cleanup(artifact_path)
-                return
             if source_frame_time < track_start or source_frame_time > track_frame:
                 self._queue_face_cleanup(artifact_path)
                 return
             obsolete_artifact = tracked_obj.set_face_snapshot(snapshot)
+            if obsolete_artifact == artifact_path:
+                self._queue_face_cleanup(artifact_path)
+                return
             if obsolete_artifact:
                 self._queue_face_cleanup(obsolete_artifact)
-            tracked_obj.obj_data["sub_label"] = (
-                result.sub_label,
-                result.face_score,
-            )
             tracked_obj.has_snapshot = True
+            if not self._queue_face_commit(result):
+                tracked_obj.face_snapshot = None
+                tracked_obj.face_snapshot_state = "failed"
+                self._queue_face_cleanup(artifact_path)
+                return
             logger.debug(
-                "Face snapshot attached to active event %s at frame %.3f",
+                "Face snapshot commit pending for active event %s at frame %.3f",
                 event_id,
                 source_frame_time,
             )
@@ -573,6 +570,49 @@ class TrackedObjectProcessor(threading.Thread):
         if not self._queue_face_commit(result):
             logger.warning("Face snapshot media queue full for %s", event_id)
             self._queue_face_cleanup(artifact_path)
+
+    def apply_face_snapshot_completion(self, payload: dict[str, Any]) -> None:
+        """Publish identity only after canonical media and DB are complete."""
+        try:
+            camera = str(payload["camera"])
+            event_id = str(payload["event_id"])
+            frame_time = float(payload["frame_time"])
+            status = str(payload["status"])
+        except (KeyError, TypeError, ValueError):
+            return
+        state = self.camera_states.get(camera)
+        tracked_obj = state.tracked_objects.get(event_id) if state else None
+        if tracked_obj is None or tracked_obj.face_snapshot is None:
+            return
+        snapshot = tracked_obj.face_snapshot
+        if float(snapshot.get("frame_time", 0)) != frame_time:
+            return
+        if status != "committed":
+            tracked_obj.face_snapshot = None
+            tracked_obj.face_snapshot_state = "failed"
+            tracked_obj.has_snapshot = self.should_save_snapshot(camera, tracked_obj)
+            return
+
+        snapshot["path"] = str(payload["canonical_path"])
+        tracked_obj.face_snapshot_state = "committed"
+        tracked_obj.obj_data["sub_label"] = (
+            str(payload["sub_label"]),
+            float(payload["face_score"]),
+        )
+        self.requestor.send_data(
+            "tracked_object_update",
+            json.dumps(
+                {
+                    "type": "face",
+                    "name": payload["sub_label"],
+                    "score": payload["face_score"],
+                    "id": event_id,
+                    "camera": camera,
+                    "timestamp": frame_time,
+                    "source_frame_time": frame_time,
+                }
+            ),
+        )
 
     @staticmethod
     def _result_from_snapshot(
@@ -893,6 +933,10 @@ class TrackedObjectProcessor(threading.Thread):
                     self.set_sub_label(event_id, sub_label, score)
                 elif topic.endswith(EventMetadataTypeEnum.face_snapshot.value):
                     self.set_face_snapshot(payload)
+                elif topic.endswith(
+                    EventMetadataTypeEnum.face_snapshot_committed.value
+                ):
+                    self.apply_face_snapshot_completion(payload)
                 elif topic.endswith(EventMetadataTypeEnum.attribute.value):
                     (event_id, field_name, field_value, score) = payload
                     self.set_object_attribute(event_id, field_name, field_value, score)

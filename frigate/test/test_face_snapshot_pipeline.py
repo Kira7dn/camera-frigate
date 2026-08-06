@@ -1,5 +1,6 @@
 """Tests for bounded, event-safe face snapshot handling."""
 
+import json
 import os
 import tempfile
 import threading
@@ -13,11 +14,13 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from frigate.const import FACE_DIR
+from frigate.api.classification import get_faces
+from frigate.embeddings.maintainer import EmbeddingMaintainer, FaceRealTimeProcessor
 from frigate.events.maintainer import EventProcessor
 from frigate.track.object_processing import TrackedObjectProcessor
 from frigate.track.tracked_object import TrackedObject
 from frigate.util.face_snapshot import (
+    FACE_EVENT_STAGING_DIR,
     CleanupJob,
     FaceRecognitionResult,
     FaceSnapshotJob,
@@ -25,12 +28,82 @@ from frigate.util.face_snapshot import (
     SnapshotCommitJob,
     SnapshotCommitted,
     commit_snapshot_job,
+    is_face_identity_directory,
     is_track_discontinuity,
+    is_unknown_face_attempt,
+    parse_face_attempt_filename,
     write_face_snapshot_artifact,
 )
 
 
 class FaceSnapshotPipelineTest(unittest.TestCase):
+    def test_face_library_api_exposes_only_unknown_training_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            os.makedirs(os.path.join(folder, "alice"))
+            os.makedirs(os.path.join(folder, "train"))
+            os.makedirs(os.path.join(folder, "events"))
+            open(os.path.join(folder, "alice", "reference.webp"), "wb").close()
+            open(
+                os.path.join(folder, "train", "event-1-1.0-unknown-0.4.webp"),
+                "wb",
+            ).close()
+            open(
+                os.path.join(folder, "train", "event-2-2.0-unknown-0.3.webp"),
+                "wb",
+            ).close()
+            open(os.path.join(folder, "events", "runtime.webp"), "wb").close()
+
+            with (
+                patch("frigate.api.classification.FACE_DIR", folder),
+                patch(
+                    "frigate.api.classification._identified_face_event_ids",
+                    return_value={"event-2"},
+                ),
+            ):
+                response = get_faces()
+
+            payload = json.loads(response.body)
+            self.assertEqual(payload["alice"], ["reference.webp"])
+            self.assertEqual(payload["train"], ["event-1-1.0-unknown-0.4.webp"])
+            self.assertNotIn("events", payload)
+
+    def test_recent_face_attempt_contract_only_accepts_unknown(self) -> None:
+        self.assertTrue(
+            is_unknown_face_attempt("camera-1234.5-unknown-0.42.webp")
+        )
+        self.assertFalse(
+            is_unknown_face_attempt("camera-1234.5-alice-0.95.webp")
+        )
+        self.assertFalse(is_unknown_face_attempt("unknown.txt"))
+        self.assertEqual(
+            parse_face_attempt_filename(
+                "event-with-hyphens-1234.5-unknown-0.42.webp"
+            ),
+            ("event-with-hyphens", "unknown"),
+        )
+
+    def test_only_unknown_face_attempts_are_queued(self) -> None:
+        processor = FaceRealTimeProcessor.__new__(FaceRealTimeProcessor)
+        processor.config = SimpleNamespace(
+            face_recognition=SimpleNamespace(save_attempts=200)
+        )
+        queued = []
+        processor.face_attempt_worker = SimpleNamespace(
+            submit=lambda key, job: queued.append((key, job)) or True
+        )
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+        processor.queue_face_attempt(
+            "face_camera", frame, "event-1", 10.0, "alice", 0.95
+        )
+        processor.queue_face_attempt(
+            "face_camera", frame, "event-2", 11.0, "unknown", 0.42
+        )
+
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0][0], ("face_camera", "event-2"))
+        self.assertEqual(queued[0][1].sub_label, "unknown")
+
     def test_empty_metadata_sentinel_is_ignored(self) -> None:
         processor = EventProcessor.__new__(EventProcessor)
         processor.face_snapshot_receiver = SimpleNamespace(
@@ -108,35 +181,39 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertTrue(os.path.isfile(result.artifact_path))
             self.assertEqual(
-                [
-                    name
-                    for name in os.listdir(os.path.join(folder, "events"))
-                    if ".tmp-" in name
-                ],
+                [name for name in os.listdir(folder) if ".tmp-" in name],
                 [],
             )
 
     def test_stale_active_result_is_not_attached(self) -> None:
-        processor = TrackedObjectProcessor.__new__(TrackedObjectProcessor)
-        tracked = SimpleNamespace(
-            obj_data={"start_time": 10.0, "frame_time": 20.0},
-            set_face_snapshot=lambda _: self.fail("stale result was attached"),
-        )
-        processor.config = SimpleNamespace(
-            cameras={
-                "face_camera": SimpleNamespace(snapshots=SimpleNamespace(enabled=True))
+        with tempfile.TemporaryDirectory() as folder:
+            artifact = os.path.join(folder, "event.webp")
+            cv2.imwrite(artifact, np.zeros((4, 4, 3), dtype=np.uint8))
+            processor = TrackedObjectProcessor.__new__(TrackedObjectProcessor)
+            tracked = SimpleNamespace(
+                obj_data={"start_time": 10.0, "frame_time": 20.0},
+                set_face_snapshot=lambda _: self.fail("stale result was attached"),
+            )
+            processor.config = SimpleNamespace(
+                cameras={
+                    "face_camera": SimpleNamespace(
+                        snapshots=SimpleNamespace(enabled=True)
+                    )
+                }
+            )
+            processor.camera_states = {
+                "face_camera": SimpleNamespace(tracked_objects={"event-1": tracked})
             }
-        )
-        processor.camera_states = {
-            "face_camera": SimpleNamespace(tracked_objects={"event-1": tracked})
-        }
-        queued = []
-        processor.face_media_publisher = SimpleNamespace(
-            publish=lambda payload, topic: queued.append((topic, payload))
-        )
-        payload = self._payload(frame_time=9.0)
-        processor.set_face_snapshot(payload)
-        self.assertEqual(queued[0][1]["paths"], (payload["artifact_path"],))
+            queued = []
+            processor.face_media_publisher = SimpleNamespace(
+                publish=lambda payload, topic: queued.append((topic, payload))
+            )
+            payload = self._payload(frame_time=9.0, artifact_path=artifact)
+            with patch(
+                "frigate.track.object_processing.FACE_EVENT_STAGING_DIR", folder
+            ):
+                processor.set_face_snapshot(payload)
+            self.assertEqual(queued[0][1]["paths"], (payload["artifact_path"],))
 
     def test_late_result_updates_only_matching_event_and_commits_atomically(
         self,
@@ -247,6 +324,203 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
             release.set()
             worker.stop()
 
+    def test_face_attempts_are_rate_limited_and_confirm_on_second_match(self) -> None:
+        processor = FaceRealTimeProcessor.__new__(FaceRealTimeProcessor)
+        processor.config = SimpleNamespace(
+            cameras={
+                "face_camera": SimpleNamespace(
+                    face_recognition=SimpleNamespace(enabled=True, min_area=1)
+                )
+            }
+        )
+        processor.face_config = SimpleNamespace(
+            unknown_score=0.5, recognition_threshold=0.8, min_faces=2
+        )
+        processor.requires_face_detection = False
+        processor.face_tracks = {}
+        processor.face_counters = Counter()
+        processor.last_face_metrics_log = time.monotonic()
+        processor.metrics = SimpleNamespace(face_rec_fps=SimpleNamespace(value=0))
+        processor.faces_per_second = SimpleNamespace(eps=lambda: 0)
+        processor.recognizer = SimpleNamespace(classify=lambda _: ("alice", 0.95))
+        processor.queue_face_attempt = lambda *args: None
+        processor._FaceRealTimeProcessor__update_metrics = lambda duration: None
+        queued = []
+        processor.face_snapshot_worker = SimpleNamespace(
+            submit=lambda key, job: queued.append((key, job)) or True
+        )
+        frame = np.zeros((6, 4), dtype=np.uint8)
+        obj = {
+            "camera": "face_camera",
+            "id": "event-1",
+            "label": "person",
+            "box": (0, 0, 4, 4),
+            "area": 16,
+            "sub_label": None,
+            "current_attributes": [
+                {"label": "face", "score": 0.9, "box": (1, 1, 3, 3)}
+            ],
+        }
+        for frame_time in (100.0, 100.2, 100.5):
+            processor.process_frame({**obj, "frame_time": frame_time}, frame)
+        self.assertEqual(processor.face_counters["classified"], 2)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0][1].frame_time, 100.5)
+
+    def test_detection_stream_limits_face_work_to_four_people(self) -> None:
+        processor = FaceRealTimeProcessor.__new__(FaceRealTimeProcessor)
+        processed = []
+        processor.face_tracks = {}
+        processor.process_frame = lambda obj, frame: processed.append(obj["id"])
+        maintainer = EmbeddingMaintainer.__new__(EmbeddingMaintainer)
+        people = [
+            {"id": str(index), "label": "person", "box": (0, 0, 2, 2), "area": index}
+            for index in range(1, 6)
+        ]
+        updates = iter(
+            [
+                (
+                    "video",
+                    (
+                        "face_camera",
+                        "stale-frame",
+                        9.8,
+                        [{"id": "stale", "label": "person", "box": (0, 0, 2, 2)}],
+                        [],
+                        [],
+                    ),
+                ),
+                (
+                    "video",
+                    ("face_camera", "frame", 10.0, people, [], []),
+                ),
+                (None, None),
+            ]
+        )
+        maintainer.detection_subscriber = SimpleNamespace(
+            check_for_update=lambda timeout=None: next(updates)
+        )
+        camera_config = SimpleNamespace(
+            type="camera",
+            objects=SimpleNamespace(track=["person"]),
+            face_recognition=SimpleNamespace(enabled=True),
+            frame_shape_yuv=(6, 4),
+        )
+        maintainer.config = SimpleNamespace(
+            cameras={"face_camera": camera_config},
+            classification=SimpleNamespace(custom={}),
+        )
+        maintainer.realtime_processors = [processor]
+        maintainer.frame_manager = SimpleNamespace(
+            get=lambda *args: np.zeros((6, 4), dtype=np.uint8),
+            close=lambda *args: None,
+        )
+        maintainer._process_frame_updates()
+        self.assertEqual(processed, ["5", "4", "3", "2"])
+
+    def test_reserved_and_hidden_face_directories_are_not_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            for name in ("alice", "train", "events", "staging", ".hidden"):
+                os.makedirs(os.path.join(folder, name))
+            self.assertTrue(
+                is_face_identity_directory("alice", os.path.join(folder, "alice"))
+            )
+            for name in ("train", "events", "staging", ".hidden"):
+                self.assertFalse(
+                    is_face_identity_directory(name, os.path.join(folder, name))
+                )
+
+    def test_face_state_reconciles_with_active_detection_set(self) -> None:
+        processor = FaceRealTimeProcessor.__new__(FaceRealTimeProcessor)
+        processor.face_tracks = {
+            ("face_camera", "active"): object(),
+            ("face_camera", "ended"): object(),
+            ("other_camera", "other"): object(),
+        }
+        processor.expire_missing_objects("face_camera", {"active"})
+        self.assertEqual(
+            set(processor.face_tracks),
+            {("face_camera", "active"), ("other_camera", "other")},
+        )
+
+    def test_active_identity_is_published_only_after_commit_ack(self) -> None:
+        processor = TrackedObjectProcessor.__new__(TrackedObjectProcessor)
+        sent = []
+        processor.requestor = SimpleNamespace(
+            send_data=lambda topic, payload: sent.append((topic, payload))
+        )
+        tracked = SimpleNamespace(
+            face_snapshot={
+                "frame_time": 10.0,
+                "path": "/tmp/cache/face-events/event.webp",
+            },
+            face_snapshot_state="pending",
+            obj_data={"label": "person"},
+        )
+        processor.camera_states = {
+            "face_camera": SimpleNamespace(tracked_objects={"event-1": tracked})
+        }
+        payload = {
+            **self._payload(),
+            "status": "committed",
+            "canonical_path": "/media/frigate/clips/face_camera-event-1-clean.webp",
+        }
+        processor.apply_face_snapshot_completion(payload)
+        self.assertEqual(tracked.face_snapshot_state, "committed")
+        self.assertEqual(tracked.obj_data["sub_label"], ("person_1", 0.99))
+        self.assertEqual(len(sent), 1)
+
+    def test_failed_commit_does_not_publish_identity(self) -> None:
+        processor = TrackedObjectProcessor.__new__(TrackedObjectProcessor)
+        processor.should_save_snapshot = lambda camera, tracked: False
+        processor.requestor = SimpleNamespace(
+            send_data=lambda *args: self.fail("failed identity was published")
+        )
+        tracked = SimpleNamespace(
+            face_snapshot={"frame_time": 10.0, "path": "artifact.webp"},
+            face_snapshot_state="pending",
+            obj_data={"label": "person"},
+            has_snapshot=True,
+        )
+        processor.camera_states = {
+            "face_camera": SimpleNamespace(tracked_objects={"event-1": tracked})
+        }
+        processor.apply_face_snapshot_completion(
+            {**self._payload(), "status": "failed", "reason": "database"}
+        )
+        self.assertIsNone(tracked.face_snapshot)
+        self.assertEqual(tracked.face_snapshot_state, "failed")
+        self.assertNotIn("sub_label", tracked.obj_data)
+
+    def test_atomic_commit_restores_previous_media_on_thumbnail_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            artifact = os.path.join(folder, "artifact.webp")
+            canonical = os.path.join(folder, "canonical.webp")
+            thumbnail = os.path.join(folder, "thumbnail.webp")
+            cv2.imwrite(artifact, np.full((10, 10, 3), 200, dtype=np.uint8))
+            cv2.imwrite(canonical, np.full((10, 10, 3), 10, dtype=np.uint8))
+            cv2.imwrite(thumbnail, np.full((10, 10, 3), 20, dtype=np.uint8))
+            original_replace = os.replace
+
+            def fail_thumbnail(source, destination):
+                if destination == thumbnail and ".tmp-" in source:
+                    raise OSError("thumbnail replace failed")
+                return original_replace(source, destination)
+
+            job = SnapshotCommitJob(
+                FaceRecognitionResult(**self._payload(artifact_path=artifact)),
+                canonical,
+                thumbnail,
+            )
+            with (
+                patch("frigate.util.face_snapshot.os.replace", fail_thumbnail),
+                self.assertRaises(OSError),
+            ):
+                commit_snapshot_job(job)
+            self.assertLess(cv2.imread(canonical).mean(), 15)
+            self.assertLess(cv2.imread(thumbnail).mean(), 25)
+            self.assertFalse(os.path.exists(artifact))
+
     @staticmethod
     def _payload(frame_time: float = 10.0, artifact_path: str | None = None) -> dict:
         return {
@@ -257,7 +531,8 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
             "face_box": (2, 2, 8, 8),
             "sub_label": "person_1",
             "face_score": 0.99,
-            "artifact_path": artifact_path or os.path.join(FACE_DIR, "event.webp"),
+            "artifact_path": artifact_path
+            or os.path.join(FACE_EVENT_STAGING_DIR, "event.webp"),
         }
 
 

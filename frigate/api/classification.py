@@ -43,10 +43,27 @@ from frigate.util.classification import (
     write_training_metadata,
 )
 from frigate.util.file import get_event_snapshot
+from frigate.util.face_snapshot import (
+    is_face_identity_directory,
+    is_unknown_face_attempt,
+    parse_face_attempt_filename,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=[Tags.classification])
+
+
+def _identified_face_event_ids(event_ids: set[str]) -> set[str]:
+    if not event_ids:
+        return set()
+
+    return {
+        event.id
+        for event in Event.select(Event.id).where(
+            Event.id.in_(event_ids) & Event.sub_label.is_null(False)
+        )
+    }
 
 
 @router.get(
@@ -67,7 +84,27 @@ def get_faces():
     for name in os.listdir(FACE_DIR):
         face_dir = os.path.join(FACE_DIR, name)
 
-        if not os.path.isdir(face_dir):
+        if name == "train" and os.path.isdir(face_dir):
+            unknown_attempts = [
+                file
+                for file in os.listdir(face_dir)
+                if is_unknown_face_attempt(file)
+            ]
+            attempt_event_ids = {
+                parsed[0]
+                for file in unknown_attempts
+                if (parsed := parse_face_attempt_filename(file)) is not None
+            }
+            identified_event_ids = _identified_face_event_ids(attempt_event_ids)
+            face_dict[name] = [
+                file
+                for file in unknown_attempts
+                if (parsed := parse_face_attempt_filename(file)) is not None
+                and parsed[0] not in identified_event_ids
+            ]
+            continue
+
+        if not is_face_identity_directory(name, face_dir):
             continue
 
         face_dict[name] = []

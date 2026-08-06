@@ -72,6 +72,7 @@ class TrackedObject:
         # The artifact is written by the embeddings process and consumed here
         # without sending image bytes through the IPC queue.
         self.face_snapshot: dict[str, Any] | None = None
+        self.face_snapshot_state: str | None = None
         self.last_updated: float = 0
         self.last_published: float = 0
         self.frame = None
@@ -514,7 +515,9 @@ class TrackedObject:
             crop=crop,
             height=height,
             quality=quality,
-            label=self.obj_data["label"],
+            label=(self.obj_data.get("sub_label") or (self.obj_data["label"],))[0]
+            if isinstance(self.obj_data.get("sub_label"), tuple)
+            else self.obj_data.get("sub_label") or self.obj_data["label"],
             box=snapshot_data["box"],
             score=snapshot_data["score"],
             area=snapshot_data["area"],
@@ -531,6 +534,7 @@ class TrackedObject:
             return snapshot.get("path")
 
         self.face_snapshot = snapshot
+        self.face_snapshot_state = "pending"
         return current.get("path") if current else None
 
     def write_snapshot_to_disk(self) -> None:
@@ -589,6 +593,7 @@ class TrackedObject:
             os.unlink(self.face_snapshot["path"])
         except FileNotFoundError:
             pass
+        self.face_snapshot = None
 
 
 def zone_filtered(obj: TrackedObject, object_config: dict[str, FilterConfig]) -> bool:

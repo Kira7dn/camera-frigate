@@ -70,3 +70,31 @@ class TestFileUtils(TestCase):
             assert rendered_image is not None
             assert rendered_image.shape[0] == 40
             assert rendered_image.max() > 0
+
+    def test_snapshot_bbox_uses_sub_label_with_person_fallback(self):
+        image = np.zeros((20, 20, 3), np.uint8)
+        for sub_label, expected in (("alice", "alice"), (None, "person")):
+            event = SimpleNamespace(
+                id="label-event",
+                camera="front_door",
+                label="person",
+                sub_label=sub_label,
+                top_score=0.9,
+                score=0.9,
+                start_time=1.0,
+                data={"box": [0.1, 0.1, 0.5, 0.5], "attributes": []},
+            )
+            with (
+                patch.object(
+                    file_util,
+                    "load_event_snapshot_image",
+                    return_value=(image, True),
+                ),
+                patch.object(
+                    file_util,
+                    "get_snapshot_bytes",
+                    return_value=(b"snapshot", 1.0),
+                ) as renderer,
+            ):
+                file_util.get_event_snapshot_bytes(event, ext="jpg", bounding_box=True)
+            self.assertEqual(renderer.call_args.kwargs["label"], expected)

@@ -2,6 +2,8 @@
 
 import logging
 import os
+import re
+import shutil
 import threading
 import time
 from collections import Counter, OrderedDict, deque
@@ -17,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 FaceTrackKey = tuple[str, str]
 Box = tuple[int, int, int, int]
+FACE_EVENT_STAGING_DIR = "/tmp/cache/face-events"
+FACE_PROCESS_INTERVAL = 0.5
+EXCLUDED_FACE_DIRECTORIES = frozenset({"train", "events", "staging", "face-events"})
+_LEGACY_ARTIFACT = re.compile(r"^.+-.+-\d+(?:\.\d+)?\.webp(?:\.tmp-\d+-\d+\.webp)?$")
+_FACE_ATTEMPT_IMAGE_EXTENSIONS = frozenset({".webp", ".png", ".jpg", ".jpeg"})
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,34 @@ class FaceTrackState:
     last_snapshot_time: float
     votes: list[FaceVote]
     candidate: FaceRecognitionResult | None = None
+    last_attempt_time: float = 0.0
+    result_emitted: bool = False
+
+
+def parse_face_attempt_filename(filename: str) -> tuple[str, str] | None:
+    """Return the event id and identity encoded in a face-attempt filename."""
+    path = Path(filename)
+    if path.suffix.lower() not in _FACE_ATTEMPT_IMAGE_EXTENSIONS:
+        return None
+
+    parts = path.stem.rsplit("-", 3)
+    if len(parts) != 4 or not parts[0]:
+        return None
+
+    event_id, timestamp, sub_label, score = parts
+    try:
+        float(timestamp)
+        float(score)
+    except ValueError:
+        return None
+
+    return event_id, sub_label
+
+
+def is_unknown_face_attempt(filename: str) -> bool:
+    """Return whether a face-attempt filename represents an unknown identity."""
+    parsed = parse_face_attempt_filename(filename)
+    return parsed is not None and parsed[1] == "unknown"
 
 
 @dataclass(frozen=True)
@@ -112,6 +147,17 @@ class SnapshotCommitted:
             "canonical_path": self.canonical_path,
             "thumbnail_path": self.thumbnail_path,
         }
+
+
+@dataclass(frozen=True)
+class SnapshotFailed:
+    """Failed media completion used to release pending active state."""
+
+    result: FaceRecognitionResult
+    reason: str
+
+    def as_payload(self) -> dict[str, Any]:
+        return {**self.result.as_payload(), "status": "failed", "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -305,11 +351,11 @@ def cleanup_paths(job: CleanupJob) -> None:
 
 
 def write_face_snapshot_artifact(
-    job: FaceSnapshotJob, face_dir: str
+    job: FaceSnapshotJob, staging_dir: str = FACE_EVENT_STAGING_DIR
 ) -> FaceRecognitionResult | None:
     """Encode once and atomically publish a recognition staging artifact."""
-    folder = os.path.join(face_dir, "events")
-    os.makedirs(folder, exist_ok=True)
+    folder = staging_dir
+    os.makedirs(folder, mode=0o700, exist_ok=True)
     artifact_path = os.path.join(
         folder, f"{job.camera}-{job.event_id}-{job.frame_time}.webp"
     )
@@ -346,7 +392,10 @@ def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
     thumbnail_temp = (
         f"{job.thumbnail_path}.tmp-{os.getpid()}-{threading.get_ident()}.webp"
     )
-    committed: list[str] = []
+    canonical_backup = f"{job.canonical_path}.bak-{os.getpid()}-{threading.get_ident()}"
+    thumbnail_backup = f"{job.thumbnail_path}.bak-{os.getpid()}-{threading.get_ident()}"
+    had_canonical = os.path.isfile(job.canonical_path)
+    had_thumbnail = os.path.isfile(job.thumbnail_path)
     try:
         if not cv2.imwrite(canonical_temp, image):
             raise OSError("Unable to encode canonical face snapshot")
@@ -358,17 +407,25 @@ def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
         )
         if not cv2.imwrite(thumbnail_temp, thumbnail):
             raise OSError("Unable to encode face snapshot thumbnail")
+        if had_canonical:
+            os.replace(job.canonical_path, canonical_backup)
+        if had_thumbnail:
+            os.replace(job.thumbnail_path, thumbnail_backup)
         os.replace(canonical_temp, job.canonical_path)
-        committed.append(job.canonical_path)
         os.replace(thumbnail_temp, job.thumbnail_path)
-        committed.append(job.thumbnail_path)
     except Exception:
-        for path in committed:
-            Path(path).unlink(missing_ok=True)
+        Path(job.canonical_path).unlink(missing_ok=True)
+        Path(job.thumbnail_path).unlink(missing_ok=True)
+        if had_canonical and os.path.isfile(canonical_backup):
+            os.replace(canonical_backup, job.canonical_path)
+        if had_thumbnail and os.path.isfile(thumbnail_backup):
+            os.replace(thumbnail_backup, job.thumbnail_path)
         raise
     finally:
         Path(canonical_temp).unlink(missing_ok=True)
         Path(thumbnail_temp).unlink(missing_ok=True)
+        Path(canonical_backup).unlink(missing_ok=True)
+        Path(thumbnail_backup).unlink(missing_ok=True)
         Path(job.result.artifact_path).unlink(missing_ok=True)
     return SnapshotCommitted(job.result, job.canonical_path, job.thumbnail_path)
 
@@ -392,16 +449,46 @@ def write_face_attempt(job: FaceAttemptJob) -> None:
         old_file.unlink(missing_ok=True)
 
 
-def reap_stale_staging(face_dir: str, max_age_seconds: int = 3600) -> int:
+def reap_stale_staging(
+    staging_dir: str = FACE_EVENT_STAGING_DIR, max_age_seconds: int = 3600
+) -> int:
     """Delete only contract-named temporary staging files older than one hour."""
-    folder = Path(face_dir) / "events"
+    folder = Path(staging_dir)
     if not folder.is_dir():
         return 0
     cutoff = time.time() - max_age_seconds
     removed = 0
     for path in folder.glob("*.webp*"):
-        is_contract_staging = path.name.endswith(".webp") or ".webp.tmp-" in path.name
+        is_contract_staging = bool(_LEGACY_ARTIFACT.match(path.name))
         if is_contract_staging and path.is_file() and path.stat().st_mtime < cutoff:
             path.unlink(missing_ok=True)
             removed += 1
     return removed
+
+
+def is_face_identity_directory(name: str, path: str) -> bool:
+    """Return whether a child of FACE_DIR is a public identity directory."""
+    return (
+        bool(name)
+        and not name.startswith(".")
+        and name.lower() not in EXCLUDED_FACE_DIRECTORIES
+        and os.path.isdir(path)
+    )
+
+
+def cleanup_legacy_face_events(face_dir: str) -> int:
+    """Remove only the obsolete runtime-created FACE_DIR/events artifact folder."""
+    legacy = Path(face_dir) / "events"
+    if not legacy.is_dir():
+        return 0
+    entries = list(legacy.iterdir())
+    if any(
+        not entry.is_file() or not _LEGACY_ARTIFACT.match(entry.name)
+        for entry in entries
+    ):
+        logger.warning("Preserving non-runtime content in legacy face events directory")
+        return 0
+    for entry in entries:
+        entry.unlink(missing_ok=True)
+    shutil.rmtree(legacy, ignore_errors=False)
+    return len(entries)

@@ -488,6 +488,7 @@ class EmbeddingMaintainer(threading.Thread):
             return
 
         # Create our own thumbnail based on the bounding box and the frame time
+        yuv_frame = None
         try:
             yuv_frame = self.frame_manager.get(
                 frame_name, camera_config.frame_shape_yuv
@@ -506,6 +507,10 @@ class EmbeddingMaintainer(threading.Thread):
             f"Processing {len(self.realtime_processors)} realtime processors for object {data.get('id')} (label: {data.get('label')})"
         )
         for processor in self.realtime_processors:
+            if isinstance(processor, FaceRealTimeProcessor):
+                # Face recognition uses the current detection stream below,
+                # independent of thumbnail/event update cadence.
+                continue
             logger.debug(f"Calling process_frame on {processor.__class__.__name__}")
             processor.process_frame(data, yuv_frame)
 
@@ -697,13 +702,23 @@ class EmbeddingMaintainer(threading.Thread):
                     )
 
     def _process_frame_updates(self) -> None:
-        """Process event updates"""
-        (topic, data) = self.detection_subscriber.check_for_update()
+        """Drain queued detections and process only the latest frame per camera."""
+        latest_by_camera: dict[str, Any] = {}
+        topic, data = self.detection_subscriber.check_for_update()
+        for _ in range(256):
+            if topic is None:
+                break
+            if data and data[0]:
+                latest_by_camera[str(data[0])] = data
+            topic, data = self.detection_subscriber.check_for_update(timeout=0)
 
-        if topic is None:
-            return
+        for data in latest_by_camera.values():
+            self._process_latest_frame(data)
 
-        camera, frame_name, _, _, motion_boxes, _ = data
+    def _process_latest_frame(self, data: Any) -> None:
+        """Process one latest detection frame without retaining older work."""
+
+        camera, frame_name, _, tracked_objects, motion_boxes, _ = data
 
         if not camera or camera not in self.config.cameras:
             return
@@ -720,11 +735,18 @@ class EmbeddingMaintainer(threading.Thread):
         has_enabled_custom = any(
             c.enabled for c in self.config.classification.custom.values()
         )
+        face_processors = [
+            processor
+            for processor in self.realtime_processors
+            if isinstance(processor, FaceRealTimeProcessor)
+        ]
+        face_enabled = bool(face_processors and camera_config.face_recognition.enabled)
 
-        if not dedicated_lpr_enabled and not has_enabled_custom:
+        if not dedicated_lpr_enabled and not has_enabled_custom and not face_enabled:
             # no active features that use this data
             return
 
+        yuv_frame = None
         try:
             yuv_frame = self.frame_manager.get(
                 frame_name, camera_config.frame_shape_yuv
@@ -739,6 +761,19 @@ class EmbeddingMaintainer(threading.Thread):
             return
 
         for processor in self.realtime_processors:
+            if face_enabled and isinstance(processor, FaceRealTimeProcessor):
+                people = [
+                    obj
+                    for obj in (tracked_objects or [])
+                    if obj.get("label") == "person" and obj.get("box")
+                ]
+                processor.expire_missing_objects(
+                    camera, {str(obj["id"]) for obj in people}
+                )
+                people.sort(key=lambda obj: int(obj.get("area", 0)), reverse=True)
+                for obj in people[:4]:
+                    processor.process_frame(obj, yuv_frame)
+
             if (
                 dedicated_lpr_enabled
                 and len(motion_boxes) > 0
