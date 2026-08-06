@@ -68,6 +68,10 @@ class TrackedObject:
         self.has_snapshot = False
         self.top_score = self.computed_score = 0.0
         self.thumbnail_data: dict[str, Any] | None = None
+        # Snapshot captured from the exact frame used by face recognition.
+        # The artifact is written by the embeddings process and consumed here
+        # without sending image bytes through the IPC queue.
+        self.face_snapshot: dict[str, Any] | None = None
         self.last_updated: float = 0
         self.last_published: float = 0
         self.frame = None
@@ -392,11 +396,19 @@ class TrackedObject:
             "estimate_velocity",
         }
 
+        snapshot = self.face_snapshot or self.thumbnail_data
+        if snapshot is not None:
+            # Do not expose the internal staging path over MQTT/API event
+            # messages. The event maintainer only needs frame/box metadata.
+            snapshot = {
+                key: value for key, value in snapshot.items() if key != "path"
+            }
+
         event: dict[str, Any] = {
             "id": self.obj_data["id"],
             "camera": self.camera_config.name,
             "frame_time": self.obj_data["frame_time"],
-            "snapshot": self.thumbnail_data,
+            "snapshot": snapshot,
             "snapshot_clean": True,
             "label": self.obj_data["label"],
             "sub_label": self.obj_data.get("sub_label"),
@@ -474,15 +486,21 @@ class TrackedObject:
         height: int | None = None,
         quality: int | None = None,
     ) -> tuple[bytes | None, float | None]:
-        if self.thumbnail_data is None:
+        snapshot_data = self.face_snapshot or self.thumbnail_data
+        if snapshot_data is None:
             return None, None
 
         try:
-            frame_time = self.thumbnail_data["frame_time"]
-            best_frame = cv2.cvtColor(
-                self.frame_cache[frame_time]["frame"],
-                cv2.COLOR_YUV2BGR_I420,
-            )
+            frame_time = snapshot_data["frame_time"]
+            if snapshot_data.get("path"):
+                best_frame = cv2.imread(snapshot_data["path"])
+                if best_frame is None:
+                    raise KeyError(snapshot_data["path"])
+            else:
+                best_frame = cv2.cvtColor(
+                    self.frame_cache[frame_time]["frame"],
+                    cv2.COLOR_YUV2BGR_I420,
+                )
         except KeyError:
             logger.warning(
                 f"Unable to create snapshot because frame {frame_time} is not in the cache"
@@ -499,14 +517,22 @@ class TrackedObject:
             height=height,
             quality=quality,
             label=self.obj_data["label"],
-            box=self.thumbnail_data["box"],
-            score=self.thumbnail_data["score"],
-            area=self.thumbnail_data["area"],
-            attributes=self.thumbnail_data["attributes"],
+            box=snapshot_data["box"],
+            score=snapshot_data["score"],
+            area=snapshot_data["area"],
+            attributes=snapshot_data["attributes"],
             color=self.colormap.get(self.obj_data["label"], (255, 255, 255)),
             timestamp_style=self.camera_config.timestamp_style,
-            estimated_speed=self.thumbnail_data["current_estimated_speed"],
+            estimated_speed=snapshot_data.get("current_estimated_speed", 0),
         )
+
+    def set_face_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Use a face-recognition frame as the event snapshot candidate."""
+        current = self.face_snapshot
+        if current and snapshot["frame_time"] <= current["frame_time"]:
+            return
+
+        self.face_snapshot = snapshot
 
     def write_snapshot_to_disk(self) -> None:
         webp_bytes = self.get_clean_webp()
@@ -521,6 +547,14 @@ class TrackedObject:
                 "wb",
             ) as p:
                 p.write(webp_bytes)
+            if self.face_snapshot and self.face_snapshot.get("path"):
+                try:
+                    os.unlink(self.face_snapshot["path"])
+                except OSError:
+                    logger.debug(
+                        "Unable to remove staged face snapshot for %s",
+                        self.obj_data["id"],
+                    )
 
     def write_thumbnail_to_disk(self) -> None:
         if not self.camera_config.name:

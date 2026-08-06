@@ -40,7 +40,7 @@ ENV CCACHE_DIR /root/.ccache
 ENV CCACHE_MAXSIZE 2G
 
 RUN --mount=type=bind,source=docker/main/build_nginx.sh,target=/deps/build_nginx.sh \
-    /deps/build_nginx.sh
+    bash /deps/build_nginx.sh
 
 FROM wget AS sqlite-vec
 ARG DEBIAN_FRONTEND
@@ -50,7 +50,7 @@ COPY docker/main/build_sqlite_vec.sh /deps/build_sqlite_vec.sh
 RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt \
     --mount=type=bind,source=docker/main/build_sqlite_vec.sh,target=/deps/build_sqlite_vec.sh \
     --mount=type=cache,target=/root/.ccache \
-    /deps/build_sqlite_vec.sh
+    bash /deps/build_sqlite_vec.sh
 
 # Build intel-media-driver from source against bookworm's system libva so it
 # works with Debian 12's glibc/libstdc++ (pre-built noble/trixie packages
@@ -58,7 +58,7 @@ RUN --mount=type=tmpfs,target=/tmp --mount=type=tmpfs,target=/var/cache/apt \
 FROM base AS intel-media-driver
 ARG DEBIAN_FRONTEND
 RUN --mount=type=bind,source=docker/main/build_intel_media_driver.sh,target=/deps/build_intel_media_driver.sh \
-    /deps/build_intel_media_driver.sh
+    bash /deps/build_intel_media_driver.sh
 
 FROM scratch AS go2rtc
 ARG TARGETARCH
@@ -68,7 +68,7 @@ ADD --link --chmod=755 "https://github.com/AlexxIT/go2rtc/releases/download/v1.9
 FROM wget AS tempio
 ARG TARGETARCH
 RUN --mount=type=bind,source=docker/main/install_tempio.sh,target=/deps/install_tempio.sh \
-    /deps/install_tempio.sh
+    bash /deps/install_tempio.sh
 
 ####
 #
@@ -150,7 +150,7 @@ COPY audio-labelmap.txt .
 FROM wget AS s6-overlay
 ARG TARGETARCH
 RUN --mount=type=bind,source=docker/main/install_s6_overlay.sh,target=/deps/install_s6_overlay.sh \
-    /deps/install_s6_overlay.sh
+    bash /deps/install_s6_overlay.sh
 
 
 FROM base AS wheels
@@ -202,7 +202,7 @@ RUN pip3 wheel --wheel-dir=/wheels -r /requirements-wheels.txt && \
 
 # Install HailoRT & Wheels
 RUN --mount=type=bind,source=docker/main/install_hailort.sh,target=/deps/install_hailort.sh \
-    /deps/install_hailort.sh
+    bash /deps/install_hailort.sh
 
 # Collect deps in a single layer
 FROM scratch AS deps-rootfs
@@ -263,7 +263,7 @@ ENV PATH="/usr/local/go2rtc/bin:/usr/local/tempio/bin:/usr/local/nginx/sbin:${PA
 
 # Install dependencies
 RUN --mount=type=bind,source=docker/main/install_deps.sh,target=/deps/install_deps.sh \
-    /deps/install_deps.sh
+    bash /deps/install_deps.sh
 
 ENV DEFAULT_FFMPEG_VERSION="8.0"
 ENV INCLUDED_FFMPEG_VERSIONS="${DEFAULT_FFMPEG_VERSION}:7.0:5.0"
@@ -346,6 +346,7 @@ COPY web/package.json web/package-lock.json ./
 RUN npm install
 
 COPY web/ ./
+ENV NODE_OPTIONS=--max-old-space-size=8192
 RUN npm run build \
     && mv dist/BASE_PATH/monacoeditorwork/* dist/assets/ \
     && rm -rf dist/BASE_PATH

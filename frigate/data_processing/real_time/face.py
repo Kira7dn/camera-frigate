@@ -56,6 +56,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.requires_face_detection = "face" not in self.config.objects.all_objects
         self.person_face_history: dict[str, list[tuple[str, float, int]]] = {}
         self.camera_current_people: dict[str, list[str]] = {}
+        self.person_face_boxes: dict[str, tuple[tuple[int, int, int, int], float]] = {}
+        self.face_snapshot_frames: dict[str, float] = {}
         self.recognizer: FaceRecognizer
         self.faces_per_second = EventsPerSecond()
         self.inference_speed = InferenceSpeed(self.metrics.face_rec_speed)
@@ -188,11 +190,28 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
 
         start = datetime.datetime.now().timestamp()
         id = obj_data["id"]
+        frame_time = float(obj_data["frame_time"])
 
         # don't run for non person objects
         if obj_data.get("label") != "person":
             logger.debug("Not processing face for a non person object.")
             return
+
+        # A face result is meaningful only for a continuous person track. If
+        # the tracker jumps to a different person, discard the old voting
+        # history before processing the new crop.
+        person_box = tuple(int(v) for v in obj_data["box"])
+        previous_box = self.person_face_boxes.get(id)
+        if previous_box is not None:
+            old_box, old_frame_time = previous_box
+            if frame_time <= old_frame_time:
+                logger.debug("Ignoring stale face frame for %s", id)
+                return
+            if self._is_track_discontinuity(old_box, person_box, frame_time - old_frame_time):
+                logger.info("Resetting face history after track discontinuity for %s", id)
+                self.person_face_history.pop(id, None)
+                self.face_snapshot_frames.pop(id, None)
+        self.person_face_boxes[id] = (person_box, frame_time)
 
         # don't overwrite sub label for objects that have a sub label
         # that is not a face
@@ -336,7 +355,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                     "score": weighted_score,
                     "id": id,
                     "camera": camera,
-                    "timestamp": start,
+                    "timestamp": frame_time,
+                    "source_frame_time": frame_time,
                 }
             ),
         )
@@ -346,6 +366,32 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 (id, weighted_sub_label, weighted_score),
                 EventMetadataTypeEnum.sub_label.value,
             )
+
+            if weighted_sub_label is not None and frame_time > self.face_snapshot_frames.get(id, 0):
+                artifact_path = self._write_face_snapshot(
+                    frame,
+                    camera,
+                    id,
+                    frame_time,
+                    weighted_score,
+                )
+                if artifact_path is not None:
+                    self.face_snapshot_frames[id] = frame_time
+                    self.sub_label_publisher.publish(
+                        {
+                            "event_id": id,
+                            "camera": camera,
+                            "frame_time": frame_time,
+                            "path": artifact_path,
+                            "box": person_box,
+                            "area": int(obj_data.get("area", area(person_box))),
+                            "score": float(obj_data.get("score", 0.0)),
+                            "attributes": obj_data.get("attributes", []),
+                            "face_score": weighted_score,
+                            "sub_label": weighted_sub_label,
+                        },
+                        EventMetadataTypeEnum.face_snapshot.value,
+                    )
 
         self.__update_metrics(datetime.datetime.now().timestamp() - start)
 
@@ -479,6 +525,74 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
 
             if object_id in self.camera_current_people.get(camera, []):
                 self.camera_current_people[camera].remove(object_id)
+        self.person_face_boxes.pop(object_id, None)
+        self.face_snapshot_frames.pop(object_id, None)
+
+    @staticmethod
+    def _box_iou(
+        first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+    ) -> float:
+        left = max(first[0], second[0])
+        top = max(first[1], second[1])
+        right = min(first[2], second[2])
+        bottom = min(first[3], second[3])
+        intersection = max(0, right - left) * max(0, bottom - top)
+        if intersection == 0:
+            return 0.0
+        first_area = max(0, first[2] - first[0]) * max(0, first[3] - first[1])
+        second_area = max(0, second[2] - second[0]) * max(0, second[3] - second[1])
+        union = first_area + second_area - intersection
+        return intersection / union if union else 0.0
+
+    @classmethod
+    def _is_track_discontinuity(
+        cls,
+        previous: tuple[int, int, int, int],
+        current: tuple[int, int, int, int],
+        frame_gap: float,
+    ) -> bool:
+        if frame_gap > 2.0:
+            return True
+        if cls._box_iou(previous, current) >= 0.05:
+            return False
+
+        previous_center = ((previous[0] + previous[2]) / 2, (previous[1] + previous[3]) / 2)
+        current_center = ((current[0] + current[2]) / 2, (current[1] + current[3]) / 2)
+        previous_diagonal = max(
+            1.0,
+            ((previous[2] - previous[0]) ** 2 + (previous[3] - previous[1]) ** 2) ** 0.5,
+        )
+        center_distance = (
+            (current_center[0] - previous_center[0]) ** 2
+            + (current_center[1] - previous_center[1]) ** 2
+        ) ** 0.5
+        return center_distance > previous_diagonal * 1.5
+
+    @staticmethod
+    def _write_face_snapshot(
+        frame: np.ndarray,
+        camera: str,
+        event_id: str,
+        frame_time: float,
+        face_score: float,
+    ) -> str | None:
+        try:
+            bgr_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            folder = os.path.join(FACE_DIR, "events")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"{camera}-{event_id}-{frame_time}.webp")
+            temporary_path = f"{path}.tmp.webp"
+            if not cv2.imwrite(temporary_path, bgr_frame):
+                return None
+            os.replace(temporary_path, path)
+            return path
+        except Exception:
+            logger.exception(
+                "Unable to persist face recognition frame for %s (score=%.3f)",
+                event_id,
+                face_score,
+            )
+            return None
 
     def weighted_average(
         self, results_list: list[tuple[str, float, int]], max_weight: int = 4000
