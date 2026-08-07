@@ -25,7 +25,7 @@ DeliveryCallback = Callable[
     [httpx.AsyncClient, str, str, NotificationEnvelope],
     Awaitable[DeliveryResult],
 ]
-RecipientEnabledCallback = Callable[[str, str, str | None], bool]
+RecipientEnabledCallback = Callable[[str, str, str | None, str | None], bool]
 
 
 class NotificationOutbox:
@@ -75,6 +75,7 @@ class NotificationOutbox:
                 id=delivery_id,
                 provider=provider,
                 recipient_id=recipient_id,
+                rule_id=envelope.rule_id or "legacy",
                 source_type=envelope.source_type,
                 source_id=envelope.source_id,
                 payload=envelope.as_dict(),
@@ -134,7 +135,7 @@ class NotificationOutbox:
     ) -> None:
         envelope = NotificationEnvelope.from_dict(delivery.payload)
         if not self.recipient_enabled(
-            delivery.provider, delivery.recipient_id, envelope.camera
+            delivery.provider, delivery.recipient_id, envelope.camera, envelope.rule_id
         ):
             self._complete(delivery, "cancelled", "Provider or recipient disabled")
             increment(delivery.provider, "cancelled")

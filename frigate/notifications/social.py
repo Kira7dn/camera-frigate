@@ -8,7 +8,10 @@ from typing import Any
 import httpx
 
 from frigate.config import FrigateConfig
-from frigate.config.camera.notification import NotificationRecipientConfig
+from frigate.config.camera.notification import (
+    NotificationDestinationsConfig,
+    NotificationRecipientConfig,
+)
 from frigate.models import NotificationDelivery
 
 from .envelope import NotificationEnvelope
@@ -39,7 +42,7 @@ class SocialClient:
         )
 
     def _provider_config(self, provider: str):
-        return getattr(self.config.notifications.providers, provider)
+        return getattr(self.config.notifications.channels, provider)
 
     def recipient(
         self, provider: str, recipient_id: str
@@ -56,7 +59,11 @@ class SocialClient:
         )
 
     def recipient_enabled(
-        self, provider: str, recipient_id: str, camera: str | None
+        self,
+        provider: str,
+        recipient_id: str,
+        camera: str | None,
+        rule_id: str | None = None,
     ) -> bool:
         if provider not in self.providers:
             return False
@@ -69,19 +76,28 @@ class SocialClient:
             or not recipient.enabled
         ):
             return False
-        if camera and recipient.cameras and camera not in recipient.cameras:
+        if camera and camera not in self.config.cameras:
             return False
-        if camera:
-            camera_config = self.config.cameras.get(camera)
-            if (
-                camera_config is None
-                or not camera_config.notifications.enabled
-                or provider not in camera_config.notifications.providers
-            ):
+        if rule_id and rule_id != "legacy":
+            rule = next(
+                (
+                    rule
+                    for rule in self.config.notifications.rules
+                    if rule.id == rule_id
+                ),
+                None,
+            )
+            if rule is None or not rule.enabled:
+                return False
+            if recipient_id not in getattr(rule.destinations, provider):
                 return False
         return True
 
-    def enqueue(self, envelope: NotificationEnvelope) -> list[str]:
+    def enqueue(
+        self,
+        envelope: NotificationEnvelope,
+        destinations: NotificationDestinationsConfig,
+    ) -> list[str]:
         delivery_ids: list[str] = []
         dedupe_envelope = envelope
         if (
@@ -92,17 +108,15 @@ class SocialClient:
             dedupe_envelope = replace(
                 envelope, source_type="lpr", source_id=envelope.snapshot_ref
             )
-        if not envelope.camera:
-            camera_providers = {"telegram", "zalo"}
-        else:
-            camera_providers = set(
-                self.config.cameras[envelope.camera].notifications.providers
-            )
         for provider in self.providers:
-            if provider not in camera_providers:
-                continue
+            selected_recipients = set(getattr(destinations, provider))
             for recipient in self._provider_config(provider).recipients:
-                if not self.recipient_enabled(provider, recipient.id, envelope.camera):
+                if (
+                    recipient.id not in selected_recipients
+                    or not self.recipient_enabled(
+                        provider, recipient.id, envelope.camera, envelope.rule_id
+                    )
+                ):
                     continue
                 delivery_id = self.outbox.enqueue(
                     provider, recipient.id, dedupe_envelope
@@ -120,7 +134,12 @@ class SocialClient:
         )
         for delivery in pending:
             camera = (delivery.payload or {}).get("camera")
-            if self.recipient_enabled(delivery.provider, delivery.recipient_id, camera):
+            if self.recipient_enabled(
+                delivery.provider,
+                delivery.recipient_id,
+                camera,
+                getattr(delivery, "rule_id", None),
+            ):
                 continue
             changed = (
                 NotificationDelivery.update(
@@ -152,7 +171,7 @@ class SocialClient:
             return DeliveryResult(False, False, "Recipient no longer exists")
         if provider == "telegram":
             return await self.telegram.deliver(client, recipient, envelope)
-        zalo_config = self.config.notifications.providers.zalo
+        zalo_config = self.config.notifications.channels.zalo
         return await self.zalo.deliver(
             client,
             recipient,

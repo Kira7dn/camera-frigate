@@ -185,6 +185,7 @@ class NotificationDelivery(Model):
     id = CharField(null=False, primary_key=True, max_length=36)
     provider = CharField(null=False, max_length=20, index=True)
     recipient_id = CharField(null=False, max_length=64)
+    rule_id = CharField(null=False, max_length=64, default="legacy")
     source_type = CharField(null=False, max_length=30)
     source_id = CharField(null=False, max_length=64)
     payload = JSONField()
@@ -199,5 +200,21 @@ class NotificationDelivery(Model):
     class Meta:
         table_name = "notification_delivery"
         indexes = (
-            (("provider", "recipient_id", "source_type", "source_id"), True),
+            (("provider", "recipient_id", "rule_id", "source_type", "source_id"), True),
         )
+
+
+class NotificationRuleState(Model):
+    """Durable per-destination cooldown and latest source receipt."""
+
+    rule_id = CharField(null=False, max_length=64)
+    camera = CharField(null=False, max_length=64)
+    channel = CharField(null=False, max_length=20)
+    recipient_id = CharField(null=False, max_length=128)
+    last_source_type = CharField(null=True, max_length=30)
+    last_source_id = CharField(null=True, max_length=128)
+    last_sent = DateTimeField(null=False)
+
+    class Meta:
+        table_name = "notification_rule_state"
+        primary_key = CompositeKey("rule_id", "camera", "channel", "recipient_id")

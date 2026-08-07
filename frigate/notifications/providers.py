@@ -24,10 +24,7 @@ class DeliveryResult:
 
 def _provider_token(primary_name: str, legacy_name: str) -> str:
     """Read a provider token without exposing it through config or status APIs."""
-    return (
-        os.getenv(primary_name, "").strip()
-        or os.getenv(legacy_name, "").strip()
-    )
+    return os.getenv(primary_name, "").strip() or os.getenv(legacy_name, "").strip()
 
 
 def _retry_after(response: httpx.Response) -> float | None:
@@ -68,6 +65,10 @@ def classify_response(response: httpx.Response) -> DeliveryResult:
 
 def envelope_text(envelope: NotificationEnvelope) -> str:
     text = f"{envelope.title}\n{envelope.message}"
+    if envelope.object_label:
+        text += f"\nObject: {envelope.object_label}"
+    if envelope.sub_label:
+        text += f"\nSub label: {envelope.sub_label}"
     if envelope.lpr_plate:
         score = f" ({envelope.lpr_score:.2f})" if envelope.lpr_score is not None else ""
         text += f"\nLicense plate: {envelope.lpr_plate}{score}"
@@ -81,9 +82,7 @@ class TelegramProvider:
 
     @property
     def configured(self) -> bool:
-        return bool(
-            _provider_token("FRIGATE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
-        )
+        return bool(_provider_token("FRIGATE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"))
 
     async def deliver(
         self,
@@ -91,9 +90,7 @@ class TelegramProvider:
         recipient: NotificationRecipientConfig,
         envelope: NotificationEnvelope,
     ) -> DeliveryResult:
-        token = _provider_token(
-            "FRIGATE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"
-        )
+        token = _provider_token("FRIGATE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
         if not token:
             return DeliveryResult(False, False, "Telegram token is missing")
         base_url = f"https://api.telegram.org/bot{token}"

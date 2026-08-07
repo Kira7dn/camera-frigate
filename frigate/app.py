@@ -59,6 +59,7 @@ from frigate.models import (
     Event,
     Export,
     NotificationDelivery,
+    NotificationRuleState,
     Previews,
     Recordings,
     RecordingsToDelete,
@@ -320,6 +321,7 @@ class FrigateApp:
             User,
             Trigger,
             NotificationDelivery,
+            NotificationRuleState,
         ]
         self.db.bind(models)
 

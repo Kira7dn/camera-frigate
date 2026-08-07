@@ -16,6 +16,7 @@ class NotificationEnvelope:
     direct_url: str
     snapshot_ref: str | None
     notification_type: str
+    rule_id: str | None = None
     object_label: str | None = None
     sub_label: str | None = None
     genai: dict[str, Any] = field(default_factory=dict)

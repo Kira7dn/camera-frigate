@@ -3,27 +3,27 @@ import type { SectionConfigOverrides } from "./types";
 const notifications: SectionConfigOverrides = {
   base: {
     sectionDocs: "/configuration/notifications",
+    hideSaveControls: true,
     restartRequired: [],
-    fieldOrder: ["enabled", "email", "providers", "delivery"],
+    fieldOrder: ["schema_version", "enabled", "channels", "rules", "delivery"],
     fieldGroups: {},
-    hiddenFields: ["enabled_in_config"],
+    hiddenFields: ["schema_version", "enabled", "channels", "rules", "delivery"],
     advancedFields: [],
   },
   global: {
     uiSchema: {
       "ui:before": { render: "NotificationsSettingsExtras" },
+      schema_version: { "ui:widget": "hidden" },
       enabled: { "ui:widget": "hidden" },
-      email: { "ui:widget": "hidden" },
-      cooldown: { "ui:widget": "hidden" },
-      enabled_in_config: { "ui:widget": "hidden" },
+      channels: { "ui:widget": "hidden" },
+      rules: { "ui:widget": "hidden" },
+      delivery: { "ui:widget": "hidden" },
     },
   },
   camera: {
-    hiddenFields: ["enabled_in_config", "email"],
-    fieldOrder: ["enabled", "cooldown", "providers"],
-    uiSchema: {
-      providers: { "ui:widget": "checkboxes" },
-    },
+    hiddenFields: ["enabled", "cooldown", "providers", "enabled_in_config"],
+    fieldOrder: [],
+    uiSchema: {},
   },
 };
 

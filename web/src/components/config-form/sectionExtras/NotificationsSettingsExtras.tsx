@@ -1,65 +1,23 @@
-import ActivityIndicator from "@/components/indicators/activity-indicator";
-import { Button } from "@/components/ui/button";
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
-import { Input } from "@/components/ui/input";
-import { StatusBarMessagesContext } from "@/context/statusbar-provider";
-import { FrigateConfig } from "@/types/frigateConfig";
-import { zodResolver } from "@hookform/resolvers/zod";
 import axios from "axios";
-import {
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
-import { useForm } from "react-hook-form";
-import { LuCheck, LuExternalLink, LuX } from "react-icons/lu";
-import { CiCircleAlert } from "react-icons/ci";
-import { Link } from "react-router-dom";
-import { toast } from "sonner";
+import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
-import { z } from "zod";
-import {
-  useNotifications,
-  useNotificationSuspend,
-  useNotificationTest,
-} from "@/api/ws";
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from "@/components/ui/select";
-import { formatUnixTimestampToDateTime } from "@/utils/dateUtil";
-import { use24HourTime } from "@/hooks/use-date-utils";
+import { toast } from "sonner";
+
+import { SettingsGroupCard } from "@/components/card/SettingsGroupCard";
 import FilterSwitch from "@/components/filter/FilterSwitch";
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { Trans, useTranslation } from "react-i18next";
-import { useDateLocale } from "@/hooks/use-date-locale";
-import { useDocDomain } from "@/hooks/use-doc-domain";
-import { isPWA } from "@/utils/isPWA";
-import { isIOS } from "react-device-detect";
-import { CameraNameLabel } from "@/components/camera/FriendlyNameLabel";
-import { useIsAdmin } from "@/hooks/use-is-admin";
-import { cn } from "@/lib/utils";
-import cloneDeep from "lodash/cloneDeep";
-import isEqual from "lodash/isEqual";
-import set from "lodash/set";
-import type { ConfigSectionData, JsonObject } from "@/types/configForm";
-import { sanitizeSectionData } from "@/utils/configUtil";
-import { isReplayCamera } from "@/utils/cameraUtil";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import type {
+  FrigateConfig,
+  NotificationEvent,
+  NotificationRecipientConfig,
+  NotificationRuleConfig,
+} from "@/types/frigateConfig";
+import { useNotificationSuspend } from "@/api/ws";
 import type { SectionRendererProps } from "./registry";
+
+type ChannelName = "webpush" | "telegram" | "zalo";
+type NotificationDocument = FrigateConfig["notifications"];
 
 type ProviderStatus = {
   enabled: boolean;
@@ -70,976 +28,590 @@ type ProviderStatus = {
   last_error?: string | null;
 };
 
-const NOTIFICATION_SERVICE_WORKER = "/notifications-worker.js";
-import {
-  SettingsGroupCard,
-  SPLIT_ROW_CLASS_NAME,
-  CONTROL_COLUMN_CLASS_NAME,
-} from "@/components/card/SettingsGroupCard";
-
-export default function NotificationsSettingsExtras({
-  formContext,
-}: SectionRendererProps) {
-  const { t } = useTranslation([
-    "views/settings",
-    "common",
-    "components/filter",
-  ]);
-  const { getLocaleDocUrl } = useDocDomain();
-
-  // roles
-  const isAdmin = useIsAdmin();
-
-  // status bar
-  const { addMessage, removeMessage } = useContext(StatusBarMessagesContext)!;
-
-  // config
-  const { data: config } = useSWR<FrigateConfig>("config", {
-    revalidateOnFocus: false,
-  });
-  const { data: providerStatus, mutate: refreshProviderStatus } = useSWR<
-    Record<string, ProviderStatus>
-  >(isAdmin ? "notifications/providers/status" : null, {
-    refreshInterval: 5000,
-    revalidateOnFocus: false,
-  });
-
-  const allCameras = useMemo(() => {
-    if (!config) {
-      return [];
-    }
-
-    return Object.values(config.cameras)
-      .sort((aConf, bConf) => aConf.ui.order - bConf.ui.order)
-      .filter((c) => c.enabled_in_config && !isReplayCamera(c.name));
-  }, [config]);
-
-  const notificationCameras = useMemo(() => {
-    if (!config) {
-      return [];
-    }
-
-    return Object.values(config.cameras)
-      .filter(
-        (conf) =>
-          conf.enabled_in_config &&
-          !isReplayCamera(conf.name) &&
-          conf.notifications &&
-          conf.notifications.enabled_in_config,
-      )
-      .sort((aConf, bConf) => aConf.ui.order - bConf.ui.order);
-  }, [config]);
-
-  const { send: sendTestNotification } = useNotificationTest();
-
-  // notification state
-  const [registration, setRegistration] =
-    useState<ServiceWorkerRegistration | null>();
-  const [cameraSelectionTouched, setCameraSelectionTouched] = useState(false);
-
-  useEffect(() => {
-    if (!("Notification" in window) || !window.isSecureContext) {
-      return;
-    }
-    navigator.serviceWorker
-      .getRegistration(NOTIFICATION_SERVICE_WORKER)
-      .then((worker) => {
-        if (worker) {
-          // Trigger a check for an updated service worker script
-          worker.update().catch(() => {});
-          setRegistration(worker);
-        } else {
-          setRegistration(null);
-        }
-      })
-      .catch(() => {
-        setRegistration(null);
-      });
-  }, []);
-
-  // form
-  const formSchema = z.object({
-    allEnabled: z.boolean(),
-    email: z.string(),
-    cameras: z.array(z.string()),
-  });
-
-  const pendingDataBySection = useMemo(
-    () => formContext?.pendingDataBySection ?? {},
-    [formContext?.pendingDataBySection],
-  );
-  const pendingCameraOverrides = useMemo(() => {
-    const overrides: Record<string, boolean> = {};
-    Object.entries(pendingDataBySection).forEach(([key, data]) => {
-      if (!key.endsWith("::notifications")) {
-        return;
-      }
-      const cameraName = key.slice(0, key.indexOf("::"));
-      const enabled = (data as JsonObject | undefined)?.enabled;
-      if (typeof enabled === "boolean") {
-        overrides[cameraName] = enabled;
-      }
-    });
-    return overrides;
-  }, [pendingDataBySection]);
-
-  const defaultValues = useMemo(() => {
-    const formData = formContext?.formData as JsonObject | undefined;
-    const enabledValue =
-      typeof formData?.enabled === "boolean"
-        ? formData.enabled
-        : (config?.notifications.enabled ?? false);
-    const emailValue =
-      typeof formData?.email === "string"
-        ? formData.email
-        : (config?.notifications.email ?? "");
-    const baseEnabledSet = new Set(
-      notificationCameras.map((camera) => camera.name),
-    );
-    const selectedCameras = enabledValue
-      ? []
-      : allCameras
-          .filter((camera) => {
-            const pendingEnabled = pendingCameraOverrides[camera.name];
-            if (typeof pendingEnabled === "boolean") {
-              return pendingEnabled;
-            }
-            return baseEnabledSet.has(camera.name);
-          })
-          .map((camera) => camera.name);
-
-    return {
-      allEnabled: Boolean(enabledValue),
-      email: typeof emailValue === "string" ? emailValue : "",
-      cameras: selectedCameras,
-    };
-  }, [
-    allCameras,
-    config?.notifications.email,
-    config?.notifications.enabled,
-    formContext?.formData,
-    notificationCameras,
-    pendingCameraOverrides,
-  ]);
-
-  const form = useForm<z.infer<typeof formSchema>>({
-    resolver: zodResolver(formSchema),
-    mode: "onChange",
-    defaultValues,
-  });
-
-  const watchAllEnabled = form.watch("allEnabled");
-  const watchCameras = form.watch("cameras");
-  const watchEmail = form.watch("email");
-  const pendingCameraOverridesRef = useRef<Set<string>>(new Set());
-
-  const resetFormState = useCallback(
-    (values: z.infer<typeof formSchema>) => {
-      form.reset(values);
-      setCameraSelectionTouched(false);
-      pendingCameraOverridesRef.current.clear();
-    },
-    [form],
-  );
-
-  // pending changes sync (Undo All / Save All)
-  const hasPendingNotifications = useMemo(
-    () =>
-      Object.keys(pendingDataBySection).some(
-        (key) => key === "notifications" || key.endsWith("::notifications"),
-      ),
-    [pendingDataBySection],
-  );
-  const hasPendingNotificationsRef = useRef(hasPendingNotifications);
-
-  useEffect(() => {
-    if (!config || form.formState.isDirty || hasPendingNotifications) {
-      return;
-    }
-    resetFormState(defaultValues);
-  }, [
-    config,
-    defaultValues,
-    form.formState.isDirty,
-    hasPendingNotifications,
-    resetFormState,
-  ]);
-
-  useEffect(() => {
-    const hadPending = hasPendingNotificationsRef.current;
-    hasPendingNotificationsRef.current = hasPendingNotifications;
-
-    if (hadPending && !hasPendingNotifications) {
-      resetFormState(defaultValues);
-    }
-  }, [hasPendingNotifications, defaultValues, resetFormState]);
-
-  useEffect(() => {
-    if (!formContext?.onFormDataChange) {
-      return;
-    }
-    const baseData =
-      (formContext.formData as JsonObject | undefined) ??
-      (config?.notifications as JsonObject | undefined);
-    if (!baseData) {
-      return;
-    }
-    const nextData = cloneDeep(baseData);
-    const normalizedEmail = watchEmail?.trim() ? watchEmail : null;
-    set(nextData, "enabled", Boolean(watchAllEnabled));
-    set(nextData, "email", normalizedEmail);
-    formContext.onFormDataChange(nextData as ConfigSectionData);
-  }, [config, formContext, watchAllEnabled, watchEmail]);
-
-  // camera selection overrides
-  const baselineCameraSelection = useMemo(() => {
-    if (!config) {
-      return [] as string[];
-    }
-    return config.notifications.enabled
-      ? []
-      : notificationCameras.map((camera) => camera.name);
-  }, [config, notificationCameras]);
-
-  const cameraSelectionDirty = useMemo(() => {
-    const current = Array.isArray(watchCameras) ? watchCameras : [];
-    return !isEqual([...current].sort(), [...baselineCameraSelection].sort());
-  }, [watchCameras, baselineCameraSelection]);
-
-  useEffect(() => {
-    formContext?.setExtraHasChanges?.(cameraSelectionDirty);
-  }, [cameraSelectionDirty, formContext]);
-
-  useEffect(() => {
-    const onPendingDataChange = formContext?.onPendingDataChange;
-    if (!onPendingDataChange || !config) {
-      return;
-    }
-
-    if (!cameraSelectionTouched) {
-      return;
-    }
-
-    if (!cameraSelectionDirty) {
-      pendingCameraOverridesRef.current.forEach((cameraName) => {
-        onPendingDataChange("notifications", cameraName, null);
-      });
-      pendingCameraOverridesRef.current.clear();
-      setCameraSelectionTouched(false);
-      return;
-    }
-
-    const selectedCameras = Array.isArray(watchCameras) ? watchCameras : [];
-
-    allCameras.forEach((camera) => {
-      const desiredEnabled = watchAllEnabled
-        ? true
-        : selectedCameras.includes(camera.name);
-      const currentNotifications = config.cameras[camera.name]?.notifications;
-      const currentEnabled = currentNotifications?.enabled;
-
-      if (desiredEnabled === currentEnabled) {
-        if (pendingCameraOverridesRef.current.has(camera.name)) {
-          onPendingDataChange("notifications", camera.name, null);
-          pendingCameraOverridesRef.current.delete(camera.name);
-        }
-        return;
-      }
-
-      if (!currentNotifications) {
-        return;
-      }
-
-      const nextNotifications = cloneDeep(
-        currentNotifications as JsonObject,
-      ) as JsonObject;
-      set(nextNotifications, "enabled", desiredEnabled);
-      const sanitizedNotifications = sanitizeSectionData(
-        nextNotifications as ConfigSectionData,
-        ["enabled_in_config", "email"],
-      );
-      onPendingDataChange("notifications", camera.name, sanitizedNotifications);
-      pendingCameraOverridesRef.current.add(camera.name);
-    });
-  }, [
-    allCameras,
-    cameraSelectionDirty,
-    cameraSelectionTouched,
-    config,
-    formContext,
-    watchAllEnabled,
-    watchCameras,
-  ]);
-
-  const anyCameraNotificationsEnabled = useMemo(
-    () =>
-      config &&
-      Object.values(config.cameras).some(
-        (c) =>
-          c.enabled_in_config &&
-          !isReplayCamera(c.name) &&
-          c.notifications &&
-          c.notifications.enabled_in_config,
-      ),
-    [config],
-  );
-
-  const shouldFetchPubKey = Boolean(
-    config &&
-      (config.notifications?.enabled || anyCameraNotificationsEnabled) &&
-      (watchAllEnabled ||
-        (Array.isArray(watchCameras) && watchCameras.length > 0)),
-  );
-
-  const { data: publicKey } = useSWR(
-    shouldFetchPubKey ? "notifications/pubkey" : null,
-    { revalidateOnFocus: false },
-  );
-
-  const subscribeToNotifications = useCallback(
-    (workerRegistration: ServiceWorkerRegistration) => {
-      if (!workerRegistration) {
-        return;
-      }
-
-      addMessage(
-        "notification_settings",
-        t("notification.unsavedRegistrations"),
-        undefined,
-        "registration",
-      );
-
-      workerRegistration.pushManager
-        .subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: publicKey,
-        })
-        .then((pushSubscription) => {
-          axios
-            .post("notifications/register", {
-              sub: pushSubscription,
-            })
-            .catch(() => {
-              toast.error(t("notification.toast.error.registerFailed"), {
-                position: "top-center",
-              });
-              pushSubscription.unsubscribe();
-              workerRegistration.unregister();
-              setRegistration(null);
-            });
-          toast.success(t("notification.toast.success.registered"), {
-            position: "top-center",
-          });
-        });
-    },
-    [addMessage, publicKey, t],
-  );
-
-  useEffect(() => {
-    if (watchCameras.length > 0) {
-      form.setValue("allEnabled", false);
-    }
-  }, [watchCameras, allCameras, form]);
-
-  useEffect(() => {
-    document.title = t("documentTitle.notifications");
-  }, [t]);
-
-  if (formContext?.level && formContext.level !== "global") {
-    return null;
-  }
-
-  if (!config) {
-    return <ActivityIndicator />;
-  }
-
-  if ((!("Notification" in window) || !window.isSecureContext) && !isAdmin) {
-    // iOS only exposes web push to apps installed to the Home Screen, so a
-    // secure-context iOS browser tab that isn't an installed PWA has no
-    // Notification API. Android supports web push in a normal tab, so it never
-    // reaches this case and keeps the generic secure-context message.
-    const requiresPwaInstall = isIOS && window.isSecureContext && !isPWA;
-
-    return (
-      <div className="scrollbar-container order-last mb-2 mt-2 flex h-full w-full flex-col overflow-y-auto pb-2 md:order-none">
-        <div className="w-full max-w-5xl">
-          <SettingsGroupCard
-            title={t("notification.notificationSettings.title")}
-          >
-            <div className="space-y-4">
-              <div className="flex flex-col gap-2 text-sm text-primary-variant">
-                <p>{t("notification.notificationSettings.desc")}</p>
-                <div className="flex items-center text-primary">
-                  <Link
-                    to={getLocaleDocUrl("configuration/notifications")}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="inline"
-                  >
-                    {t("readTheDocumentation", { ns: "common" })}
-                    <LuExternalLink className="ml-2 inline-flex size-3" />
-                  </Link>
-                </div>
-              </div>
-
-              <Alert variant="destructive">
-                <CiCircleAlert className="size-5" />
-                <AlertTitle>
-                  {t("notification.notificationUnavailable.title")}
-                </AlertTitle>
-                <AlertDescription>
-                  <Trans
-                    ns="views/settings"
-                    i18nKey={
-                      requiresPwaInstall
-                        ? "notification.notificationUnavailable.descPwa"
-                        : "notification.notificationUnavailable.desc"
-                    }
-                  />
-                  <div className="mt-3 flex items-center">
-                    <Link
-                      to={getLocaleDocUrl(
-                        requiresPwaInstall
-                          ? "configuration/notifications"
-                          : "configuration/authentication",
-                      )}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="inline"
-                    >
-                      {t("readTheDocumentation", { ns: "common" })}{" "}
-                      <LuExternalLink className="ml-2 inline-flex size-3" />
-                    </Link>
-                  </div>
-                </AlertDescription>
-              </Alert>
-            </div>
-          </SettingsGroupCard>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex size-full flex-col md:flex-row">
-      <div className="scrollbar-container order-last mb-2 mt-2 flex h-full w-full flex-col overflow-y-auto px-2 md:order-none">
-        <div className={cn("w-full max-w-5xl space-y-6")}>
-          {isAdmin && (
-            <SettingsGroupCard
-              title={t("notification.notificationSettings.title")}
-            >
-              <div className="space-y-6">
-                <Form {...form}>
-                  <div className="space-y-6">
-                    <FormField
-                      control={form.control}
-                      name="email"
-                      render={({ field }) => (
-                        <FormItem className={SPLIT_ROW_CLASS_NAME}>
-                          <div className="space-y-1.5">
-                            <FormLabel htmlFor="notification-email">
-                              {t("notification.email.title")}
-                            </FormLabel>
-                            <FormDescription className="hidden md:block">
-                              {t("notification.email.desc")}
-                            </FormDescription>
-                          </div>
-
-                          <div
-                            className={`${CONTROL_COLUMN_CLASS_NAME} space-y-1.5`}
-                          >
-                            <FormControl>
-                              <Input
-                                id="notification-email"
-                                className="w-full border border-input bg-background p-2 hover:bg-accent hover:text-accent-foreground dark:[color-scheme:dark] md:w-72"
-                                placeholder={t(
-                                  "notification.email.placeholder",
-                                )}
-                                {...field}
-                              />
-                            </FormControl>
-                            <FormDescription className="md:hidden">
-                              {t("notification.email.desc")}
-                            </FormDescription>
-                            <FormMessage />
-                          </div>
-                        </FormItem>
-                      )}
-                    />
-
-                    <FormField
-                      control={form.control}
-                      name="cameras"
-                      render={({ field }) => (
-                        <FormItem className={SPLIT_ROW_CLASS_NAME}>
-                          <div className="space-y-1.5">
-                            <FormLabel className="text-base">
-                              {t("notification.cameras.title")}
-                            </FormLabel>
-                            <FormDescription className="hidden md:block">
-                              {t("notification.cameras.desc")}
-                            </FormDescription>
-                          </div>
-
-                          <div
-                            className={`${CONTROL_COLUMN_CLASS_NAME} space-y-1.5`}
-                          >
-                            {allCameras.length > 0 ? (
-                              <div className="w-full space-y-2 rounded-lg bg-secondary p-4">
-                                <FormField
-                                  control={form.control}
-                                  name="allEnabled"
-                                  render={({ field: allEnabledField }) => (
-                                    <FilterSwitch
-                                      label={t("cameras.all.title", {
-                                        ns: "components/filter",
-                                      })}
-                                      isChecked={allEnabledField.value}
-                                      onCheckedChange={(checked) => {
-                                        setCameraSelectionTouched(true);
-                                        if (checked) {
-                                          form.setValue("cameras", []);
-                                        }
-                                        allEnabledField.onChange(checked);
-                                      }}
-                                    />
-                                  )}
-                                />
-                                {allCameras.map((camera) => {
-                                  const currentCameras = Array.isArray(
-                                    field.value,
-                                  )
-                                    ? field.value
-                                    : [];
-                                  return (
-                                    <FilterSwitch
-                                      key={camera.name}
-                                      label={camera.name}
-                                      type="camera"
-                                      isChecked={currentCameras.includes(
-                                        camera.name,
-                                      )}
-                                      onCheckedChange={(checked) => {
-                                        setCameraSelectionTouched(true);
-                                        const newCameras = checked
-                                          ? Array.from(
-                                              new Set([
-                                                ...currentCameras,
-                                                camera.name,
-                                              ]),
-                                            )
-                                          : currentCameras.filter(
-                                              (value) => value !== camera.name,
-                                            );
-                                        field.onChange(newCameras);
-                                        form.setValue("allEnabled", false);
-                                      }}
-                                    />
-                                  );
-                                })}
-                              </div>
-                            ) : (
-                              <div className="font-normal text-destructive">
-                                {t("notification.cameras.noCameras")}
-                              </div>
-                            )}
-                            <FormDescription className="md:hidden">
-                              {t("notification.cameras.desc")}
-                            </FormDescription>
-                            <FormMessage />
-                          </div>
-                        </FormItem>
-                      )}
-                    />
-                  </div>
-                </Form>
-              </div>
-            </SettingsGroupCard>
-          )}
-
-          {isAdmin && (
-            <NotificationProviderCards
-              config={config}
-              formContext={formContext}
-              status={providerStatus}
-              onTestComplete={() => refreshProviderStatus()}
-            />
-          )}
-
-          <div className="space-y-6">
-            <SettingsGroupCard title={t("notification.deviceSpecific")}>
-              <div className={cn("space-y-2", isAdmin && "md:max-w-[50%]")}>
-                <Button
-                  aria-label={t("notification.registerDevice")}
-                  className="w-full md:w-auto"
-                  disabled={
-                    !("Notification" in window) ||
-                    !window.isSecureContext ||
-                    !shouldFetchPubKey ||
-                    publicKey == undefined
-                  }
-                  onClick={() => {
-                    if (registration == null) {
-                      Notification.requestPermission().then((permission) => {
-                        if (permission === "granted") {
-                          navigator.serviceWorker
-                            .register(NOTIFICATION_SERVICE_WORKER, {
-                              updateViaCache: "none",
-                            })
-                            .then((workerRegistration) => {
-                              setRegistration(workerRegistration);
-
-                              if (workerRegistration.active) {
-                                subscribeToNotifications(workerRegistration);
-                              } else {
-                                setTimeout(
-                                  () =>
-                                    subscribeToNotifications(
-                                      workerRegistration,
-                                    ),
-                                  1000,
-                                );
-                              }
-                            });
-                        }
-                      });
-                    } else {
-                      registration.pushManager
-                        .getSubscription()
-                        .then((pushSubscription) => {
-                          pushSubscription?.unsubscribe();
-                          registration.unregister();
-                          setRegistration(null);
-                          removeMessage(
-                            "notification_settings",
-                            "registration",
-                          );
-                        });
-                    }
-                  }}
-                >
-                  {registration != null
-                    ? t("notification.unregisterDevice")
-                    : t("notification.registerDevice")}
-                </Button>
-                {isAdmin && registration != null && registration.active && (
-                  <Button
-                    className="w-full md:w-auto"
-                    aria-label={t("notification.sendTestNotification")}
-                    onClick={() => sendTestNotification("notification_test")}
-                  >
-                    {t("notification.sendTestNotification")}
-                  </Button>
-                )}
-              </div>
-            </SettingsGroupCard>
-
-            {isAdmin && notificationCameras.length > 0 && (
-              <SettingsGroupCard title={t("notification.globalSettings.title")}>
-                <div className="space-y-4">
-                  <div className="flex max-w-xl flex-col gap-2 text-sm text-primary-variant">
-                    <p>{t("notification.globalSettings.desc")}</p>
-                  </div>
-                  <div className="w-full rounded-lg bg-secondary p-5 md:max-w-2xl">
-                    <div className="grid gap-6">
-                      {notificationCameras.map((item) => (
-                        <CameraNotificationSwitch
-                          key={item.name}
-                          config={config}
-                          camera={item.name}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </SettingsGroupCard>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function NotificationProviderCards({
-  config,
-  formContext,
-  status,
-  onTestComplete,
-}: {
-  config: FrigateConfig;
-  formContext?: SectionRendererProps["formContext"];
-  status?: Record<string, ProviderStatus>;
-  onTestComplete: () => void;
-}) {
-  const { t } = useTranslation(["views/settings"]);
-  const providers = ["webpush", "telegram", "zalo"] as const;
-  const providerNames = {
-    webpush: t("notification.providers.names.webpush"),
-    telegram: t("notification.providers.names.telegram"),
-    zalo: t("notification.providers.names.zalo"),
-  };
-  const pendingProviders = ((formContext?.formData as JsonObject | undefined)
-    ?.providers ?? {}) as Record<string, { enabled?: boolean }>;
-
-  const setProviderEnabled = (
-    provider: (typeof providers)[number],
-    enabled: boolean,
-  ) => {
-    if (!formContext?.onFormDataChange) {
-      return;
-    }
-    const nextData = cloneDeep(
-      ((formContext.formData as JsonObject | undefined) ??
-        (config.notifications as JsonObject)) as JsonObject,
-    );
-    set(nextData, `providers.${provider}.enabled`, enabled);
-    formContext.onFormDataChange(nextData as ConfigSectionData);
-  };
-
-  const sendTest = async (
-    provider: (typeof providers)[number],
-    recipientId = "",
-  ) => {
-    try {
-      await axios.post(`notifications/providers/${provider}/test`, {
-        recipient_id: recipientId,
-      });
-      toast.success(t("notification.providers.testQueued"));
-      onTestComplete();
-    } catch {
-      toast.error(t("notification.providers.testFailed"));
-    }
-  };
-
-  return (
-    <SettingsGroupCard title={t("notification.providers.title")}>
-      <div className="grid gap-4 lg:grid-cols-3">
-        {providers.map((provider) => {
-          const providerConfig = config.notifications.providers?.[provider];
-          const providerState = status?.[provider];
-          const recipients =
-            providerConfig &&
-            provider !== "webpush" &&
-            "recipients" in providerConfig
-              ? providerConfig.recipients
-              : [];
-          return (
-            <div
-              key={provider}
-              className="space-y-3 rounded-lg bg-secondary p-4"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="font-medium">{providerNames[provider]}</div>
-                <div
-                  className={cn(
-                    "text-xs font-medium uppercase",
-                    providerState?.readiness === "ready"
-                      ? "text-success"
-                      : providerState?.readiness === "degraded"
-                        ? "text-warning"
-                        : "text-danger",
-                  )}
-                >
-                  {providerState?.readiness ??
-                    t("notification.providers.loading")}
-                </div>
-              </div>
-              <div className="text-sm text-primary-variant">
-                {t("notification.providers.pending", {
-                  count: providerState?.pending ?? 0,
-                })}
-              </div>
-              <FilterSwitch
-                label={t("notification.providers.enabled")}
-                isChecked={
-                  pendingProviders[provider]?.enabled ??
-                  providerConfig?.enabled ??
-                  false
-                }
-                onCheckedChange={(checked) =>
-                  setProviderEnabled(provider, checked)
-                }
-              />
-              {provider === "zalo" &&
-                !config.notifications.providers?.zalo?.public_base_url && (
-                  <div className="text-xs text-warning">
-                    {t("notification.providers.zaloDegraded")}
-                  </div>
-                )}
-              {provider === "webpush" ? (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  disabled={!providerState?.configured}
-                  onClick={() => sendTest(provider)}
-                >
-                  {t("notification.providers.test")}
-                </Button>
-              ) : (
-                <div className="space-y-2">
-                  {recipients.map((recipient) => (
-                    <div
-                      key={recipient.id}
-                      className="flex items-center justify-between gap-2 text-sm"
-                    >
-                      <div className="min-w-0">
-                        <div className="truncate">{recipient.name}</div>
-                        <div className="truncate text-xs text-primary-variant">
-                          {recipient.chat_id}
-                        </div>
-                      </div>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={
-                          !recipient.enabled || !providerState?.configured
-                        }
-                        onClick={() => sendTest(provider, recipient.id)}
-                      >
-                        {t("notification.providers.test")}
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </SettingsGroupCard>
-  );
-}
-
-type CameraNotificationSwitchProps = {
-  config?: FrigateConfig;
-  camera: string;
+type ConfigResponse = {
+  revision: string;
+  notifications: NotificationDocument;
+  capabilities: { cameras: string[]; events: NotificationEvent[] };
+  providers: Record<ChannelName, ProviderStatus>;
 };
 
-export function CameraNotificationSwitch({
-  config,
-  camera,
-}: CameraNotificationSwitchProps) {
-  const { t } = useTranslation(["views/settings"]);
-  const { payload: notificationState, send: sendNotification } =
-    useNotifications(camera);
-  const { payload: notificationSuspendUntil, send: sendNotificationSuspend } =
-    useNotificationSuspend(camera);
-  const [isSuspended, setIsSuspended] = useState<boolean>(false);
+const EVENTS: { value: NotificationEvent; label: string }[] = [
+  { value: "alert", label: "Alert" },
+  { value: "object_detected", label: "Object detected" },
+  { value: "license_plate", label: "License plate" },
+  { value: "face_recognized", label: "Face recognized" },
+  { value: "camera_offline", label: "Camera offline" },
+  { value: "camera_online", label: "Camera online" },
+  { value: "semantic_trigger", label: "Semantic trigger" },
+  { value: "camera_monitoring", label: "Camera monitoring" },
+];
+const NOTIFICATION_SERVICE_WORKER = "/notifications-worker.js";
+
+const clone = <T,>(value: T): T => structuredClone(value);
+
+function newRule(index: number): NotificationRuleConfig {
+  return {
+    id: `rule_${index}`,
+    name: `Notification rule ${index}`,
+    enabled: true,
+    event: "alert",
+    filters: {
+      cameras: [],
+      labels: [],
+      zones: [],
+      identities: [],
+      trigger_names: [],
+      conditions: [],
+    },
+    destinations: { webpush: true, telegram: [], zalo: [] },
+    cooldown: 30,
+  };
+}
+
+export default function NotificationsSettingsExtras({
+  selectedCamera,
+  formContext,
+}: SectionRendererProps) {
+  const { data, mutate } = useSWR<ConfigResponse>("notifications/config", {
+    revalidateOnFocus: false,
+  });
+  const [document, setDocument] = useState<NotificationDocument>();
+  const [revision, setRevision] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (notificationSuspendUntil) {
-      setIsSuspended(
-        notificationSuspendUntil !== "0" || notificationState === "OFF",
-      );
+    if (!data || dirty) return;
+    setDocument(clone(data.notifications));
+    setRevision(data.revision);
+  }, [data, dirty]);
+
+  const update = (mutator: (draft: NotificationDocument) => void) => {
+    if (!document) return;
+    const draft = clone(document);
+    mutator(draft);
+    setDocument(draft);
+    setDirty(true);
+  };
+
+  const save = async () => {
+    if (!document) return;
+    setSaving(true);
+    try {
+      const response = await axios.put("notifications/config", {
+        revision,
+        notifications: document,
+      });
+      setDocument(clone(response.data.notifications));
+      setRevision(response.data.revision);
+      setDirty(false);
+      await mutate();
+      toast.success("Notification configuration saved to deploy/config.yaml");
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        toast.error("config.yaml changed. Reload before saving again.");
+      } else {
+        toast.error("Unable to save notification configuration");
+      }
+    } finally {
+      setSaving(false);
     }
-  }, [notificationSuspendUntil, notificationState]);
-
-  const handleSuspend = (duration: string) => {
-    setIsSuspended(true);
-    if (duration == "off") {
-      sendNotification("OFF");
-    } else {
-      sendNotificationSuspend(parseInt(duration));
-    }
   };
 
-  const handleCancelSuspension = () => {
-    sendNotification("ON");
-    sendNotificationSuspend(0);
-  };
+  if (!document || !data) {
+    return <div className="p-4 text-sm text-primary-variant">Loading notifications…</div>;
+  }
 
-  const locale = useDateLocale();
-  const is24Hour = use24HourTime(config);
-
-  const formatSuspendedUntil = (timestamp: string) => {
-    if (timestamp === "0") return t("time.untilForRestart", { ns: "common" });
-
-    const time = formatUnixTimestampToDateTime(parseInt(timestamp), {
-      time_style: "medium",
-      date_style: "medium",
-      timezone: config?.ui.timezone,
-      date_format: is24Hour
-        ? t("time.formattedTimestampMonthDayHourMinute.24hour", {
-            ns: "common",
-          })
-        : t("time.formattedTimestampMonthDayHourMinute.12hour", {
-            ns: "common",
-          }),
-      locale: locale,
-    });
-    return t("time.untilForTime", { ns: "common", time });
-  };
+  if (formContext?.level === "camera" && selectedCamera) {
+    return (
+      <CameraNotificationView
+        camera={selectedCamera}
+        document={document}
+      />
+    );
+  }
 
   return (
-    <div className="flex items-center justify-between gap-2">
-      <div className="flex flex-col items-start justify-start">
-        <div className="flex flex-row items-center justify-start gap-3">
-          {!isSuspended ? (
-            <LuCheck className="size-6 text-success" />
-          ) : (
-            <LuX className="size-6 text-danger" />
-          )}
-          <div className="flex flex-col">
-            <CameraNameLabel
-              className="cursor-pointer text-primary smart-capitalize"
-              htmlFor="camera"
-              camera={camera}
-            />
-
-            {!isSuspended ? (
-              <div className="flex flex-row items-center gap-2 text-sm text-success">
-                {t("notification.active")}
-              </div>
-            ) : (
-              <div className="flex flex-row items-center gap-2 text-sm text-danger">
-                {t("notification.suspended", {
-                  time: formatSuspendedUntil(notificationSuspendUntil),
-                })}
-              </div>
-            )}
+    <div className="space-y-6 pb-8">
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-secondary-variant bg-secondary p-4">
+        <div>
+          <div className="font-medium">Notification configuration</div>
+          <div className="text-sm text-primary-variant">
+            Single source of truth: deploy/config.yaml
           </div>
+        </div>
+        <div className="flex gap-2">
+          {dirty && (
+            <Button
+              variant="outline"
+              onClick={() => {
+                setDocument(clone(data.notifications));
+                setRevision(data.revision);
+                setDirty(false);
+              }}
+            >
+              Discard
+            </Button>
+          )}
+          <Button disabled={!dirty || saving} onClick={save}>
+            {saving ? "Saving…" : "Save Notifications"}
+          </Button>
         </div>
       </div>
 
-      {!isSuspended ? (
-        <Select onValueChange={handleSuspend}>
-          <SelectTrigger className="w-auto">
-            <SelectValue placeholder={t("notification.suspendTime.suspend")} />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="5">
-              {t("notification.suspendTime.5minutes")}
-            </SelectItem>
-            <SelectItem value="10">
-              {t("notification.suspendTime.10minutes")}
-            </SelectItem>
-            <SelectItem value="30">
-              {t("notification.suspendTime.30minutes")}
-            </SelectItem>
-            <SelectItem value="60">
-              {t("notification.suspendTime.1hour")}
-            </SelectItem>
-            <SelectItem value="840">
-              {t("notification.suspendTime.12hours")}
-            </SelectItem>
-            <SelectItem value="1440">
-              {t("notification.suspendTime.24hours")}
-            </SelectItem>
-            <SelectItem value="off">
-              {t("notification.suspendTime.untilRestart")}
-            </SelectItem>
-          </SelectContent>
-        </Select>
-      ) : (
-        <Button
-          variant="destructive"
-          size="sm"
-          onClick={handleCancelSuspension}
-        >
-          {t("notification.cancelSuspension")}
-        </Button>
+      <SettingsGroupCard title="General">
+        <div className="space-y-3">
+          <FilterSwitch
+            label="Enable notifications"
+            isChecked={document.enabled}
+            onCheckedChange={(enabled) =>
+              update((draft) => (draft.enabled = enabled))
+            }
+          />
+          <label className="block max-w-xl space-y-1 text-sm">
+            <span>WebPush contact email</span>
+            <Input
+              type="email"
+              value={document.email ?? ""}
+              placeholder="admin@example.com"
+              onChange={(event) =>
+                update((draft) => (draft.email = event.target.value || null))
+              }
+            />
+          </label>
+        </div>
+      </SettingsGroupCard>
+
+      <SettingsGroupCard title="Channels">
+        <div className="grid gap-4 xl:grid-cols-3">
+          {(["webpush", "telegram", "zalo"] as ChannelName[]).map((channel) => (
+            <ChannelCard
+              key={channel}
+              channel={channel}
+              document={document}
+              status={data.providers[channel]}
+              dirty={dirty}
+              update={update}
+              refresh={() => mutate()}
+            />
+          ))}
+        </div>
+      </SettingsGroupCard>
+
+      <SettingsGroupCard title="Rules">
+        <div className="space-y-4">
+          {document.rules.map((rule, index) => (
+            <RuleEditor
+              key={`${rule.id}-${index}`}
+              rule={rule}
+              cameras={data.capabilities.cameras}
+              channels={document.channels}
+              dirty={dirty}
+              updateRule={(next) =>
+                update((draft) => {
+                  draft.rules[index] = next;
+                })
+              }
+              remove={() => update((draft) => draft.rules.splice(index, 1))}
+              refresh={() => mutate()}
+            />
+          ))}
+          <Button
+            variant="outline"
+            onClick={() => update((draft) => draft.rules.push(newRule(draft.rules.length + 1)))}
+          >
+            Add rule
+          </Button>
+        </div>
+      </SettingsGroupCard>
+
+      <SettingsGroupCard title="Delivery">
+        <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-5">
+          {(
+            [
+              ["max_attempts", "Maximum attempts"],
+              ["initial_backoff", "Initial backoff (s)"],
+              ["max_backoff", "Maximum backoff (s)"],
+              ["retention_days", "Retention (days)"],
+              ["max_pending", "Maximum pending"],
+            ] as const
+          ).map(([field, label]) => (
+            <label key={field} className="space-y-1 text-sm">
+              <span>{label}</span>
+              <Input
+                type="number"
+                min={1}
+                value={document.delivery[field]}
+                onChange={(event) =>
+                  update(
+                    (draft) =>
+                      (draft.delivery[field] = Number(event.target.value)),
+                  )
+                }
+              />
+            </label>
+          ))}
+        </div>
+      </SettingsGroupCard>
+    </div>
+  );
+}
+
+function CameraNotificationView({
+  camera,
+  document,
+}: {
+  camera: string;
+  document: NotificationDocument;
+}) {
+  const { payload: suspendedUntil, send: sendSuspend } =
+    useNotificationSuspend(camera);
+  const rules = document.rules.filter(
+    (rule) =>
+      rule.enabled &&
+      (rule.filters.cameras.length === 0 ||
+        rule.filters.cameras.includes(camera)),
+  );
+  const suspended = Boolean(suspendedUntil && suspendedUntil !== "0");
+  return (
+    <div className="space-y-4 pb-8">
+      <SettingsGroupCard title={`Notifications for ${camera}`}>
+        <div className="space-y-3">
+          <div className="text-sm text-primary-variant">
+            Persistent settings are managed by rules in Settings → Notifications.
+          </div>
+          {rules.length ? (
+            rules.map((rule) => (
+              <div
+                key={rule.id}
+                className="flex items-center justify-between rounded-md border border-secondary-variant p-3"
+              >
+                <div>
+                  <div className="font-medium">{rule.name}</div>
+                  <div className="text-xs text-primary-variant">
+                    {rule.event} · {rule.cooldown}s cooldown
+                  </div>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="text-sm">No notification rule applies to this camera.</div>
+          )}
+          <div className="flex flex-wrap items-center gap-2 pt-2">
+            <div className={suspended ? "text-danger" : "text-success"}>
+              {suspended ? `Suspended until ${suspendedUntil}` : "Active"}
+            </div>
+            {!suspended ? (
+              <>
+                <Button size="sm" variant="outline" onClick={() => sendSuspend(5)}>
+                  Suspend 5 minutes
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => sendSuspend(60)}>
+                  Suspend 1 hour
+                </Button>
+              </>
+            ) : (
+              <Button size="sm" variant="outline" onClick={() => sendSuspend(0)}>
+                Resume
+              </Button>
+            )}
+          </div>
+        </div>
+      </SettingsGroupCard>
+    </div>
+  );
+}
+
+function ChannelCard({
+  channel,
+  document,
+  status,
+  dirty,
+  update,
+  refresh,
+}: {
+  channel: ChannelName;
+  document: NotificationDocument;
+  status?: ProviderStatus;
+  dirty: boolean;
+  update: (mutator: (draft: NotificationDocument) => void) => void;
+  refresh: () => void;
+}) {
+  const channelConfig = document.channels[channel];
+  const recipients = "recipients" in channelConfig ? channelConfig.recipients : [];
+  const test = async (recipientId = "") => {
+    try {
+      await axios.post(`notifications/providers/${channel}/test`, {
+        recipient_id: recipientId,
+      });
+      toast.success("Test notification queued");
+      refresh();
+    } catch {
+      toast.error("Provider is not ready");
+    }
+  };
+
+  return (
+    <div className="space-y-3 rounded-lg border border-secondary-variant p-4">
+      <div className="flex items-center justify-between">
+        <div className="font-medium capitalize">{channel}</div>
+        <div className="text-xs uppercase text-primary-variant">
+          {status?.readiness ?? "loading"} · {status?.pending ?? 0} pending
+        </div>
+      </div>
+      <FilterSwitch
+        label="Enabled"
+        isChecked={channelConfig.enabled}
+        onCheckedChange={(enabled) =>
+          update((draft) => (draft.channels[channel].enabled = enabled))
+        }
+      />
+      {channel === "zalo" && (
+        <label className="block space-y-1 text-sm">
+          <span>Public base URL</span>
+          <Input
+            value={document.channels.zalo.public_base_url ?? ""}
+            placeholder="https://camera.example.com"
+            onChange={(event) =>
+              update(
+                (draft) =>
+                  (draft.channels.zalo.public_base_url = event.target.value || null),
+              )
+            }
+          />
+        </label>
+      )}
+      {channel !== "webpush" && (
+        <div className="space-y-3">
+          {recipients.map((recipient, index) => (
+            <RecipientEditor
+              key={`${recipient.id}-${index}`}
+              recipient={recipient}
+              onChange={(next) =>
+                update((draft) => {
+                  const config = draft.channels[channel];
+                  if ("recipients" in config) config.recipients[index] = next;
+                })
+              }
+              remove={() =>
+                update((draft) => {
+                  const config = draft.channels[channel];
+                  if ("recipients" in config) config.recipients.splice(index, 1);
+                })
+              }
+              test={() => test(recipient.id)}
+              testDisabled={dirty || !recipient.enabled || !status?.configured}
+            />
+          ))}
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              update((draft) => {
+                const config = draft.channels[channel];
+                if ("recipients" in config)
+                  config.recipients.push({
+                    id: `recipient_${config.recipients.length + 1}`,
+                    name: "New recipient",
+                    chat_id: "",
+                    enabled: true,
+                  });
+              })
+            }
+          >
+            Add recipient
+          </Button>
+        </div>
+      )}
+      {channel === "webpush" && (
+        <div className="space-y-2">
+          <WebPushDeviceRegistration enabled={channelConfig.enabled} />
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={dirty || !status?.configured}
+            onClick={() => test()}
+          >
+            Test saved configuration
+          </Button>
+        </div>
+      )}
+      {status?.last_error && (
+        <div className="text-xs text-danger">{status.last_error}</div>
       )}
     </div>
+  );
+}
+
+function WebPushDeviceRegistration({ enabled }: { enabled: boolean }) {
+  const { data: publicKey } = useSWR<string>(
+    enabled ? "notifications/pubkey" : null,
+    { revalidateOnFocus: false },
+  );
+  const [registration, setRegistration] =
+    useState<ServiceWorkerRegistration | null>();
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker
+      .getRegistration(NOTIFICATION_SERVICE_WORKER)
+      .then((value) => setRegistration(value ?? null))
+      .catch(() => setRegistration(null));
+  }, []);
+
+  const toggle = async () => {
+    if (registration) {
+      const subscription = await registration.pushManager.getSubscription();
+      await subscription?.unsubscribe();
+      await registration.unregister();
+      setRegistration(null);
+      toast.success("WebPush device unregistered");
+      return;
+    }
+    if (!publicKey || !("Notification" in window) || !window.isSecureContext) {
+      toast.error("WebPush requires HTTPS and a ready VAPID key");
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return;
+    const worker = await navigator.serviceWorker.register(
+      NOTIFICATION_SERVICE_WORKER,
+      { updateViaCache: "none" },
+    );
+    await navigator.serviceWorker.ready;
+    const subscription = await worker.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: publicKey,
+    });
+    await axios.post("notifications/register", { sub: subscription });
+    setRegistration(worker);
+    toast.success("WebPush device registered");
+  };
+
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      disabled={!enabled || !("serviceWorker" in navigator)}
+      onClick={toggle}
+    >
+      {registration ? "Unregister this device" : "Register this device"}
+    </Button>
+  );
+}
+
+function RecipientEditor({
+  recipient,
+  onChange,
+  remove,
+  test,
+  testDisabled,
+}: {
+  recipient: NotificationRecipientConfig;
+  onChange: (recipient: NotificationRecipientConfig) => void;
+  remove: () => void;
+  test: () => void;
+  testDisabled: boolean;
+}) {
+  return (
+    <div className="space-y-2 rounded-md bg-secondary p-3">
+      <div className="grid gap-2 md:grid-cols-2">
+        <Input value={recipient.id} onChange={(e) => onChange({ ...recipient, id: e.target.value })} placeholder="ID" />
+        <Input value={recipient.name} onChange={(e) => onChange({ ...recipient, name: e.target.value })} placeholder="Name" />
+      </div>
+      <Input value={recipient.chat_id} onChange={(e) => onChange({ ...recipient, chat_id: e.target.value })} placeholder="Chat ID or {ENV_NAME}" />
+      <div className="flex flex-wrap items-center gap-2">
+        <FilterSwitch label="Enabled" isChecked={recipient.enabled} onCheckedChange={(enabled) => onChange({ ...recipient, enabled })} />
+        <Button size="sm" variant="outline" disabled={testDisabled} onClick={test}>Test</Button>
+        <Button size="sm" variant="destructive" onClick={remove}>Remove</Button>
+      </div>
+    </div>
+  );
+}
+
+function RuleEditor({
+  rule,
+  cameras,
+  channels,
+  dirty,
+  updateRule,
+  remove,
+  refresh,
+}: {
+  rule: NotificationRuleConfig;
+  cameras: string[];
+  channels: NotificationDocument["channels"];
+  dirty: boolean;
+  updateRule: (rule: NotificationRuleConfig) => void;
+  remove: () => void;
+  refresh: () => void;
+}) {
+  const socialRecipients = useMemo(
+    () => ({ telegram: channels.telegram.recipients, zalo: channels.zalo.recipients }),
+    [channels],
+  );
+  const change = (mutator: (draft: NotificationRuleConfig) => void) => {
+    const draft = clone(rule);
+    mutator(draft);
+    updateRule(draft);
+  };
+  const test = async () => {
+    try {
+      await axios.post(`notifications/rules/${rule.id}/test`);
+      toast.success("Rule test queued");
+      refresh();
+    } catch {
+      toast.error("No destination is ready");
+    }
+  };
+  return (
+    <div className="space-y-4 rounded-lg border border-secondary-variant p-4">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <Input value={rule.id} onChange={(e) => change((draft) => (draft.id = e.target.value))} placeholder="Rule ID" />
+        <Input value={rule.name} onChange={(e) => change((draft) => (draft.name = e.target.value))} placeholder="Name" />
+        <select className="rounded-md border border-secondary-variant bg-background px-3" value={rule.event} onChange={(e) => change((draft) => (draft.event = e.target.value as NotificationEvent))}>
+          {EVENTS.map((event) => <option key={event.value} value={event.value}>{event.label}</option>)}
+        </select>
+        <Input type="number" min={0} value={rule.cooldown} onChange={(e) => change((draft) => (draft.cooldown = Number(e.target.value)))} placeholder="Cooldown seconds" />
+      </div>
+      <FilterSwitch label="Rule enabled" isChecked={rule.enabled} onCheckedChange={(enabled) => change((draft) => (draft.enabled = enabled))} />
+      <div>
+        <div className="mb-2 text-sm font-medium">Cameras (none means all)</div>
+        <div className="flex flex-wrap gap-3">
+          {cameras.map((camera) => <FilterSwitch key={camera} label={camera} isChecked={rule.filters.cameras.includes(camera)} onCheckedChange={(checked) => change((draft) => { draft.filters.cameras = checked ? [...draft.filters.cameras, camera] : draft.filters.cameras.filter((value) => value !== camera); })} />)}
+        </div>
+      </div>
+      {(rule.event === "alert" || rule.event === "object_detected") && (
+        <div className="grid gap-3 md:grid-cols-2">
+          <ListInput label="Labels" value={rule.filters.labels} onChange={(value) => change((draft) => (draft.filters.labels = value))} />
+          <ListInput label="Zones" value={rule.filters.zones} onChange={(value) => change((draft) => (draft.filters.zones = value))} />
+        </div>
+      )}
+      {rule.event === "face_recognized" && <ListInput label="Identities (* means all known; add unknown explicitly)" value={rule.filters.identities} onChange={(value) => change((draft) => (draft.filters.identities = value))} />}
+      {rule.event === "semantic_trigger" && <ListInput label="Trigger names" value={rule.filters.trigger_names} onChange={(value) => change((draft) => (draft.filters.trigger_names = value))} />}
+      {rule.event === "camera_monitoring" && <ListInput label="Conditions" value={rule.filters.conditions} onChange={(value) => change((draft) => (draft.filters.conditions = value))} />}
+      <div>
+        <div className="mb-2 text-sm font-medium">Destinations</div>
+        <div className="space-y-2">
+          <FilterSwitch label="WebPush registered devices" isChecked={rule.destinations.webpush} onCheckedChange={(checked) => change((draft) => (draft.destinations.webpush = checked))} />
+          {(["telegram", "zalo"] as const).map((channel) => socialRecipients[channel].map((recipient) => (
+            <FilterSwitch key={`${channel}-${recipient.id}`} label={`${channel}: ${recipient.name}`} isChecked={rule.destinations[channel].includes(recipient.id)} onCheckedChange={(checked) => change((draft) => { draft.destinations[channel] = checked ? [...draft.destinations[channel], recipient.id] : draft.destinations[channel].filter((id) => id !== recipient.id); })} />
+          )))}
+        </div>
+      </div>
+      <div className="flex gap-2">
+        <Button size="sm" variant="outline" disabled={dirty || !rule.enabled} onClick={test}>Test saved rule</Button>
+        <Button size="sm" variant="destructive" onClick={remove}>Remove rule</Button>
+      </div>
+    </div>
+  );
+}
+
+function ListInput({ label, value, onChange }: { label: string; value: string[]; onChange: (value: string[]) => void }) {
+  return (
+    <label className="space-y-1 text-sm">
+      <span>{label}</span>
+      <Input value={value.join(", ")} onChange={(event) => onChange(event.target.value.split(",").map((item) => item.trim()).filter(Boolean))} placeholder="Comma-separated" />
+    </label>
   );
 }

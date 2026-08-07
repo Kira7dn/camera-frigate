@@ -99,6 +99,8 @@ export interface SectionConfig {
   /** Fields to show in advanced section */
   advancedFields?: string[];
   /** Fields to compare for override detection */
+  /** Custom sections can own their complete save transaction and controls. */
+  hideSaveControls?: boolean;
   overrideFields?: string[];
   /** Documentation link for the section */
   sectionDocs?: string;
@@ -1058,7 +1060,7 @@ export function ConfigSection({
         </LiveFormDataContext.Provider>
       </FieldMessagesContext.Provider>
 
-      {!embedded && (
+      {!embedded && !sectionConfig?.hideSaveControls && (
         <div
           className={cn(
             "w-full border-t border-secondary bg-background pt-0",

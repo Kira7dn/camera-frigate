@@ -400,7 +400,37 @@ export type NotificationRecipientConfig = {
   name: string;
   chat_id: string;
   enabled: boolean;
-  cameras: string[];
+};
+
+export type NotificationEvent =
+  | "alert"
+  | "object_detected"
+  | "license_plate"
+  | "face_recognized"
+  | "camera_offline"
+  | "camera_online"
+  | "semantic_trigger"
+  | "camera_monitoring";
+
+export type NotificationRuleConfig = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  event: NotificationEvent;
+  filters: {
+    cameras: string[];
+    labels: string[];
+    zones: string[];
+    identities: string[];
+    trigger_names: string[];
+    conditions: string[];
+  };
+  destinations: {
+    webpush: boolean;
+    telegram: string[];
+    zalo: string[];
+  };
+  cooldown: number;
 };
 
 export type NotificationSocialProviderConfig = {
@@ -567,10 +597,10 @@ export interface FrigateConfig {
   };
 
   notifications: {
+    schema_version: 2;
     enabled: boolean;
-    email?: string;
-    cooldown: number;
-    providers: {
+    email?: string | null;
+    channels: {
       webpush: { enabled: boolean };
       telegram: NotificationSocialProviderConfig;
       zalo: NotificationSocialProviderConfig & {
@@ -578,6 +608,7 @@ export interface FrigateConfig {
         media_url_ttl: number;
       };
     };
+    rules: NotificationRuleConfig[];
     delivery: {
       max_attempts: number;
       initial_backoff: number;
@@ -585,7 +616,6 @@ export interface FrigateConfig {
       retention_days: number;
       max_pending: number;
     };
-    enabled_in_config: boolean;
   };
 
   objects: {

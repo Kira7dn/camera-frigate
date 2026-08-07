@@ -1,6 +1,7 @@
 """configuration utils."""
 
 import asyncio
+import datetime
 import logging
 import os
 import shutil
@@ -68,6 +69,118 @@ def find_config_file() -> str:
     return config_path
 
 
+def migrate_notification_config_v2(config: dict[str, Any]) -> bool:
+    """Move legacy provider/camera routing into explicit global rules.
+
+    The generated rules cover only event types supported by the legacy native
+    client. New v2 sources remain opt-in, so an upgrade cannot create extra
+    object, face, or camera-health messages.
+    """
+    notifications = config.get("notifications")
+    if not isinstance(notifications, dict) or notifications.get("schema_version") == 2:
+        return False
+
+    providers = notifications.get("providers") or {}
+    channels: dict[str, Any] = {}
+    recipient_camera_filters: dict[str, dict[str, list[str]]] = {
+        "telegram": {},
+        "zalo": {},
+    }
+    for provider_name in ("webpush", "telegram", "zalo"):
+        provider = dict(providers.get(provider_name) or {})
+        recipients = provider.get("recipients")
+        if isinstance(recipients, list):
+            clean_recipients = []
+            for recipient_value in recipients:
+                recipient = dict(recipient_value or {})
+                recipient_id = str(recipient.get("id", ""))
+                recipient_camera_filters[provider_name][recipient_id] = list(
+                    recipient.pop("cameras", []) or []
+                )
+                clean_recipients.append(recipient)
+            provider["recipients"] = clean_recipients
+        channels[provider_name] = provider
+
+    global_cooldown = int(notifications.get("cooldown", 0) or 0)
+    rules: list[dict[str, Any]] = []
+    cameras = config.get("cameras") or {}
+    for camera_name, camera_value in cameras.items():
+        camera = camera_value if isinstance(camera_value, dict) else {}
+        camera_notifications = camera.get("notifications") or {}
+        if not isinstance(camera_notifications, dict) or not camera_notifications.get(
+            "enabled", False
+        ):
+            camera.pop("notifications", None)
+            continue
+        selected = set(camera_notifications.get("providers") or ["webpush"])
+        cooldown = max(
+            global_cooldown, int(camera_notifications.get("cooldown", 0) or 0)
+        )
+        destinations: dict[str, Any] = {
+            "webpush": "webpush" in selected,
+            "telegram": [],
+            "zalo": [],
+        }
+        for provider_name in ("telegram", "zalo"):
+            if provider_name not in selected:
+                continue
+            provider = channels.get(provider_name) or {}
+            for recipient in provider.get("recipients", []) or []:
+                recipient_id = str(recipient.get("id", ""))
+                allowed_cameras = recipient_camera_filters[provider_name].get(
+                    recipient_id, []
+                )
+                if not allowed_cameras or camera_name in allowed_cameras:
+                    destinations[provider_name].append(recipient_id)
+
+        for event in ("alert", "semantic_trigger", "camera_monitoring"):
+            if not (
+                destinations["webpush"]
+                or destinations["telegram"]
+                or destinations["zalo"]
+            ):
+                continue
+            rules.append(
+                {
+                    "id": f"migrated_{camera_name}_{event}",
+                    "name": f"{camera_name} {event.replace('_', ' ')}",
+                    "enabled": True,
+                    "event": event,
+                    "filters": {"cameras": [camera_name]},
+                    "destinations": dict(destinations),
+                    "cooldown": cooldown,
+                }
+            )
+        social_destinations = {
+            "webpush": False,
+            "telegram": list(destinations["telegram"]),
+            "zalo": list(destinations["zalo"]),
+        }
+        if social_destinations["telegram"] or social_destinations["zalo"]:
+            rules.append(
+                {
+                    "id": f"migrated_{camera_name}_license_plate",
+                    "name": f"{camera_name} license plate",
+                    "enabled": True,
+                    "event": "license_plate",
+                    "filters": {"cameras": [camera_name]},
+                    "destinations": social_destinations,
+                    "cooldown": cooldown,
+                }
+            )
+        camera.pop("notifications", None)
+
+    config["notifications"] = {
+        "schema_version": 2,
+        "enabled": bool(notifications.get("enabled", False)),
+        "email": notifications.get("email"),
+        "channels": channels,
+        "rules": rules,
+        "delivery": notifications.get("delivery") or {},
+    }
+    return True
+
+
 def migrate_frigate_config(config_file: str):
     """handle migrating the frigate config."""
     logger.info("Checking if frigate config needs migration...")
@@ -78,12 +191,23 @@ def migrate_frigate_config(config_file: str):
 
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
-    with open(config_file) as f:
+    with open(config_file, encoding="utf-8") as f:
         config: dict[str, dict[str, Any]] = yaml.load(f)
 
     if config is None:
         logger.error(f"Failed to load config at {config_file}")
         return
+
+    if migrate_notification_config_v2(config):
+        backup_name = datetime.datetime.now(datetime.UTC).strftime(
+            "notification-config-v1-%Y%m%d-%H%M%S.yaml"
+        )
+        backup_dir = os.path.join(CONFIG_DIR, "config-backups")
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+        shutil.copy(config_file, os.path.join(backup_dir, backup_name))
+        with open(config_file, "w", encoding="utf-8", newline="\n") as file:
+            yaml.dump(config, file)
+        logger.info("Migrated notifications to schema version 2")
 
     previous_version = str(config.get("version", "0.13"))
 

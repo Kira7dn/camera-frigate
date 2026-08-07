@@ -117,6 +117,8 @@ def get_event_snapshot_bytes(
     quality: int | None = None,
     timestamp_style: Any | None = None,
     colormap: dict[str, tuple[int, int, int]] | None = None,
+    label: str | None = None,
+    extra_overlay_boxes: list[dict[str, Any]] | None = None,
 ) -> tuple[bytes | None, float]:
     best_frame, is_clean_snapshot = load_event_snapshot_image(event)
     if best_frame is None:
@@ -128,6 +130,8 @@ def get_event_snapshot_bytes(
         event.data.get("box") if event.data else None,
     )
     overlay_boxes = _get_event_snapshot_overlay_boxes(best_frame.shape, event)
+    if extra_overlay_boxes:
+        overlay_boxes.extend(extra_overlay_boxes)
 
     if (bounding_box or crop or timestamp) and not is_clean_snapshot:
         logger.warning(
@@ -144,7 +148,7 @@ def get_event_snapshot_bytes(
         crop=crop and is_clean_snapshot,
         height=height,
         quality=quality,
-        label=getattr(event, "sub_label", None) or event.label,
+        label=label or getattr(event, "sub_label", None) or event.label,
         box=box,
         score=_get_event_snapshot_score(event),
         area=_get_event_snapshot_area(event),

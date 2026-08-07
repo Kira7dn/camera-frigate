@@ -4,7 +4,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from frigate.config.camera.notification import NotificationRecipientConfig
+from frigate.config.camera.notification import (
+    NotificationDestinationsConfig,
+    NotificationRecipientConfig,
+)
 from frigate.notifications.envelope import NotificationEnvelope
 from frigate.notifications.social import SocialClient
 
@@ -22,22 +25,18 @@ class TestNotificationSocialClient(unittest.TestCase):
             id="ops",
             name="Operators",
             chat_id="123",
-            cameras=["car_camera"],
         )
         self.client.config = SimpleNamespace(
             notifications=SimpleNamespace(
-                providers=SimpleNamespace(
+                channels=SimpleNamespace(
                     telegram=SimpleNamespace(enabled=True, recipients=[self.recipient]),
                     zalo=SimpleNamespace(enabled=False, recipients=[]),
-                )
+                ),
+                rules=[],
             ),
             cameras={
-                "car_camera": SimpleNamespace(
-                    notifications=SimpleNamespace(enabled=True, providers=["telegram"])
-                ),
-                "other_camera": SimpleNamespace(
-                    notifications=SimpleNamespace(enabled=True, providers=["telegram"])
-                ),
+                "car_camera": SimpleNamespace(),
+                "other_camera": SimpleNamespace(),
             },
         )
         self.client.outbox = MagicMock()
@@ -59,14 +58,18 @@ class TestNotificationSocialClient(unittest.TestCase):
             lpr_plate="51A12345",
         )
 
-    def test_recipient_camera_filter(self):
+    def test_recipient_and_channel_enabled(self):
         self.assertTrue(self.client.recipient_enabled("telegram", "ops", "car_camera"))
-        self.assertFalse(
-            self.client.recipient_enabled("telegram", "ops", "other_camera")
-        )
+        self.assertFalse(self.client.recipient_enabled("zalo", "ops", "car_camera"))
 
     def test_review_with_plate_uses_lpr_passage_dedupe_key(self):
-        self.assertEqual(self.client.enqueue(self.envelope()), ["delivery-1"])
+        self.assertEqual(
+            self.client.enqueue(
+                self.envelope(),
+                NotificationDestinationsConfig(telegram=["ops"]),
+            ),
+            ["delivery-1"],
+        )
         queued_envelope = self.client.outbox.enqueue.call_args.args[2]
         self.assertEqual(queued_envelope.source_type, "lpr")
         self.assertEqual(queued_envelope.source_id, "event-1")

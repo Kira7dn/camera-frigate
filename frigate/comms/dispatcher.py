@@ -289,7 +289,15 @@ class Dispatcher:
                     "audio_transcription": self.config.cameras[
                         camera
                     ].audio_transcription.live_enabled,
-                    "notifications": self.config.cameras[camera].notifications.enabled,
+                    "notifications": self.config.notifications.enabled
+                    and any(
+                        rule.enabled
+                        and (
+                            not rule.filters.cameras
+                            or camera in rule.filters.cameras
+                        )
+                        for rule in self.config.notifications.rules
+                    ),
                     "notifications_suspended": int(
                         self.notification_client.suspended_cameras.get(camera, 0)
                     )

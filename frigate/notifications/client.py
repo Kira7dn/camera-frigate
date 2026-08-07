@@ -1,4 +1,4 @@
-"""Shared native notification policy and fan-out pipeline."""
+"""Rule-driven native notification policy and provider fan-out."""
 
 import datetime
 import json
@@ -7,6 +7,7 @@ import re
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
@@ -16,10 +17,11 @@ from frigate.comms.base_communicator import Communicator
 from frigate.comms.config_updater import ConfigSubscriber
 from frigate.config import FrigateConfig
 from frigate.config.auth import AuthConfig
-from frigate.config.camera.updater import (
-    CameraConfigUpdateEnum,
-    CameraConfigUpdateSubscriber,
+from frigate.config.camera.notification import (
+    NotificationDestinationsConfig,
+    NotificationRuleConfig,
 )
+from frigate.models import NotificationRuleState
 
 from .envelope import NotificationEnvelope
 from .metrics import increment
@@ -27,16 +29,28 @@ from .social import SocialClient
 from .webpush import WebPushProvider
 
 logger = logging.getLogger(__name__)
+CAMERA_STATUS_TOPIC = re.compile(r"^([^/]+)/status/detect$")
+OFFLINE_DEBOUNCE_SECONDS = 30
+SEEN_RETENTION_SECONDS = 86400
 
 
 def normalize_plate(value: Any) -> str | None:
-    """Normalize a recognized plate for notification deduplication."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if not isinstance(value, str):
+        return None
     plate = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
-    return plate or None
+    if not 5 <= len(plate) <= 12:
+        return None
+    if not any(char.isdigit() for char in plate) or not any(
+        char.isalpha() for char in plate
+    ):
+        return None
+    return plate
 
 
 class NotificationClient(Communicator):
-    """Apply notification policy once and fan out to enabled providers."""
+    """Normalize Frigate events, match rules once, then fan out."""
 
     def __init__(self, config: FrigateConfig, stop_event: MpEvent) -> None:
         self.config = config
@@ -44,17 +58,20 @@ class NotificationClient(Communicator):
         self.webpush = WebPushProvider(config, stop_event)
         self.social = SocialClient(config, stop_event)
         self.suspended_cameras = {camera: 0 for camera in config.cameras}
-        self.last_camera_notification_time = {camera: 0.0 for camera in config.cameras}
-        self.last_notification_time = 0.0
         self.suspension_broadcaster: Callable[[str, Any, bool], None] | None = None
         self.global_config_subscriber = ConfigSubscriber("config/")
-        self.config_subscriber = CameraConfigUpdateSubscriber(
-            config, config.cameras, [CameraConfigUpdateEnum.notifications]
+        self._last_delivery: dict[tuple[str, str, str, str], float] = {}
+        self._seen: dict[tuple[str, str, str], float] = {}
+        self._alert_plates: dict[str, str] = {}
+        self._lpr_updates: dict[str, dict[str, Any]] = {}
+        self._camera_status: dict[str, str] = {}
+        self._offline_since: dict[str, float] = {}
+        self._offline_notified: set[str] = set()
+        self._load_rule_state()
+        self._maintenance_thread = threading.Thread(
+            target=self._process_runtime_state, daemon=True
         )
-        self._suspension_thread = threading.Thread(
-            target=self._process_suspensions, daemon=True
-        )
-        self._suspension_thread.start()
+        self._maintenance_thread.start()
 
     def subscribe(self, receiver: Callable) -> None:
         pass
@@ -77,10 +94,7 @@ class NotificationClient(Communicator):
 
     def is_camera_suspended(self, camera: str) -> bool:
         suspended_until = self.suspended_cameras.get(camera, 0)
-        if (
-            suspended_until
-            and suspended_until <= datetime.datetime.now(datetime.UTC).timestamp()
-        ):
+        if suspended_until and suspended_until <= self._now():
             self.unsuspend_notifications(camera)
             self._broadcast_suspension(camera)
             return False
@@ -94,10 +108,73 @@ class NotificationClient(Communicator):
                 True,
             )
 
-    def _process_suspensions(self) -> None:
+    @staticmethod
+    def _now() -> float:
+        return datetime.datetime.now(datetime.UTC).timestamp()
+
+    def _load_rule_state(self) -> None:
+        try:
+            for state in NotificationRuleState.select():
+                key = (state.rule_id, state.camera, state.channel, state.recipient_id)
+                self._last_delivery[key] = state.last_sent.timestamp()
+                if state.last_source_type and state.last_source_id:
+                    self._seen[
+                        (state.rule_id, state.last_source_type, state.last_source_id)
+                    ] = state.last_sent.timestamp()
+        except Exception:
+            logger.debug("Notification rule state is not available yet", exc_info=True)
+
+    def _persist_rule_state(
+        self,
+        key: tuple[str, str, str, str],
+        envelope: NotificationEnvelope,
+        sent_at: float,
+    ) -> None:
+        try:
+            NotificationRuleState.insert(
+                rule_id=key[0],
+                camera=key[1],
+                channel=key[2],
+                recipient_id=key[3],
+                last_source_type=envelope.source_type,
+                last_source_id=envelope.source_id,
+                last_sent=datetime.datetime.fromtimestamp(sent_at, datetime.UTC),
+            ).on_conflict(
+                conflict_target=[
+                    NotificationRuleState.rule_id,
+                    NotificationRuleState.camera,
+                    NotificationRuleState.channel,
+                    NotificationRuleState.recipient_id,
+                ],
+                update={
+                    NotificationRuleState.last_source_type: envelope.source_type,
+                    NotificationRuleState.last_source_id: envelope.source_id,
+                    NotificationRuleState.last_sent: datetime.datetime.fromtimestamp(
+                        sent_at, datetime.UTC
+                    ),
+                },
+            ).execute()
+        except Exception:
+            logger.warning("Unable to persist notification rule state", exc_info=True)
+
+    def _process_runtime_state(self) -> None:
         while not self.stop_event.wait(1):
+            now = self._now()
             for camera in tuple(self.suspended_cameras):
                 self.is_camera_suspended(camera)
+            for camera, offline_since in tuple(self._offline_since.items()):
+                if (
+                    camera not in self._offline_notified
+                    and now - offline_since >= OFFLINE_DEBOUNCE_SECONDS
+                    and self._camera_status.get(camera) == "offline"
+                ):
+                    self._offline_notified.add(camera)
+                    self._route(
+                        "camera_offline",
+                        self._camera_status_envelope(camera, "offline", offline_since),
+                    )
+            cutoff = now - SEEN_RETENTION_SECONDS
+            self._seen = {key: at for key, at in self._seen.items() if at >= cutoff}
 
     def _refresh_config(self) -> None:
         changed = False
@@ -111,52 +188,117 @@ class NotificationClient(Communicator):
             elif topic == "config/auth" and isinstance(payload, AuthConfig):
                 self.config.auth = payload
                 self.webpush.refresh_authorization()
-        updates = self.config_subscriber.check_for_updates()
-        changed = changed or bool(updates)
-        for camera in updates.get("add", []):
-            self.suspended_cameras[camera] = 0
-            self.last_camera_notification_time[camera] = 0.0
+        for camera in self.config.cameras:
+            self.suspended_cameras.setdefault(camera, 0)
         if changed:
             self.social.cancel_disabled()
 
-    def _eligible(self, camera: str, provider: str | None = None) -> bool:
-        camera_config = self.config.cameras.get(camera)
-        if camera_config is None or not camera_config.notifications.enabled:
+    def _rule_matches(
+        self, rule: NotificationRuleConfig, envelope: NotificationEnvelope
+    ) -> bool:
+        filters = rule.filters
+        if filters.cameras and envelope.camera not in filters.cameras:
             return False
-        if provider and provider not in camera_config.notifications.providers:
+        labels = set(envelope.genai.get("_labels", []))
+        if envelope.object_label:
+            labels.add(envelope.object_label)
+        if filters.labels and not labels.intersection(filters.labels):
             return False
-        return not self.is_camera_suspended(camera)
-
-    def _within_cooldown(self, camera: str) -> bool:
-        now = datetime.datetime.now(datetime.UTC).timestamp()
-        return (
-            now - self.last_notification_time < self.config.notifications.cooldown
-            or now - self.last_camera_notification_time.get(camera, 0)
-            < self.config.cameras[camera].notifications.cooldown
+        zones = set(envelope.genai.get("_zones", []))
+        if filters.zones and not zones.intersection(filters.zones):
+            return False
+        if filters.identities:
+            identity = envelope.sub_label or "unknown"
+            if "*" not in filters.identities and identity not in filters.identities:
+                return False
+            if identity == "unknown" and "unknown" not in filters.identities:
+                return False
+        if (
+            filters.trigger_names
+            and envelope.genai.get("trigger_name") not in filters.trigger_names
+        ):
+            return False
+        return not (
+            filters.conditions
+            and envelope.genai.get("condition") not in filters.conditions
         )
 
-    def _fan_out(
-        self, envelope: NotificationEnvelope, *, apply_cooldown: bool = True
-    ) -> list[str]:
-        camera = envelope.camera
-        if camera and (
-            not self._eligible(camera)
-            or (apply_cooldown and self._within_cooldown(camera))
-        ):
-            increment("all", "skipped_policy")
+    def _available_destinations(
+        self, rule: NotificationRuleConfig, envelope: NotificationEnvelope
+    ) -> tuple[NotificationDestinationsConfig, list[tuple[str, str, str, str]]]:
+        now = self._now()
+        selected = rule.destinations
+        keys: list[tuple[str, str, str, str]] = []
+
+        def allowed(channel: str, recipient: str) -> bool:
+            key = (rule.id, envelope.camera or "*", channel, recipient)
+            if now - self._last_delivery.get(key, 0) < rule.cooldown:
+                increment(channel, "skipped_cooldown")
+                return False
+            keys.append(key)
+            return True
+
+        webpush = (
+            selected.webpush
+            and self.config.notifications.channels.webpush.enabled
+            and self.webpush.configured
+            and allowed("webpush", "registered_devices")
+        )
+        telegram = [
+            r
+            for r in selected.telegram
+            if self.social.recipient_enabled("telegram", r, envelope.camera, rule.id)
+            and allowed("telegram", r)
+        ]
+        zalo = [
+            r
+            for r in selected.zalo
+            if self.social.recipient_enabled("zalo", r, envelope.camera, rule.id)
+            and allowed("zalo", r)
+        ]
+        return (
+            NotificationDestinationsConfig(
+                webpush=webpush, telegram=telegram, zalo=zalo
+            ),
+            keys,
+        )
+
+    def _route(self, event: str, envelope: NotificationEnvelope) -> list[str]:
+        if not self.config.notifications.enabled:
+            increment("all", "skipped_disabled")
+            return []
+        if envelope.camera and self.is_camera_suspended(envelope.camera):
+            increment("all", "skipped_suspended")
             return []
         deliveries: list[str] = []
-        webpush_deliveries = 0
-        if (
-            envelope.source_type != "lpr"
-            and (camera is None or self._eligible(camera, "webpush"))
-        ) and self.config.notifications.providers.webpush.enabled:
-            webpush_deliveries = self.webpush.deliver(envelope)
-        deliveries.extend(self.social.enqueue(envelope))
-        if camera and (webpush_deliveries or deliveries):
-            now = datetime.datetime.now(datetime.UTC).timestamp()
-            self.last_notification_time = now
-            self.last_camera_notification_time[camera] = now
+        for rule in self.config.notifications.rules:
+            if (
+                not rule.enabled
+                or rule.event != event
+                or not self._rule_matches(rule, envelope)
+            ):
+                continue
+            dedupe_key = (rule.id, envelope.source_type, envelope.source_id)
+            if dedupe_key in self._seen:
+                increment("all", "deduplicated")
+                continue
+            destinations, cooldown_keys = self._available_destinations(rule, envelope)
+            ruled_envelope = replace(envelope, rule_id=rule.id)
+            delivered = False
+            if (
+                destinations.webpush
+                and self.config.notifications.channels.webpush.enabled
+            ):
+                delivered = self.webpush.deliver(ruled_envelope) > 0 or delivered
+            social_deliveries = self.social.enqueue(ruled_envelope, destinations)
+            delivered = bool(social_deliveries) or delivered
+            deliveries.extend(social_deliveries)
+            if delivered:
+                now = self._now()
+                self._seen[dedupe_key] = now
+                for key in cooldown_keys:
+                    self._last_delivery[key] = now
+                    self._persist_rule_state(key, ruled_envelope, now)
         return deliveries
 
     def publish(self, topic: str, payload: Any, retain: bool = False) -> None:
@@ -164,94 +306,212 @@ class NotificationClient(Communicator):
         try:
             decoded = json.loads(payload) if isinstance(payload, str) else payload
         except json.JSONDecodeError:
+            decoded = payload
+
+        status_match = CAMERA_STATUS_TOPIC.match(topic)
+        if status_match and isinstance(decoded, str):
+            self._handle_camera_status(status_match.group(1), decoded)
             return
-        envelope: NotificationEnvelope | None = None
+
+        result: tuple[str, NotificationEnvelope] | None = None
         if topic == "reviews" and isinstance(decoded, dict):
             envelope = self._review_envelope(decoded)
-        elif topic == "triggers" and isinstance(decoded, dict):
-            envelope = self._trigger_envelope(decoded)
-        elif topic == "camera_monitoring" and isinstance(decoded, dict):
-            envelope = self._monitoring_envelope(decoded)
-        elif topic == "notification_test":
-            envelope = self._test_envelope()
+            result = ("alert", envelope) if envelope else None
         elif topic == "events" and isinstance(decoded, dict):
             envelope = self._lpr_envelope(decoded)
-        if envelope:
-            self._fan_out(envelope, apply_cooldown=envelope.source_type != "test")
+            if envelope:
+                result = ("license_plate", envelope)
+            else:
+                envelope = self._object_envelope(decoded)
+                result = ("object_detected", envelope) if envelope else None
+        elif (
+            topic in ("face_recognized", "tracked_object_update")
+            and isinstance(decoded, dict)
+            and (topic == "face_recognized" or decoded.get("type") == "face")
+        ):
+            envelope = self._face_envelope(decoded)
+            result = ("face_recognized", envelope) if envelope else None
+        elif (
+            topic == "tracked_object_update"
+            and isinstance(decoded, dict)
+            and str(decoded.get("type")) in ("lpr", "TrackedObjectUpdateTypesEnum.lpr")
+        ):
+            self._remember_lpr_update(decoded)
+        elif topic == "triggers" and isinstance(decoded, dict):
+            envelope = self._trigger_envelope(decoded)
+            result = ("semantic_trigger", envelope) if envelope else None
+        elif topic == "camera_monitoring" and isinstance(decoded, dict):
+            envelope = self._monitoring_envelope(decoded)
+            result = ("camera_monitoring", envelope) if envelope else None
+        if result:
+            self._route(*result)
 
     def _review_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
         after = payload.get("after") or {}
         if after.get("severity") != "alert":
             return None
         camera = after.get("camera")
-        if not camera:
+        if not camera or camera not in self.config.cameras:
             return None
         data = after.get("data") or {}
-        state = payload.get("type", "update")
-        metadata = data.get("metadata") or {}
+        metadata = dict(data.get("metadata") or {})
         objects = [
             value for value in data.get("objects", []) if "-verified" not in value
         ]
         objects.extend(data.get("sub_labels", []))
+        metadata["_labels"] = objects
+        metadata["_zones"] = data.get("zones", [])
         label = ", ".join(sorted(set(objects))) or "Activity"
         camera_name = self.config.cameras[camera].friendly_name or titlecase(
             camera.replace("_", " ")
         )
-        if metadata.get("title"):
-            title = metadata["title"]
-            message = metadata.get("shortSummary") or f"Detected on {camera_name}"
-        else:
-            title = f"{titlecase(label.replace('_', ' '))} detected"
-            message = f"Detected on {camera_name}"
         source_id = str(after.get("id") or uuid.uuid4())
         event_ids = data.get("detections") or data.get("event_ids") or []
         snapshot_ref = str(event_ids[0]) if event_ids else None
         plate = normalize_plate(data.get("recognized_license_plate"))
+        if plate and snapshot_ref:
+            self._alert_plates[snapshot_ref] = plate
         return NotificationEnvelope(
             id=str(uuid.uuid4()),
             source_type="review",
             source_id=source_id,
             camera=camera,
-            timestamp=float(
-                after.get("end_time")
-                or after.get("start_time")
-                or datetime.datetime.now(datetime.UTC).timestamp()
-            ),
-            title=title,
-            message=message,
-            direct_url=f"/review?id={source_id}"
-            if state in ("end", "genai")
-            else f"/#{camera}",
+            timestamp=float(after.get("start_time") or self._now()),
+            title=metadata.get("title")
+            or f"{titlecase(label.replace('_', ' '))} detected",
+            message=metadata.get("shortSummary") or f"Detected on {camera_name}",
+            direct_url=f"/review?id={source_id}",
             snapshot_ref=snapshot_ref,
             notification_type="alert",
-            object_label=label,
+            object_label=objects[0] if objects else None,
             genai=metadata,
             lpr_plate=plate,
             lpr_score=data.get("recognized_license_plate_score"),
             lpr_plate_box=data.get("license_plate_box"),
         )
 
-    def _trigger_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
+    def _object_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
+        if payload.get("type") not in ("new", "update"):
+            return None
+        after = payload.get("after") or {}
+        camera, event_id, label = (
+            after.get("camera"),
+            after.get("id"),
+            after.get("label"),
+        )
+        if not camera or not event_id or not label:
+            return None
+        zones = after.get("current_zones") or after.get("entered_zones") or []
+        return NotificationEnvelope(
+            id=str(uuid.uuid4()),
+            source_type="object",
+            source_id=str(event_id),
+            camera=camera,
+            timestamp=float(after.get("start_time") or self._now()),
+            title=f"{titlecase(str(label).replace('_', ' '))} detected",
+            message=f"Detected on {camera}",
+            direct_url=f"/explore?event_id={event_id}",
+            snapshot_ref=str(event_id),
+            notification_type="object_detected",
+            object_label=str(label),
+            genai={"_labels": [label], "_zones": zones},
+        )
+
+    def _lpr_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
+        if payload.get("type") != "end":
+            return None
+        after = payload.get("after") or payload
+        if after.get("label") != "car":
+            return None
+        data = after.get("data") or {}
+        event_id = after.get("id")
+        update = self._lpr_updates.pop(str(event_id), {}) if event_id else {}
+        plate = normalize_plate(
+            update.get("plate")
+            or data.get("recognized_license_plate")
+            or after.get("recognized_license_plate")
+        )
+        camera = after.get("camera")
+        if (
+            not plate
+            or not camera
+            or not event_id
+            or self._alert_plates.get(str(event_id)) == plate
+        ):
+            return None
+        score = update.get("score", data.get("recognized_license_plate_score"))
+        return NotificationEnvelope(
+            id=str(uuid.uuid4()),
+            source_type="lpr",
+            source_id=str(event_id),
+            camera=camera,
+            timestamp=float(after.get("end_time") or self._now()),
+            title=f"Vehicle {plate}",
+            message=f"Vehicle passage ended on {camera}",
+            direct_url=f"/explore?event_id={event_id}",
+            snapshot_ref=str(event_id),
+            notification_type="lpr",
+            object_label="car",
+            sub_label=update.get("sub_label") or after.get("sub_label"),
+            genai={"_labels": ["car"]},
+            lpr_plate=plate,
+            lpr_score=float(score) if score is not None else None,
+            lpr_plate_box=update.get("plate_box") or data.get("license_plate_box"),
+        )
+
+    def _remember_lpr_update(self, payload: dict[str, Any]) -> None:
+        event_id = payload.get("id")
+        plate = normalize_plate(payload.get("plate"))
+        if not event_id or not plate:
+            return
+        self._lpr_updates[str(event_id)] = {
+            "plate": plate,
+            "score": payload.get("score"),
+            "plate_box": payload.get("plate_box"),
+            "sub_label": payload.get("name"),
+        }
+
+    def _face_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
         camera = payload.get("camera")
-        name = payload.get("name")
+        event_id = payload.get("event_id") or payload.get("id")
+        identity = str(payload.get("identity") or payload.get("name") or "unknown")
+        if not camera or not event_id:
+            return None
+        return NotificationEnvelope(
+            id=str(uuid.uuid4()),
+            source_type="face",
+            source_id=f"{event_id}:{identity}",
+            camera=camera,
+            timestamp=float(payload.get("timestamp") or self._now()),
+            title=f"Face recognized: {identity}",
+            message=f"Recognized on {camera}",
+            direct_url=f"/explore?event_id={event_id}",
+            snapshot_ref=str(event_id),
+            notification_type="face_recognized",
+            sub_label=identity,
+            genai={"score": payload.get("score")},
+        )
+
+    def _trigger_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
+        camera, name = payload.get("camera"), payload.get("name")
         if not camera or not name:
             return None
         triggers = self.config.cameras[camera].semantic_search.triggers or {}
         if name not in triggers or "notification" not in triggers[name].actions:
             return None
         event_id = str(payload.get("event_id") or uuid.uuid4())
-        score = float(payload.get("score", 0))
         return NotificationEnvelope(
             id=str(uuid.uuid4()),
             source_type="trigger",
             source_id=f"{event_id}:{name}",
             camera=camera,
-            timestamp=datetime.datetime.now(datetime.UTC).timestamp(),
+            timestamp=self._now(),
             title=f"{name.replace('_', ' ')} triggered",
-            message=f"{titlecase(str(payload.get('type', 'semantic')))} trigger score {score:.2f}",
+            message=f"Semantic trigger score {float(payload.get('score', 0)):.2f}",
             direct_url=f"/explore?event_id={event_id}",
             snapshot_ref=event_id,
             notification_type="trigger",
+            genai={"trigger_name": name},
         )
 
     def _monitoring_envelope(
@@ -260,24 +520,61 @@ class NotificationClient(Communicator):
         camera = payload.get("camera")
         if not camera:
             return None
-        camera_name = self.config.cameras[camera].friendly_name or titlecase(
-            camera.replace("_", " ")
+        source_id = str(
+            payload.get("id") or payload.get("job_id") or f"{camera}:{int(self._now())}"
         )
-        message = str(payload.get("message") or payload.get("reasoning") or "")
         return NotificationEnvelope(
             id=str(uuid.uuid4()),
             source_type="camera_monitoring",
-            source_id=str(
-                payload.get("id")
-                or f"{camera}:{int(datetime.datetime.now(datetime.UTC).timestamp())}"
-            ),
+            source_id=source_id,
             camera=camera,
-            timestamp=datetime.datetime.now(datetime.UTC).timestamp(),
-            title=f"{camera_name}: Monitoring Alert",
-            message=message[:200],
+            timestamp=self._now(),
+            title=f"{camera}: Monitoring alert",
+            message=str(payload.get("message") or payload.get("reasoning") or "")[:200],
             direct_url=f"/#{camera}",
             snapshot_ref=None,
             notification_type="monitoring",
+            genai={
+                "condition": payload.get("condition"),
+                "reasoning": payload.get("reasoning"),
+            },
+        )
+
+    def _handle_camera_status(self, camera: str, status: str) -> None:
+        if camera not in self.config.cameras or status not in (
+            "online",
+            "offline",
+            "disabled",
+        ):
+            return
+        previous = self._camera_status.get(camera)
+        self._camera_status[camera] = status
+        if status == "offline":
+            if previous != "offline":
+                self._offline_since[camera] = self._now()
+            return
+        self._offline_since.pop(camera, None)
+        if status == "online" and camera in self._offline_notified:
+            self._offline_notified.remove(camera)
+            self._route(
+                "camera_online",
+                self._camera_status_envelope(camera, "online", self._now()),
+            )
+
+    def _camera_status_envelope(
+        self, camera: str, status: str, timestamp: float
+    ) -> NotificationEnvelope:
+        return NotificationEnvelope(
+            id=str(uuid.uuid4()),
+            source_type="camera_status",
+            source_id=f"{camera}:{status}:{int(timestamp)}",
+            camera=camera,
+            timestamp=timestamp,
+            title=f"Camera {status}",
+            message=f"{camera} is {status}",
+            direct_url=f"/#{camera}",
+            snapshot_ref=None,
+            notification_type=f"camera_{status}",
         )
 
     @staticmethod
@@ -296,52 +593,39 @@ class NotificationClient(Communicator):
             notification_type="test",
         )
 
-    def _lpr_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
-        if payload.get("type") != "end":
-            return None
-        after = payload.get("after") or payload
-        if after.get("label") != "car":
-            return None
-        data = after.get("data") or {}
-        plate = normalize_plate(
-            data.get("recognized_license_plate")
-            or after.get("recognized_license_plate")
-        )
-        camera = after.get("camera")
-        event_id = after.get("id")
-        if not plate or not camera or not event_id:
-            return None
-        score = data.get("recognized_license_plate_score")
-        return NotificationEnvelope(
-            id=str(uuid.uuid4()),
-            source_type="lpr",
-            source_id=str(event_id),
-            camera=camera,
-            timestamp=float(
-                after.get("end_time") or datetime.datetime.now(datetime.UTC).timestamp()
-            ),
-            title=f"Vehicle {plate}",
-            message=f"Vehicle passage ended on {camera}",
-            direct_url=f"/explore?event_id={event_id}",
-            snapshot_ref=str(event_id),
-            notification_type="lpr",
-            object_label="car",
-            sub_label=after.get("sub_label"),
-            lpr_plate=plate,
-            lpr_score=float(score) if score is not None else None,
-            lpr_plate_box=data.get("license_plate_box"),
-        )
-
     def enqueue_test(self, provider: str, recipient_id: str) -> str | None:
         if provider == "webpush":
             envelope = self._test_envelope()
             return envelope.id if self.webpush.deliver(envelope) else None
         return self.social.enqueue_test(provider, recipient_id)
 
+    def enqueue_rule_test(self, rule_id: str) -> list[str] | None:
+        rule = next(
+            (rule for rule in self.config.notifications.rules if rule.id == rule_id),
+            None,
+        )
+        if rule is None or not rule.enabled:
+            return None
+        camera = (
+            rule.filters.cameras[0]
+            if rule.filters.cameras
+            else next(iter(self.config.cameras), None)
+        )
+        envelope = replace(self._test_envelope(), camera=camera, rule_id=rule.id)
+        deliveries: list[str] = []
+        if (
+            rule.destinations.webpush
+            and self.config.notifications.channels.webpush.enabled
+            and self.webpush.deliver(envelope)
+        ):
+            deliveries.append(envelope.id)
+        deliveries.extend(self.social.enqueue(envelope, rule.destinations))
+        return deliveries
+
     def provider_status(self) -> dict[str, Any]:
         status = self.social.status()
         status["webpush"] = {
-            "enabled": self.config.notifications.providers.webpush.enabled,
+            "enabled": self.config.notifications.channels.webpush.enabled,
             "configured": self.webpush.configured,
             "readiness": "ready" if self.webpush.configured else "missing",
             "pending": self.webpush.pending,
@@ -352,7 +636,6 @@ class NotificationClient(Communicator):
 
     def stop(self) -> None:
         self.global_config_subscriber.stop()
-        self.config_subscriber.stop()
         self.social.stop()
         self.webpush.stop()
-        self._suspension_thread.join(timeout=5)
+        self._maintenance_thread.join(timeout=5)

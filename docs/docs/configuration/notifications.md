@@ -3,61 +3,21 @@ id: notifications
 title: Notifications
 ---
 
-import ConfigTabs from "@site/src/components/ConfigTabs";
-import TabItem from "@theme/TabItem";
-import NavPath from "@site/src/components/NavPath";
-
 # Notifications
 
-Frigate offers native notifications through WebPush, Telegram, and Zalo. All
-providers use the same camera enablement, cooldown, and suspension policy.
-WebPush uses the [WebPush Protocol](https://web.dev/articles/push-notifications-web-push-protocol)
-and [VAPID spec](https://tools.ietf.org/html/draft-thomson-webpush-vapid).
+Frigate uses one rule engine for WebPush, Telegram, and Zalo. The complete
+notification document is stored under `notifications` in the active Frigate
+YAML. In this deployment that file is `deploy/config.yaml`; the dashboard saves
+directly to that file and hot-reloads the notification client.
 
-:::info
-
-Push notifications require internet access from the Frigate server to the browser vendor's push service (e.g., Google FCM, Mozilla autopush). See [Network Requirements](/frigate/network_requirements#push-notifications) for details.
-
-:::
-
-## Setting up Notifications
-
-In order to use notifications the following requirements must be met:
-
-- Frigate must be accessed via a secure `https` connection ([see the authorization docs](/configuration/authentication)).
-- A supported browser must be used. Currently Chrome, Firefox, and Safari are known to be supported.
-- In order for notifications to be usable externally, Frigate must be accessible externally.
-- For iOS devices, some users have also indicated that the Notifications switch needs to be enabled in iOS Settings --> Apps --> Safari --> Advanced --> Features.
-
-### Configuration
-
-Enable notifications and fill out the required fields.
-
-Optionally, change the default cooldown period for notifications. The cooldown can also be overridden at the camera level.
-
-Notifications will be prevented if either:
-
-- The global cooldown period hasn't elapsed since any camera's last notification
-- The camera-specific cooldown period hasn't elapsed for the specific camera
-
-#### Global notifications
-
-<ConfigTabs>
-<TabItem value="ui">
-
-1. Navigate to <NavPath path="Settings > Notifications > Notifications" />.
-   - Set **Email** to your email address
-   - Enable notifications for the desired cameras
-
-</TabItem>
-<TabItem value="yaml">
+## Configuration
 
 ```yaml
 notifications:
+  schema_version: 2
   enabled: true
-  email: "johndoe@gmail.com"
-  cooldown: 10 # wait 10 seconds before sending another notification from any camera
-  providers:
+  email: admin@example.com
+  channels:
     webpush:
       enabled: true
     telegram:
@@ -65,8 +25,8 @@ notifications:
       recipients:
         - id: security_team
           name: Security Team
-          chat_id: "-100123456789"
-          cameras: [doorbell]
+          chat_id: "{FRIGATE_TELEGRAM_CHAT_ID}"
+          enabled: true
     zalo:
       enabled: true
       public_base_url: https://camera.example.com
@@ -74,8 +34,22 @@ notifications:
       recipients:
         - id: operators
           name: Operators
-          chat_id: "123456789"
-          cameras: [doorbell]
+          chat_id: "{FRIGATE_ZALO_CHAT_ID}"
+          enabled: true
+  rules:
+    - id: door_alert
+      name: Door alert
+      enabled: true
+      event: alert
+      filters:
+        cameras: [doorbell]
+        labels: [person]
+        zones: [front_porch]
+      destinations:
+        webpush: true
+        telegram: [security_team]
+        zalo: [operators]
+      cooldown: 30
   delivery:
     max_attempts: 5
     initial_backoff: 5
@@ -84,70 +58,51 @@ notifications:
     max_pending: 5000
 ```
 
-</TabItem>
-</ConfigTabs>
+An empty `filters.cameras` list means every camera. Rules, rather than camera
+configuration or recipient configuration, decide which event goes to which
+destination. Cooldown is isolated by rule, camera, channel, and recipient.
 
-#### Per-camera notifications
+Supported rule events are:
 
-<ConfigTabs>
-<TabItem value="ui">
+- `alert`: a review first reaches Alert severity.
+- `object_detected`: a confirmed tracked object appears or first enters a
+  matching zone.
+- `license_plate`: a car passage ends with a normalized plate.
+- `face_recognized`: face identity and media have been committed.
+- `camera_offline`: the detect stream stays offline for 30 seconds.
+- `camera_online`: a camera recovers after a notified offline transition.
+- `semantic_trigger`: a semantic trigger with the notification action.
+- `camera_monitoring`: a camera monitoring/VLM Watch result.
 
-1. Navigate to <NavPath path="Settings > Camera configuration > Notifications" /> and select the desired camera.
-   - Set **Enable notifications** to on
-   - Set **Cooldown period** to the desired number of seconds to wait before sending another notification from this camera (e.g. `30`)
+The camera Notifications page is read-only and shows effective rules. Its
+Suspend action is runtime state and blocks every selected channel for that
+camera.
 
-</TabItem>
-<TabItem value="yaml">
+## Secrets and provider behavior
 
-```yaml
-cameras:
-  doorbell:
-    ...
-    notifications:
-      enabled: True
-      cooldown: 30 # wait 30 seconds before sending another notification from the doorbell camera
-      providers: [webpush, telegram, zalo]
-```
-
-</TabItem>
-</ConfigTabs>
-
-If `providers` is omitted for a camera, only WebPush is selected. An empty
-recipient `cameras` list grants that recipient all notification-enabled cameras.
-Provider and recipient enablement must also be on.
-
-Telegram and Zalo tokens are secrets and are never stored in YAML. Set them in
-the Frigate process environment:
+Tokens are never stored in YAML or returned by the API. Set them in the process
+environment:
 
 ```dotenv
 FRIGATE_TELEGRAM_BOT_TOKEN=
 FRIGATE_ZALO_BOT_TOKEN=
 ```
 
-Telegram uploads event snapshots directly. Zalo receives a short-lived signed
-snapshot URL. Without `public_base_url`, Zalo remains available in degraded
-text/link mode.
+Telegram uploads the snapshot directly. Zalo uses a short-lived signed media
+URL; without `public_base_url`, it sends text/link notifications in degraded
+mode. Telegram and Zalo deliveries use the durable SQLite outbox and resume
+after restart.
 
-### Registration
+## WebPush registration
 
-Once notifications are enabled, press the `Register for Notifications` button on all devices that you would like to receive notifications on. This will register the background worker. After this Frigate must be restarted and then notifications will begin to be sent.
+WebPush requires HTTPS and a supported browser. Register each browser/device
+from Settings → Notifications. Browser push services also require outbound
+internet access. Chrome supports notification images; Safari and Firefox may
+show only title and message.
 
-## Supported Notifications
+## Migration
 
-Native notifications support review alerts, semantic triggers, camera monitoring
-alerts, test notifications, and finalized car events with a recognized license
-plate.
-
-:::note
-
-Currently, only Chrome supports images in notifications. Safari and Firefox will only show a title and message in the notification.
-
-:::
-
-## Reduce Notification Latency
-
-Different platforms handle notifications differently, some settings changes may be required to get optimal notification delivery.
-
-### Android
-
-Most Android phones have battery optimization settings. To get reliable Notification delivery the browser (Chrome, Firefox) should have battery optimizations disabled. If Frigate is running as a PWA then the Frigate app should have battery optimizations disabled as well.
+Legacy `providers`, recipient camera lists, and per-camera notification blocks
+are backed up and automatically converted once to schema v2. Migration creates
+only rules matching the former Alert, Semantic, Monitoring, and social LPR
+behavior; new object, face, and camera-health rules remain opt-in.
