@@ -2,10 +2,14 @@
 
 
 def migrate(migrator, database, fake=False, **kwargs):
-    columns = {
-        row[1]
-        for row in database.execute_sql("PRAGMA table_info(notification_delivery)")
-    }
+    columns = (
+        set()
+        if fake
+        else {
+            row[1]
+            for row in database.execute_sql("PRAGMA table_info(notification_delivery)")
+        }
+    )
     if "rule_id" not in columns:
         migrator.sql(
             "ALTER TABLE notification_delivery "

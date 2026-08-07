@@ -2,6 +2,7 @@
 
 import base64
 import datetime
+import hashlib
 import json
 import logging
 import math
@@ -26,6 +27,9 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
+from frigate.data_processing.common.license_plate.association import (
+    is_lpr_track_discontinuity,
+)
 from frigate.data_processing.common.license_plate.model import LicensePlateModelRunner
 from frigate.embeddings.onnx.lpr_embedding import LPR_EMBEDDING_SIZE
 from frigate.types import TrackedObjectUpdateTypesEnum
@@ -1200,7 +1204,11 @@ class LicensePlateProcessingMixin:
         self.metrics.alpr_pps.value = self.plates_rec_second.eps()
         self.metrics.yolov9_lpr_pps.value = self.plates_det_second.eps()
         camera = obj_data if dedicated_lpr else obj_data["camera"]
-        current_time = int(datetime.datetime.now().timestamp())
+        current_time = (
+            datetime.datetime.now().timestamp()
+            if dedicated_lpr
+            else float(obj_data.get("frame_time") or datetime.datetime.now().timestamp())
+        )
         debug_frame_id = int(datetime.datetime.now().timestamp() * 1000)
 
         if not self.config.cameras[camera].lpr.enabled:
@@ -1539,6 +1547,62 @@ class LicensePlateProcessingMixin:
 
         is_new = id not in self.detected_license_plates
 
+        # A tracker can briefly retain an id after a vehicle disappears and then
+        # associate the id with a different vehicle. Never combine the old plate
+        # cluster with the new vehicle's box. Require the new plate/box pairing in
+        # two OCR passes before replacing the old cluster; the first pass is
+        # deliberately not published because its association is ambiguous.
+        plate_state = self.detected_license_plates.get(id)
+        if plate_state is not None and not dedicated_lpr:
+            previous_obj = plate_state.get("obj_data") or {}
+            if is_lpr_track_discontinuity(
+                plate_state.get("plate"),
+                top_plate,
+                previous_obj.get("box"),
+                obj_data.get("box"),
+                self.cluster_threshold,
+            ):
+                switch_candidate = plate_state.get("switch_candidate") or {}
+                candidate_plate = switch_candidate.get("plate")
+                candidate_count = int(switch_candidate.get("count", 0))
+                if (
+                    candidate_plate
+                    and JaroWinkler.similarity(candidate_plate, top_plate)
+                    >= self.cluster_threshold
+                ):
+                    candidate_count += 1
+                else:
+                    candidate_count = 1
+
+                plate_state["switch_candidate"] = {
+                    "plate": top_plate,
+                    "count": candidate_count,
+                }
+                if candidate_count < 2:
+                    logger.warning(
+                        "%s: Suppressed ambiguous LPR association for tracker %s: "
+                        "%s -> %s",
+                        camera,
+                        id,
+                        plate_state.get("plate"),
+                        top_plate,
+                    )
+                    return
+
+                logger.warning(
+                    "%s: Reset LPR cluster after confirmed tracker discontinuity "
+                    "for %s: %s -> %s",
+                    camera,
+                    id,
+                    plate_state.get("plate"),
+                    top_plate,
+                )
+                plate_state["plates"] = []
+                plate_state.pop("plate", None)
+                plate_state.pop("switch_candidate", None)
+            else:
+                plate_state.pop("switch_candidate", None)
+
         # Collect variant
         variant = {
             "plate": top_plate,
@@ -1637,6 +1701,21 @@ class LicensePlateProcessingMixin:
             )
 
         # always publish to recognized_license_plate field
+        evidence_id = hashlib.sha256(
+            f"{id}:{current_time}:lpr".encode()
+        ).hexdigest()
+        evidence_dir = Path(CLIPS_DIR) / "artifacts" / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        evidence_path = evidence_dir / f"{evidence_id}.jpg"
+        full_frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+        if not evidence_path.exists():
+            ok, encoded_evidence = cv2.imencode(
+                ".jpg", full_frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]
+            )
+            if ok:
+                temporary = evidence_path.with_suffix(".tmp")
+                temporary.write_bytes(encoded_evidence.tobytes())
+                os.replace(temporary, evidence_path)
         self.requestor.send_data(
             "tracked_object_update",
             json.dumps(
@@ -1648,7 +1727,15 @@ class LicensePlateProcessingMixin:
                     "id": id,
                     "camera": camera,
                     "timestamp": start,
+                    "frame_time": current_time,
                     "plate_box": plate_box,
+                    "object_box": plate_box
+                    if dedicated_lpr
+                    else obj_data.get("box"),
+                    "frame_ref": str(evidence_path),
+                    "frame_width": int(full_frame_bgr.shape[1]),
+                    "frame_height": int(full_frame_bgr.shape[0]),
+                    "evidence_id": evidence_id,
                 }
             ),
         )

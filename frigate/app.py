@@ -57,8 +57,12 @@ from frigate.jobs.motion_search import stop_all_motion_search_jobs
 from frigate.log import _stop_logging
 from frigate.models import (
     Event,
+    EventEvidence,
+    EventObservation,
     Export,
+    MediaArtifact,
     NotificationDelivery,
+    NotificationIntent,
     NotificationRuleState,
     Previews,
     Recordings,
@@ -311,6 +315,8 @@ class FrigateApp:
         )
         models = [
             Event,
+            EventEvidence,
+            EventObservation,
             Export,
             Previews,
             Recordings,
@@ -321,7 +327,9 @@ class FrigateApp:
             User,
             Trigger,
             NotificationDelivery,
+            NotificationIntent,
             NotificationRuleState,
+            MediaArtifact,
         ]
         self.db.bind(models)
 

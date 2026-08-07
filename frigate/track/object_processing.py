@@ -640,6 +640,10 @@ class TrackedObjectProcessor(threading.Thread):
                     "camera": camera,
                     "timestamp": frame_time,
                     "source_frame_time": frame_time,
+                    "frame_ref": payload["canonical_path"],
+                    "person_box": payload["person_box"],
+                    "face_box": payload["face_box"],
+                    "evidence_id": payload["transaction_id"],
                 }
             ),
         )

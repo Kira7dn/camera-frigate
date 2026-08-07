@@ -42,11 +42,18 @@ from frigate.const import (
     MAX_SEGMENT_DURATION,
     PREVIEW_FRAME_TYPE,
 )
-from frigate.models import Event, Previews, Recordings, Regions, ReviewSegment
+from frigate.events.canonical import CanonicalMediaStore
+from frigate.models import (
+    Event,
+    EventEvidence,
+    Previews,
+    Recordings,
+    Regions,
+    ReviewSegment,
+)
 from frigate.output.preview import get_most_recent_preview_frame
 from frigate.track.object_processing import TrackedObjectProcessor
 from frigate.util.file import (
-    get_event_snapshot_bytes,
     get_event_snapshot_path,
     get_event_thumbnail_bytes,
     load_event_snapshot_image,
@@ -799,22 +806,15 @@ async def event_snapshot(
                 content={"success": False, "message": "Snapshot not available"},
                 status_code=404,
             )
-        snapshot_settings = _resolve_snapshot_settings(
-            request.app.frigate_config.cameras[event.camera].snapshots, params
-        )
-        jpg_bytes, frame_time = get_event_snapshot_bytes(
-            event,
-            ext="jpg",
-            timestamp=snapshot_settings["timestamp"],
-            bounding_box=snapshot_settings["bounding_box"],
-            crop=snapshot_settings["crop"],
-            height=snapshot_settings["height"],
-            quality=snapshot_settings["quality"],
-            timestamp_style=request.app.frigate_config.cameras[
-                event.camera
-            ].timestamp_style,
-            colormap=request.app.frigate_config.model.colormap,
-        )
+        artifact = CanonicalMediaStore().get(event.canonical_artifact_id)
+        if artifact is not None:
+            jpg_bytes = CanonicalMediaStore().bytes(artifact.id)
+            frame_time = EventEvidence.get_by_id(artifact.evidence_id).frame_time
+        else:
+            return JSONResponse(
+                content={"success": False, "message": "Canonical artifact unavailable"},
+                status_code=404,
+            )
     except DoesNotExist:
         # see if the object is currently being tracked
         try:
@@ -859,6 +859,9 @@ async def event_snapshot(
         "Cache-Control": "private, max-age=31536000" if event_complete else "no-store",
         "X-Frame-Time": str(frame_time),
     }
+    if event_complete and 'artifact' in locals() and artifact is not None:
+        headers["X-Media-Artifact-Id"] = artifact.id
+        headers["ETag"] = f'"{artifact.sha256}"'
 
     if params.download:
         headers["Content-Disposition"] = f"attachment; filename=snapshot-{event_id}.jpg"
@@ -889,7 +892,22 @@ async def event_thumbnail(
         await require_camera_access(event.camera, request=request)
         if event.end_time is not None:
             event_complete = True
-
+            artifact = CanonicalMediaStore().get(event.canonical_artifact_id)
+            if artifact is not None:
+                thumbnail_bytes = CanonicalMediaStore().bytes(artifact.id)
+                return Response(
+                    thumbnail_bytes,
+                    media_type="image/jpeg",
+                    headers={
+                        "Cache-Control": f"private, max-age={_resolve_cache_age(max_cache_age)}",
+                        "X-Media-Artifact-Id": artifact.id,
+                        "ETag": f'"{artifact.sha256}"',
+                    },
+                )
+            return JSONResponse(
+                content={"success": False, "message": "Canonical artifact unavailable"},
+                status_code=404,
+            )
         thumbnail_bytes = get_event_thumbnail_bytes(event)
     except DoesNotExist:
         thumbnail_bytes = None

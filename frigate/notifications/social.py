@@ -1,7 +1,6 @@
 """Social notification provider orchestration."""
 
 import datetime
-from dataclasses import replace
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
@@ -44,6 +43,22 @@ class SocialClient:
     def _provider_config(self, provider: str):
         return getattr(self.config.notifications.channels, provider)
 
+    def public_media_ready(self) -> bool:
+        expected = self.config.notifications.public_base_url
+        if not expected:
+            return False
+        try:
+            response = httpx.get("http://ngrok:4040/api/tunnels", timeout=0.5)
+            response.raise_for_status()
+            urls = {
+                str(tunnel.get("public_url", "")).rstrip("/")
+                for tunnel in response.json().get("tunnels", [])
+                if tunnel.get("proto") == "https"
+            }
+            return str(expected).rstrip("/") in urls
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return False
+
     def recipient(
         self, provider: str, recipient_id: str
     ) -> NotificationRecipientConfig | None:
@@ -78,7 +93,7 @@ class SocialClient:
             return False
         if camera and camera not in self.config.cameras:
             return False
-        if rule_id and rule_id != "legacy":
+        if rule_id and rule_id not in ("legacy", "event_revision"):
             rule = next(
                 (
                     rule
@@ -99,15 +114,6 @@ class SocialClient:
         destinations: NotificationDestinationsConfig,
     ) -> list[str]:
         delivery_ids: list[str] = []
-        dedupe_envelope = envelope
-        if (
-            envelope.source_type == "review"
-            and envelope.lpr_plate
-            and envelope.snapshot_ref
-        ):
-            dedupe_envelope = replace(
-                envelope, source_type="lpr", source_id=envelope.snapshot_ref
-            )
         for provider in self.providers:
             selected_recipients = set(getattr(destinations, provider))
             for recipient in self._provider_config(provider).recipients:
@@ -119,7 +125,7 @@ class SocialClient:
                 ):
                     continue
                 delivery_id = self.outbox.enqueue(
-                    provider, recipient.id, dedupe_envelope
+                    provider, recipient.id, envelope
                 )
                 if delivery_id:
                     delivery_ids.append(delivery_id)
@@ -172,11 +178,14 @@ class SocialClient:
         if provider == "telegram":
             return await self.telegram.deliver(client, recipient, envelope)
         zalo_config = self.config.notifications.channels.zalo
+        public_base_url = self.config.notifications.public_base_url
+        if provider == "zalo" and not self.public_media_ready():
+            return DeliveryResult(False, True, "Public media tunnel is unavailable")
         return await self.zalo.deliver(
             client,
             recipient,
             envelope,
-            str(zalo_config.public_base_url) if zalo_config.public_base_url else None,
+            str(public_base_url) if public_base_url else None,
             zalo_config.media_url_ttl,
         )
 
@@ -219,7 +228,7 @@ class SocialClient:
                 .order_by(NotificationDelivery.completed_at.desc())
                 .first()
             )
-            degraded = provider == "zalo" and not provider_config.public_base_url
+            degraded = provider == "zalo" and not self.public_media_ready()
             result[provider] = {
                 "enabled": provider_config.enabled,
                 "configured": adapter.configured,

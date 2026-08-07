@@ -65,13 +65,9 @@ def classify_response(response: httpx.Response) -> DeliveryResult:
 
 def envelope_text(envelope: NotificationEnvelope) -> str:
     text = f"{envelope.title}\n{envelope.message}"
-    if envelope.object_label:
-        text += f"\nObject: {envelope.object_label}"
-    if envelope.sub_label:
-        text += f"\nSub label: {envelope.sub_label}"
-    if envelope.lpr_plate:
-        score = f" ({envelope.lpr_score:.2f})" if envelope.lpr_score is not None else ""
-        text += f"\nLicense plate: {envelope.lpr_plate}{score}"
+    shown_label = envelope.sub_label or envelope.lpr_plate or envelope.object_label
+    if envelope.lpr_plate and envelope.lpr_plate != shown_label:
+        text += f"\nBiển số: {envelope.lpr_plate}"
     if envelope.direct_url:
         text += f"\n{envelope.direct_url}"
     return text
@@ -95,11 +91,10 @@ class TelegramProvider:
             return DeliveryResult(False, False, "Telegram token is missing")
         base_url = f"https://api.telegram.org/bot{token}"
         text = envelope_text(envelope)
-        snapshot = (
-            load_snapshot(envelope.snapshot_ref) if envelope.snapshot_ref else None
-        )
-        if envelope.snapshot_ref and snapshot is None:
-            return DeliveryResult(False, True, "Snapshot is not available yet")
+        artifact_ref = envelope.artifact_ref
+        snapshot = load_snapshot(artifact_ref) if artifact_ref else None
+        if artifact_ref and snapshot is None:
+            return DeliveryResult(False, True, "Canonical artifact is not available")
         try:
             if snapshot:
                 response = await client.post(
@@ -142,14 +137,13 @@ class ZaloProvider:
         text = envelope_text(envelope)
         payload: dict[str, Any] = {"chat_id": recipient.chat_id}
         endpoint = "sendMessage"
-        if public_base_url and envelope.snapshot_ref:
-            if load_snapshot(envelope.snapshot_ref) is None:
-                return DeliveryResult(False, True, "Snapshot is not available yet")
+        artifact_ref = envelope.artifact_ref
+        if public_base_url and artifact_ref:
             endpoint = "sendPhoto"
             payload.update(
                 {
                     "photo": self.signer.url(
-                        public_base_url, envelope.snapshot_ref, media_url_ttl
+                        public_base_url, artifact_ref, media_url_ttl
                     ),
                     "caption": text,
                 }

@@ -45,64 +45,29 @@ class NotificationMediaSigner:
                 pass
             return key
 
-    def signature(self, event_id: str, expires: int) -> str:
-        value = f"{event_id}:{expires}".encode()
+    def signature(self, artifact_id: str, expires: int) -> str:
+        value = f"{artifact_id}:{expires}".encode()
         return hmac.new(self.key, value, hashlib.sha256).hexdigest()
 
-    def verify(self, event_id: str, expires: int, signature: str) -> bool:
+    def verify(self, artifact_id: str, expires: int, signature: str) -> bool:
         if expires < int(time.time()):
             return False
-        return hmac.compare_digest(self.signature(event_id, expires), signature)
+        return hmac.compare_digest(self.signature(artifact_id, expires), signature)
 
-    def url(self, public_base_url: str, event_id: str, ttl: int) -> str:
+    def url(self, public_base_url: str, artifact_id: str, ttl: int) -> str:
         with self._expiry_lock:
             expires = max(int(time.time()) + ttl, self._last_expiry + 1)
             self._last_expiry = expires
-        signature = self.signature(event_id, expires)
+        signature = self.signature(artifact_id, expires)
         return (
             f"{public_base_url.rstrip('/')}/api/notifications/media/"
-            f"{quote(event_id, safe='')}/snapshot.jpg?expires={expires}"
+            f"{quote(artifact_id, safe='')}/artifact.jpg?expires={expires}"
             f"&signature={signature}"
         )
 
 
-def load_snapshot(event_id: str) -> bytes | None:
-    """Load an annotated completed event snapshot as JPEG bytes."""
-    from peewee import DoesNotExist
+def load_snapshot(artifact_id: str) -> bytes | None:
+    """Load immutable artifact bytes; never derive presentation from delivery."""
+    from frigate.events.canonical import CanonicalMediaStore
 
-    from frigate.models import Event, NotificationDelivery
-    from frigate.util.file import get_event_snapshot_bytes
-
-    try:
-        event = Event.get_by_id(event_id)
-    except DoesNotExist:
-        return None
-    label = getattr(event, "sub_label", None) or event.label
-    extra_overlay_boxes = []
-    delivery = (
-        NotificationDelivery.select()
-        .where(NotificationDelivery.source_id == event_id)
-        .order_by(NotificationDelivery.created_at.desc())
-        .first()
-    )
-    if delivery is not None and isinstance(delivery.payload, dict):
-        payload = delivery.payload
-        label = payload.get("sub_label") or payload.get("lpr_plate") or label
-        plate_box = payload.get("lpr_plate_box")
-        if isinstance(plate_box, (list, tuple)) and len(plate_box) == 4:
-            extra_overlay_boxes.append(
-                {
-                    "box": tuple(int(value) for value in plate_box),
-                    "label": payload.get("lpr_plate") or "license_plate",
-                    "score": payload.get("lpr_score"),
-                    "color": (0, 255, 255),
-                }
-            )
-    image, _ = get_event_snapshot_bytes(
-        event,
-        ext="jpg",
-        bounding_box=True,
-        label=label,
-        extra_overlay_boxes=extra_overlay_boxes,
-    )
-    return image
+    return CanonicalMediaStore().bytes(artifact_id)

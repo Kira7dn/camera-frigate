@@ -13,7 +13,7 @@ import httpx
 from peewee import IntegrityError
 
 from frigate.config.camera.notification import NotificationDeliveryConfig
-from frigate.models import NotificationDelivery
+from frigate.models import MediaArtifact, NotificationDelivery
 
 from .envelope import NotificationEnvelope
 from .metrics import increment, observe_latency, set_queue_depth
@@ -79,12 +79,18 @@ class NotificationOutbox:
                 source_type=envelope.source_type,
                 source_id=envelope.source_id,
                 payload=envelope.as_dict(),
+                intent_id=envelope.facts.get("intent_id"),
+                media_artifact_id=envelope.artifact_ref,
                 status="pending",
                 attempts=0,
                 next_attempt=now,
                 created_at=now,
                 updated_at=now,
             )
+            if envelope.artifact_ref:
+                MediaArtifact.update(pinned=True).where(
+                    MediaArtifact.id == envelope.artifact_ref
+                ).execute()
         except IntegrityError:
             increment(provider, "deduplicated")
             return None

@@ -1,3 +1,4 @@
+import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -21,6 +22,15 @@ class EventResponse(BaseModel):
     detector_type: str | None
     model_type: str | None
     data: dict[str, Any]
+    state: str = "TRACKING"
+    revision: int = 0
+    finalized_at: datetime.datetime | None = None
+    canonical_plate: str | None = None
+    canonical_plate_score: float | None = None
+    canonical_sub_label: str | None = None
+    display_label: str | None = None
+    canonical_evidence_id: str | None = None
+    canonical_artifact_id: str | None = None
 
     model_config = ConfigDict(protected_namespaces=())
 

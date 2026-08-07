@@ -5,6 +5,7 @@ configuration.  Per-camera notification fields remain readable for legacy
 configuration migration, but the v2 runtime never consults them.
 """
 
+import os
 from typing import Any, Literal
 
 from pydantic import Field, HttpUrl, model_validator
@@ -72,6 +73,7 @@ class TelegramChannelConfig(FrigateBaseModel):
 
 class ZaloChannelConfig(FrigateBaseModel):
     enabled: bool = Field(default=False, title="Enabled")
+    # Deprecated read-only compatibility. The v2 runtime uses the global URL.
     public_base_url: HttpUrl | None = Field(
         default=None,
         title="Public base URL",
@@ -154,6 +156,22 @@ class NotificationDeliveryConfig(FrigateBaseModel):
         return self
 
 
+class NotificationPipelineConfig(FrigateBaseModel):
+    finalization_timeout: float = Field(default=5, ge=0, le=60)
+    shadow_mode: bool = Field(
+        default=True,
+        description="Build projections and artifacts without enqueueing providers.",
+    )
+
+
+class NotificationPresentationConfig(FrigateBaseModel):
+    locale: Literal["vi"] = "vi"
+
+
+class NotificationMediaConfig(FrigateBaseModel):
+    max_storage_mb: int = Field(default=2048, ge=128, le=1048576)
+
+
 class CameraNotificationConfig(FrigateBaseModel):
     """Legacy camera notification settings, read only for v1 migration."""
 
@@ -176,6 +194,10 @@ class NotificationConfig(FrigateBaseModel):
         description="Contact used for the VAPID WebPush subscription.",
     )
     enabled_in_config: bool | None = Field(default=None, title="Original state")
+    public_base_url: HttpUrl | None = Field(
+        default=None,
+        description="Public HTTPS base URL for immutable signed media and actions.",
+    )
     channels: NotificationChannelsConfig = Field(
         default_factory=NotificationChannelsConfig, title="Channels"
     )
@@ -183,6 +205,11 @@ class NotificationConfig(FrigateBaseModel):
     delivery: NotificationDeliveryConfig = Field(
         default_factory=NotificationDeliveryConfig, title="Delivery"
     )
+    pipeline: NotificationPipelineConfig = Field(default_factory=NotificationPipelineConfig)
+    presentation: NotificationPresentationConfig = Field(
+        default_factory=NotificationPresentationConfig
+    )
+    media: NotificationMediaConfig = Field(default_factory=NotificationMediaConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -191,6 +218,9 @@ class NotificationConfig(FrigateBaseModel):
         if not isinstance(value, dict):
             return value
         data = dict(value)
+        if data.get("public_base_url") == "{NGROK_URL}":
+            ngrok_url = os.getenv("NGROK_URL", "").strip()
+            data["public_base_url"] = ngrok_url or None
         data.setdefault("schema_version", 2)
         if "channels" not in data and "providers" in data:
             channels = data.pop("providers")
@@ -218,6 +248,16 @@ class NotificationConfig(FrigateBaseModel):
                     for name, channel in channels.items()
                 }
             data["channels"] = channels
+        channels = data.get("channels")
+        if isinstance(channels, dict):
+            zalo = channels.get("zalo")
+            if isinstance(zalo, dict) and zalo.get("public_base_url"):
+                data.setdefault("public_base_url", zalo.get("public_base_url"))
+                zalo = dict(zalo)
+                zalo.pop("public_base_url", None)
+                channels = dict(channels)
+                channels["zalo"] = zalo
+                data["channels"] = channels
         data.pop("cooldown", None)
         data.pop("enabled_in_config", None)
         return data

@@ -17,7 +17,7 @@ from py_vapid import Vapid01, utils
 from pydantic import BaseModel, ValidationError
 from ruamel.yaml import YAML
 
-from frigate.api.auth import allow_any_authenticated, require_role
+from frigate.api.auth import allow_any_authenticated, allow_public, require_role
 from frigate.api.config_util import swap_runtime_config
 from frigate.api.defs.tags import Tags
 from frigate.config import FrigateConfig
@@ -317,23 +317,30 @@ def test_provider(request: Request, provider: str, body: ProviderTestRequest):
 
 
 @router.get(
-    "/notifications/media/{event_id}/snapshot.jpg",
-    summary="Get a signed notification snapshot",
+    "/notifications/media/{artifact_id}/artifact.jpg",
+    summary="Get a signed immutable notification artifact",
+    dependencies=[Depends(allow_public())],
+)
+@router.get(
+    "/notifications/media/{artifact_id}/snapshot.jpg",
+    include_in_schema=False,
 )
 def notification_snapshot(
     request: Request,
-    event_id: str,
+    artifact_id: str,
     expires: int = Query(),
     signature: str = Query(),
 ):
-    """Serve an event snapshot only when its short-lived HMAC is valid."""
+    """Serve one stored artifact only when its short-lived HMAC is valid."""
     client = _notification_client(request)
-    if client is None or not client.social.signer.verify(event_id, expires, signature):
+    if client is None or not client.social.signer.verify(
+        artifact_id, expires, signature
+    ):
         return JSONResponse(
             {"success": False, "message": "Invalid or expired media signature"},
             status_code=403,
         )
-    snapshot = load_snapshot(event_id)
+    snapshot = load_snapshot(artifact_id)
     if snapshot is None:
         return JSONResponse(
             {"success": False, "message": "Snapshot not available"},
@@ -342,7 +349,10 @@ def notification_snapshot(
     return Response(
         snapshot,
         media_type="image/jpeg",
-        headers={"Cache-Control": "private, no-store"},
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Media-Artifact-Id": artifact_id,
+        },
     )
 
 

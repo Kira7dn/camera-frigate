@@ -167,6 +167,12 @@ def events(
         Event.false_positive,
         Event.box,
         Event.data,
+        Event.state,
+        Event.revision,
+        Event.finalized_at,
+        Event.display_label,
+        Event.canonical_evidence_id,
+        Event.canonical_artifact_id,
     ]
 
     if camera != "all":
@@ -452,6 +458,12 @@ def events_explore(
                         "recognized_license_plate_score",
                     ]
                 },
+                "state": event.state,
+                "revision": event.revision,
+                "finalized_at": event.finalized_at,
+                "display_label": event.display_label,
+                "canonical_evidence_id": event.canonical_evidence_id,
+                "canonical_artifact_id": event.canonical_artifact_id,
                 "event_count": label_counts[event.label],
             }
             yield processed_event
@@ -578,6 +590,12 @@ def events_search(
         Event.top_score,
         Event.data,
         Event.plus_id,
+        Event.state,
+        Event.revision,
+        Event.finalized_at,
+        Event.display_label,
+        Event.canonical_evidence_id,
+        Event.canonical_artifact_id,
         ReviewSegment.thumb_path,
     ]
 

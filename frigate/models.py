@@ -49,6 +49,94 @@ class Event(Model):
     detector_type = CharField(max_length=32)
     model_type = CharField(max_length=32)
     data = JSONField()  # ex: tracked object box, region, etc.
+    # Canonical event projection. EventAggregator is the sole writer of these
+    # fields; legacy tracking fields above remain readable during rollout.
+    state = CharField(max_length=20, default="TRACKING", index=True)
+    revision = IntegerField(default=0)
+    finalized_at = DateTimeField(null=True)
+    canonical_plate = CharField(max_length=32, null=True)
+    canonical_plate_score = FloatField(null=True)
+    canonical_sub_label = CharField(max_length=100, null=True)
+    display_label = CharField(max_length=100, null=True)
+    canonical_evidence_id = CharField(max_length=64, null=True)
+    canonical_artifact_id = CharField(max_length=64, null=True)
+
+
+class EventObservation(Model):
+    """Durable, idempotent input to the canonical event projection."""
+
+    observation_id = CharField(primary_key=True, max_length=64)
+    event_id = CharField(index=True, max_length=30)
+    kind = CharField(index=True, max_length=32)
+    observed_at = DateTimeField(index=True)
+    frame_time = FloatField(null=True)
+    evidence_id = CharField(max_length=64, null=True)
+    payload = JSONField()
+    expires_at = DateTimeField(index=True)
+
+    class Meta:
+        table_name = "event_observation"
+
+
+class EventEvidence(Model):
+    """One immutable full frame and every box measured on that frame."""
+
+    id = CharField(primary_key=True, max_length=64)
+    event_id = CharField(index=True, max_length=30)
+    frame_ref = TextField()
+    frame_time = FloatField()
+    width = IntegerField()
+    height = IntegerField()
+    boxes = JSONField()
+    technical = JSONField()
+    created_at = DateTimeField(index=True)
+
+    class Meta:
+        table_name = "event_evidence"
+
+
+class MediaArtifact(Model):
+    """Immutable canonical media manifest; image bytes live outside SQLite."""
+
+    id = CharField(primary_key=True, max_length=64)
+    event_id = CharField(index=True, max_length=30)
+    revision = IntegerField()
+    evidence_id = CharField(index=True, max_length=64)
+    profile = CharField(max_length=32)
+    render_version = IntegerField()
+    path = TextField(unique=True)
+    sha256 = CharField(max_length=64)
+    byte_size = IntegerField()
+    manifest = JSONField()
+    created_at = DateTimeField(index=True)
+    expires_at = DateTimeField(index=True)
+    pinned = BooleanField(default=False, index=True)
+
+    class Meta:
+        table_name = "media_artifact"
+        indexes = (
+            (("event_id", "revision", "evidence_id", "profile", "render_version"), True),
+        )
+
+
+class NotificationIntent(Model):
+    """Immutable presentation contract, coalesced per event recipient/channel."""
+
+    id = CharField(primary_key=True, max_length=64)
+    event_id = CharField(index=True, max_length=30)
+    revision = IntegerField()
+    channel = CharField(max_length=20)
+    recipient_id = CharField(max_length=128)
+    facts = JSONField()
+    caption = TextField()
+    actions = JSONField()
+    media_artifact_id = CharField(max_length=64, null=True, index=True)
+    status = CharField(max_length=20, default="pending", index=True)
+    created_at = DateTimeField(index=True)
+
+    class Meta:
+        table_name = "notification_intent"
+        indexes = ((("event_id", "revision", "channel", "recipient_id"), True),)
 
 
 class Timeline(Model):
@@ -196,6 +284,8 @@ class NotificationDelivery(Model):
     updated_at = DateTimeField(null=False)
     completed_at = DateTimeField(null=True)
     last_error = TextField(null=True)
+    intent_id = CharField(max_length=64, null=True, index=True)
+    media_artifact_id = CharField(max_length=64, null=True, index=True)
 
     class Meta:
         table_name = "notification_delivery"

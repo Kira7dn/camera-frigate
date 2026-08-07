@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from frigate.notifications.envelope import NotificationEnvelope
 from frigate.notifications.media import NotificationMediaSigner
 
 
@@ -31,3 +32,18 @@ class TestNotificationMediaSigner(unittest.TestCase):
             self.assertFalse(
                 signer.verify("event-1", expires, signer.signature("event-1", expires))
             )
+
+    def test_envelope_never_falls_back_to_event_snapshot(self):
+        envelope = NotificationEnvelope(
+            id="notification-1",
+            source_type="event_revision",
+            source_id="event-1",
+            camera="car_camera",
+            timestamp=1.0,
+            title="title",
+            message="message",
+            direct_url="",
+            snapshot_ref="event-1",
+            notification_type="alert",
+        )
+        self.assertIsNone(envelope.artifact_ref)

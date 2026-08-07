@@ -1,6 +1,7 @@
 """Rule-driven native notification policy and provider fan-out."""
 
 import datetime
+import hashlib
 import json
 import logging
 import re
@@ -9,8 +10,10 @@ import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from multiprocessing.synchronize import Event as MpEvent
+from pathlib import Path
 from typing import Any
 
+import cv2
 from titlecase import titlecase
 
 from frigate.comms.base_communicator import Communicator
@@ -21,7 +24,8 @@ from frigate.config.camera.notification import (
     NotificationDestinationsConfig,
     NotificationRuleConfig,
 )
-from frigate.models import NotificationRuleState
+from frigate.events.canonical import CanonicalMediaStore, EventAggregator
+from frigate.models import Event, NotificationIntent, NotificationRuleState
 
 from .envelope import NotificationEnvelope
 from .metrics import increment
@@ -67,6 +71,12 @@ class NotificationClient(Communicator):
         self._camera_status: dict[str, str] = {}
         self._offline_since: dict[str, float] = {}
         self._offline_notified: set[str] = set()
+        self._aggregator = EventAggregator(
+            CanonicalMediaStore(
+                max_storage_mb=config.notifications.media.max_storage_mb
+            ),
+            config.notifications.pipeline.finalization_timeout,
+        )
         self._load_rule_state()
         self._maintenance_thread = threading.Thread(
             target=self._process_runtime_state, daemon=True
@@ -175,6 +185,8 @@ class NotificationClient(Communicator):
                     )
             cutoff = now - SEEN_RETENTION_SECONDS
             self._seen = {key: at for key, at in self._seen.items() if at >= cutoff}
+            for event_id in self._aggregator.finalize_due():
+                self._route_finalized_event(event_id)
 
     def _refresh_config(self) -> None:
         changed = False
@@ -242,6 +254,8 @@ class NotificationClient(Communicator):
             selected.webpush
             and self.config.notifications.channels.webpush.enabled
             and self.webpush.configured
+            and (not envelope.media_artifact_id or bool(self.config.notifications.public_base_url))
+            and (not envelope.media_artifact_id or self.social.public_media_ready())
             and allowed("webpush", "registered_devices")
         )
         telegram = [
@@ -254,6 +268,7 @@ class NotificationClient(Communicator):
             r
             for r in selected.zalo
             if self.social.recipient_enabled("zalo", r, envelope.camera, rule.id)
+            and bool(self.config.notifications.public_base_url)
             and allowed("zalo", r)
         ]
         return (
@@ -270,36 +285,147 @@ class NotificationClient(Communicator):
         if envelope.camera and self.is_camera_suspended(envelope.camera):
             increment("all", "skipped_suspended")
             return []
-        deliveries: list[str] = []
-        for rule in self.config.notifications.rules:
-            if (
-                not rule.enabled
-                or rule.event != event
-                or not self._rule_matches(rule, envelope)
-            ):
-                continue
+        envelope = self._canonical_envelope(envelope)
+        if envelope.snapshot_ref and not envelope.media_artifact_id:
+            # Never enqueue a provisional or dynamically rendered image.
+            increment("all", "waiting_for_finalization")
+            return []
+        if self.config.notifications.pipeline.shadow_mode:
+            increment("all", "shadow_committed")
+            return []
+        event_types = {event}
+        if envelope.media_artifact_id:
+            event_types.update(("alert", "object_detected"))
+            if envelope.lpr_plate:
+                event_types.add("license_plate")
+            if envelope.sub_label:
+                event_types.add("face_recognized")
+        matching_rules = [
+            rule
+            for rule in self.config.notifications.rules
+            if rule.enabled
+            and rule.event in event_types
+            and self._rule_matches(rule, envelope)
+        ]
+        destinations = NotificationDestinationsConfig()
+        cooldown_keys: list[tuple[str, str, str, str]] = []
+        dedupe_keys: list[tuple[str, str, str]] = []
+        for rule in matching_rules:
             dedupe_key = (rule.id, envelope.source_type, envelope.source_id)
             if dedupe_key in self._seen:
                 increment("all", "deduplicated")
                 continue
-            destinations, cooldown_keys = self._available_destinations(rule, envelope)
-            ruled_envelope = replace(envelope, rule_id=rule.id)
-            delivered = False
-            if (
-                destinations.webpush
-                and self.config.notifications.channels.webpush.enabled
-            ):
-                delivered = self.webpush.deliver(ruled_envelope) > 0 or delivered
-            social_deliveries = self.social.enqueue(ruled_envelope, destinations)
-            delivered = bool(social_deliveries) or delivered
-            deliveries.extend(social_deliveries)
-            if delivered:
-                now = self._now()
+            available, keys = self._available_destinations(rule, envelope)
+            destinations.webpush = destinations.webpush or available.webpush
+            destinations.telegram = sorted(
+                set(destinations.telegram).union(available.telegram)
+            )
+            destinations.zalo = sorted(set(destinations.zalo).union(available.zalo))
+            cooldown_keys.extend(keys)
+            dedupe_keys.append(dedupe_key)
+        if not dedupe_keys:
+            return []
+        ruled_envelope = replace(envelope, rule_id="event_revision")
+        self._persist_intents(ruled_envelope, destinations)
+        delivered = False
+        if destinations.webpush and self.config.notifications.channels.webpush.enabled:
+            delivered = self.webpush.deliver(ruled_envelope) > 0
+        deliveries = self.social.enqueue(ruled_envelope, destinations)
+        delivered = bool(deliveries) or delivered
+        if delivered:
+            now = self._now()
+            for dedupe_key in dedupe_keys:
                 self._seen[dedupe_key] = now
-                for key in cooldown_keys:
-                    self._last_delivery[key] = now
-                    self._persist_rule_state(key, ruled_envelope, now)
+            for key in set(cooldown_keys):
+                self._last_delivery[key] = now
+                self._persist_rule_state(key, ruled_envelope, now)
         return deliveries
+
+    def _persist_intents(
+        self,
+        envelope: NotificationEnvelope,
+        destinations: NotificationDestinationsConfig,
+    ) -> None:
+        if not envelope.media_artifact_id or envelope.revision is None:
+            return
+        recipients = []
+        if destinations.webpush:
+            recipients.append(("webpush", "registered_devices"))
+        recipients.extend(("telegram", value) for value in destinations.telegram)
+        recipients.extend(("zalo", value) for value in destinations.zalo)
+        for channel, recipient in recipients:
+            key = f"{envelope.source_id}:{envelope.revision}:{channel}:{recipient}"
+            intent_id = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            facts = {**envelope.facts, "intent_id": intent_id}
+            NotificationIntent.insert(
+                id=intent_id,
+                event_id=str(envelope.facts.get("event_id") or envelope.source_id),
+                revision=envelope.revision,
+                channel=channel,
+                recipient_id=recipient,
+                facts=facts,
+                caption=f"{envelope.title}\n{envelope.message}",
+                actions=[{"url": envelope.direct_url}] if envelope.direct_url else [],
+                media_artifact_id=envelope.media_artifact_id,
+                status="pending",
+                created_at=datetime.datetime.now(datetime.UTC),
+            ).on_conflict_ignore().execute()
+
+    def _canonical_envelope(self, envelope: NotificationEnvelope) -> NotificationEnvelope:
+        """Pin event presentation and media before rule evaluation or retries."""
+        event_id = envelope.snapshot_ref
+        if not event_id:
+            return envelope
+        event = Event.get_or_none(Event.id == event_id)
+        if event is None or event.end_time is None or event.state != "FINALIZED":
+            return envelope
+        artifact = self._aggregator.media.get(event.canonical_artifact_id)
+        if artifact is None:
+            return envelope
+        identity = event.canonical_sub_label or event.sub_label
+        is_face = event.label == "person" and bool(identity)
+        label = event.display_label or identity or envelope.lpr_plate or event.label
+        if is_face:
+            confidence = (event.data or {}).get("sub_label_score") or (
+                event.data or {}
+            ).get("face_snapshot_score")
+        else:
+            confidence = envelope.lpr_score
+        confidence_text = (
+            f" · Tin cậy {round(confidence * 100):d}%"
+            if confidence is not None
+            else ""
+        )
+        title = f"{'👤' if is_face else '🚗'} {label} · {event.camera}"
+        message = (
+            f"Đã nhận diện khuôn mặt{confidence_text}"
+            if is_face
+            else f"Xe đã kết thúc lượt qua{confidence_text}"
+        )
+        return replace(
+            envelope,
+            title=title,
+            message=message,
+            snapshot_ref=None,
+            media_artifact_id=artifact.id,
+            revision=artifact.revision,
+            direct_url=(
+                f"{str(self.config.notifications.public_base_url).rstrip('/')}"
+                f"/explore?event_id={event.id}&revision={artifact.revision}"
+                if self.config.notifications.public_base_url
+                else ""
+            ),
+            facts={
+                **envelope.facts,
+                "event_id": event.id,
+                "revision": artifact.revision,
+                "display_label": label,
+                "identity": identity if is_face else None,
+                "license_plate": envelope.lpr_plate,
+                "confidence": confidence,
+                "artifact_id": artifact.id,
+            },
+        )
 
     def publish(self, topic: str, payload: Any, retain: bool = False) -> None:
         self._refresh_config()
@@ -318,6 +444,16 @@ class NotificationClient(Communicator):
             envelope = self._review_envelope(decoded)
             result = ("alert", envelope) if envelope else None
         elif topic == "events" and isinstance(decoded, dict):
+            if decoded.get("type") == "end":
+                after = decoded.get("after") or decoded
+                event_id = after.get("id")
+                if event_id:
+                    self._aggregator.observe(
+                        observation_id=self._observation_id("event_ended", decoded),
+                        event_id=str(event_id),
+                        kind="event_ended",
+                        payload={"end_time": after.get("end_time")},
+                    )
             envelope = self._lpr_envelope(decoded)
             if envelope:
                 result = ("license_plate", envelope)
@@ -330,6 +466,34 @@ class NotificationClient(Communicator):
             and (topic == "face_recognized" or decoded.get("type") == "face")
         ):
             envelope = self._face_envelope(decoded)
+            if envelope:
+                evidence_id = self._capture_evidence(
+                    str(decoded.get("event_id") or decoded.get("id")), decoded
+                )
+                previous = Event.get_or_none(
+                    Event.id == str(decoded.get("event_id") or decoded.get("id"))
+                )
+                previous_revision = previous.revision if previous else 0
+                self._aggregator.observe(
+                    observation_id=self._observation_id("face", decoded),
+                    event_id=str(decoded.get("event_id") or decoded.get("id")),
+                    kind="face",
+                    payload={
+                        "sub_label": decoded.get("identity") or decoded.get("name"),
+                        "score": decoded.get("score"),
+                    },
+                    frame_time=decoded.get("timestamp"),
+                    evidence_id=evidence_id,
+                )
+                current = Event.get_or_none(
+                    Event.id == str(decoded.get("event_id") or decoded.get("id"))
+                )
+                if (
+                    current
+                    and current.revision > previous_revision
+                    and current.state == "FINALIZED"
+                ):
+                    self._route_finalized_event(current.id)
             result = ("face_recognized", envelope) if envelope else None
         elif (
             topic == "tracked_object_update"
@@ -345,6 +509,38 @@ class NotificationClient(Communicator):
             result = ("camera_monitoring", envelope) if envelope else None
         if result:
             self._route(*result)
+
+    @staticmethod
+    def _observation_id(kind: str, payload: dict[str, Any]) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(f"{kind}:{canonical}".encode()).hexdigest()
+
+    def _route_finalized_event(self, event_id: str) -> None:
+        event = Event.get_or_none(Event.id == event_id)
+        if event is None:
+            return
+        plate = event.canonical_plate or (event.data or {}).get(
+            "recognized_license_plate"
+        )
+        envelope = NotificationEnvelope(
+            id=str(uuid.uuid4()),
+            source_type="event_revision",
+            source_id=f"{event.id}:r{event.revision}",
+            camera=event.camera,
+            timestamp=self._now(),
+            title=event.display_label or event.label,
+            message="Event finalized",
+            direct_url="",
+            snapshot_ref=event.id,
+            notification_type="event_revision",
+            object_label=event.label,
+            sub_label=event.canonical_sub_label or event.sub_label,
+            genai={"_labels": [event.label], "_zones": event.zones or []},
+            lpr_plate=plate,
+            lpr_score=event.canonical_plate_score
+            or (event.data or {}).get("recognized_license_plate_score"),
+        )
+        self._route("license_plate" if plate else "alert", envelope)
 
     def _review_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
         after = payload.get("after") or {}
@@ -470,6 +666,77 @@ class NotificationClient(Communicator):
             "plate_box": payload.get("plate_box"),
             "sub_label": payload.get("name"),
         }
+        evidence_id = self._capture_evidence(str(event_id), payload)
+        previous = Event.get_or_none(Event.id == str(event_id))
+        previous_revision = previous.revision if previous else 0
+        self._aggregator.observe(
+            observation_id=self._observation_id("lpr", payload),
+            event_id=str(event_id),
+            kind="lpr",
+            payload={
+                "plate": plate,
+                "score": payload.get("score"),
+                "sub_label": payload.get("name"),
+                "plate_box": payload.get("plate_box"),
+            },
+            frame_time=payload.get("frame_time") or payload.get("timestamp"),
+            evidence_id=evidence_id,
+        )
+        current = Event.get_or_none(Event.id == str(event_id))
+        if current and current.revision > previous_revision and current.state == "FINALIZED":
+            self._route_finalized_event(str(event_id))
+
+    def _capture_evidence(
+        self, event_id: str, payload: dict[str, Any]
+    ) -> str | None:
+        """Copy a detector full frame and frame-local boxes into durable evidence."""
+        source = payload.get("frame_ref") or payload.get("full_frame_path")
+        if not source:
+            return None
+        source_path = Path(str(source))
+        image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+        if image is None:
+            logger.warning("Canonical evidence frame is unavailable for %s", event_id)
+            return None
+        evidence_id = str(payload.get("evidence_id") or "").strip()
+        if not evidence_id:
+            evidence_id = hashlib.sha256(
+                f"{event_id}:{payload.get('frame_time') or payload.get('timestamp')}:{source_path}".encode()
+            ).hexdigest()
+        evidence_path = self._aggregator.media.root / "evidence" / f"{evidence_id}.jpg"
+        evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        if not evidence_path.exists():
+            temporary = evidence_path.with_suffix(".tmp")
+            temporary.write_bytes(source_path.read_bytes())
+            temporary.replace(evidence_path)
+        boxes = []
+        object_box = payload.get("object_box") or payload.get("person_box")
+        if object_box:
+            boxes.append({"role": "object", "box": object_box})
+        for role, key in (("plate", "plate_box"), ("face", "face_box")):
+            if payload.get(key):
+                boxes.append({"role": role, "box": payload[key]})
+        if not boxes:
+            return None
+        self._aggregator.add_evidence(
+            evidence_id=evidence_id,
+            event_id=event_id,
+            frame_ref=str(evidence_path),
+            frame_time=float(
+                payload.get("frame_time")
+                or payload.get("source_frame_time")
+                or payload.get("timestamp")
+                or self._now()
+            ),
+            width=int(payload.get("frame_width") or image.shape[1]),
+            height=int(payload.get("frame_height") or image.shape[0]),
+            boxes=boxes,
+            technical={
+                "source": str(payload.get("type") or "enrichment"),
+                "detector_timestamp": payload.get("timestamp"),
+            },
+        )
+        return evidence_id
 
     def _face_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
         camera = payload.get("camera")
@@ -627,7 +894,14 @@ class NotificationClient(Communicator):
         status["webpush"] = {
             "enabled": self.config.notifications.channels.webpush.enabled,
             "configured": self.webpush.configured,
-            "readiness": "ready" if self.webpush.configured else "missing",
+            "readiness": (
+                "missing"
+                if not self.webpush.configured
+                else "degraded"
+                if self.config.notifications.public_base_url
+                and not self.social.public_media_ready()
+                else "ready"
+            ),
             "pending": self.webpush.pending,
             "last_success": None,
             "last_error": None,
