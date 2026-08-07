@@ -205,7 +205,10 @@ class LatestFaceCandidateStore(Generic[T]):
                     if key not in excluded
                 ]
                 oldest_age = max(
-                    (now - float(getattr(item, "created_monotonic")) for item in eligible),
+                    (
+                        now - float(getattr(item, "created_monotonic"))
+                        for item in eligible
+                    ),
                     default=0.0,
                 )
                 if eligible and (
@@ -219,7 +222,9 @@ class LatestFaceCandidateStore(Generic[T]):
                     break
                 remaining = deadline - now
                 if remaining <= 0:
-                    selected = []
+                    selected = self._select_fair(eligible, max_items) if eligible else []
+                    for item in selected:
+                        self._items.pop(getattr(item, "key"), None)
                     break
                 wait_for = remaining
                 if eligible and flush_seconds > 0:

@@ -25,6 +25,7 @@ from frigate.config.camera.updater import (
 )
 from frigate.const import BASE_DIR, CONFIG_DIR
 from frigate.models import User
+from frigate.notifications.envelope import NotificationEnvelope
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,13 @@ class PushNotification:
 class WebPushClient(Communicator):
     """Frigate wrapper for webpush client."""
 
-    def __init__(self, config: FrigateConfig, stop_event: MpEvent) -> None:
+    def __init__(
+        self,
+        config: FrigateConfig,
+        stop_event: MpEvent,
+        *,
+        manage_suspensions: bool = True,
+    ) -> None:
         self.config = config
         self.stop_event = stop_event
         self.claim_headers: dict[str, dict[str, str]] = {}
@@ -67,10 +74,12 @@ class WebPushClient(Communicator):
             target=self._process_notifications, daemon=True
         )
         self.notification_thread.start()
-        self.suspension_thread = threading.Thread(
-            target=self._process_suspensions, daemon=True
-        )
-        self.suspension_thread.start()
+        self.suspension_thread: threading.Thread | None = None
+        if manage_suspensions:
+            self.suspension_thread = threading.Thread(
+                target=self._process_suspensions, daemon=True
+            )
+            self.suspension_thread.start()
 
         if not self.config.notifications.email:
             logger.warning("Email must be provided for push notifications to be sent.")
@@ -285,6 +294,40 @@ class WebPushClient(Communicator):
             ttl=ttl,
         )
         self.notification_queue.put(notification)
+
+    def send_envelope(self, envelope: NotificationEnvelope) -> int:
+        """Queue a normalized envelope for every authorized WebPush user."""
+        if not self.config.notifications.email:
+            return 0
+        self.check_registrations()
+        sent = 0
+        payload = {"after": {"id": envelope.source_id}}
+        image = ""
+        if envelope.snapshot_ref:
+            if envelope.source_type == "trigger" and envelope.camera:
+                image = (
+                    f"/clips/triggers/{envelope.camera}/{envelope.snapshot_ref}.webp"
+                )
+            else:
+                image = f"/api/events/{envelope.snapshot_ref}/snapshot.jpg"
+        for user in self.web_pushers:
+            if envelope.camera and not self._user_has_camera_access(
+                user, envelope.camera
+            ):
+                continue
+            self.send_push_notification(
+                user=user,
+                payload=payload,
+                title=envelope.title,
+                message=envelope.message,
+                direct_url=envelope.direct_url,
+                image=image,
+                notification_type=envelope.notification_type,
+                ttl=3600 if envelope.notification_type == "alert" else 0,
+            )
+            sent += 1
+        self.cleanup_registrations()
+        return sent
 
     def _process_notifications(self) -> None:
         while not self.stop_event.is_set():

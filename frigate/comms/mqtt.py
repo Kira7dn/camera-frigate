@@ -46,8 +46,8 @@ class MqttClient(Communicator):
         """Whether notifications are configured globally or on any camera.
 
         Notifications can be enabled per camera with the global config left
-        disabled, so the global topics must consider both (matching how
-        app.py decides to create the WebPushClient).
+        disabled, so the global topics must consider both when registering
+        runtime notification controls.
         """
         return self.config.notifications.enabled_in_config or any(
             cam.enabled and cam.notifications.enabled_in_config

@@ -27,6 +27,7 @@ from frigate.util.face_snapshot import (
     LatestPerObjectWorker,
     SnapshotCommitJob,
     SnapshotCommitted,
+    SnapshotFailed,
     commit_snapshot_job,
     finalize_snapshot_commit,
     is_face_identity_directory,
@@ -126,6 +127,82 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
             result = EventProcessor._process_snapshot_job(CleanupJob((artifact,)))
             self.assertIsNone(result)
             self.assertFalse(os.path.exists(artifact))
+
+    def test_cleanup_cannot_overtake_pending_commit_for_same_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            blocker_artifact = os.path.join(folder, "blocker.webp")
+            target_artifact = os.path.join(folder, "target.webp")
+            cv2.imwrite(blocker_artifact, np.zeros((8, 8, 3), dtype=np.uint8))
+            cv2.imwrite(target_artifact, np.ones((8, 8, 3), dtype=np.uint8))
+            blocker_started = threading.Event()
+            release_blocker = threading.Event()
+
+            def commit_job(event_id: str, artifact: str) -> SnapshotCommitJob:
+                payload = self._payload(artifact_path=artifact)
+                payload["event_id"] = event_id
+                result = FaceRecognitionResult(**payload)
+                return SnapshotCommitJob(
+                    result,
+                    os.path.join(folder, f"{event_id}-clean.webp"),
+                    os.path.join(folder, f"{event_id}-thumb.webp"),
+                )
+
+            def handler(job: SnapshotCommitJob | CleanupJob):
+                if (
+                    isinstance(job, SnapshotCommitJob)
+                    and job.result.event_id == "blocker"
+                ):
+                    blocker_started.set()
+                    release_blocker.wait(2)
+                return EventProcessor._process_snapshot_job(job)
+
+            worker = LatestPerObjectWorker(handler, max_objects=4)
+            try:
+                self.assertTrue(
+                    worker.submit(
+                        ("face_camera", "blocker"),
+                        commit_job("blocker", blocker_artifact),
+                    )
+                )
+                self.assertTrue(blocker_started.wait(1))
+                self.assertTrue(
+                    worker.submit(
+                        ("face_camera", "target"),
+                        commit_job("target", target_artifact),
+                    )
+                )
+                self.assertTrue(
+                    worker.submit_control(CleanupJob((target_artifact,)))
+                )
+                release_blocker.set()
+                deadline = time.time() + 2
+                results = []
+                while time.time() < deadline:
+                    results.extend(worker.drain_results())
+                    if any(
+                        isinstance(result, SnapshotCommitted)
+                        and result.result.event_id == "target"
+                        for result in results
+                    ):
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(
+                    any(
+                        isinstance(result, SnapshotCommitted)
+                        and result.result.event_id == "target"
+                        for result in results
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        isinstance(result, SnapshotFailed)
+                        and result.result.event_id == "target"
+                        for result in results
+                    )
+                )
+            finally:
+                release_blocker.set()
+                worker.stop()
 
     def test_track_discontinuity_and_stale_frame(self) -> None:
         self.assertTrue(

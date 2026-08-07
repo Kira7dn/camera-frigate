@@ -10,7 +10,6 @@ from frigate.camera import PTZMetrics
 from frigate.camera.activity_manager import AudioActivityManager, CameraActivityManager
 from frigate.comms.base_communicator import Communicator
 from frigate.comms.runtime_state import RuntimeStatePersistence
-from frigate.comms.webpush import WebPushClient
 from frigate.config import BirdseyeModeEnum, FrigateConfig
 from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
@@ -38,6 +37,7 @@ from frigate.const import (
     UPSERT_REVIEW_SEGMENT,
 )
 from frigate.models import Event, Previews, Recordings, ReviewSegment
+from frigate.notifications.client import NotificationClient
 from frigate.ptz.onvif import OnvifCommandEnum, OnvifController
 from frigate.types import ModelStatusTypesEnum, TrackedObjectUpdateTypesEnum
 from frigate.util.object import get_camera_regions_grid
@@ -102,11 +102,11 @@ class Dispatcher:
         for comm in self.comms:
             comm.subscribe(self._receive)
 
-        self.web_push_client = next(
-            (comm for comm in communicators if isinstance(comm, WebPushClient)), None
+        self.notification_client = next(
+            (comm for comm in communicators if isinstance(comm, NotificationClient)), None
         )
-        if self.web_push_client is not None:
-            self.web_push_client.set_suspension_broadcaster(self.publish)
+        if self.notification_client is not None:
+            self.notification_client.set_suspension_broadcaster(self.publish)
 
     def _receive(self, topic: str, payload: Any) -> Any | None:
         """Handle receiving of payload from communicators."""
@@ -291,10 +291,10 @@ class Dispatcher:
                     ].audio_transcription.live_enabled,
                     "notifications": self.config.cameras[camera].notifications.enabled,
                     "notifications_suspended": int(
-                        self.web_push_client.suspended_cameras.get(camera, 0)
+                        self.notification_client.suspended_cameras.get(camera, 0)
                     )
-                    if self.web_push_client
-                    and camera in self.web_push_client.suspended_cameras
+                    if self.notification_client
+                    and camera in self.notification_client.suspended_cameras
                     else 0,
                     "autotracking": self.config.cameras[
                         camera
@@ -918,19 +918,19 @@ class Dispatcher:
                 logger.info(f"Turning on notifications for {camera_name}")
                 notification_settings.enabled = True
             if (
-                self.web_push_client
-                and camera_name in self.web_push_client.suspended_cameras
+                self.notification_client
+                and camera_name in self.notification_client.suspended_cameras
             ):
-                self.web_push_client.suspended_cameras[camera_name] = 0
+                self.notification_client.suspended_cameras[camera_name] = 0
         elif payload == "OFF":
             if notification_settings.enabled:
                 logger.info(f"Turning off notifications for {camera_name}")
                 notification_settings.enabled = False
             if (
-                self.web_push_client
-                and camera_name in self.web_push_client.suspended_cameras
+                self.notification_client
+                and camera_name in self.notification_client.suspended_cameras
             ):
-                self.web_push_client.suspended_cameras[camera_name] = 0
+                self.notification_client.suspended_cameras[camera_name] = 0
 
         self.config_updater.publish_update(
             CameraConfigUpdateTopic(CameraConfigUpdateEnum.notifications, camera_name),
@@ -947,8 +947,8 @@ class Dispatcher:
             logger.error(f"Invalid suspension duration: {payload}")
             return
 
-        if self.web_push_client is None:
-            logger.error("WebPushClient not available for suspension")
+        if self.notification_client is None:
+            logger.error("NotificationClient not available for suspension")
             return
 
         notification_settings = self.config.cameras[camera_name].notifications
@@ -958,15 +958,15 @@ class Dispatcher:
             return
 
         if duration != 0:
-            self.web_push_client.suspend_notifications(camera_name, duration)
+            self.notification_client.suspend_notifications(camera_name, duration)
         else:
-            self.web_push_client.unsuspend_notifications(camera_name)
+            self.notification_client.unsuspend_notifications(camera_name)
 
         self.publish(
             f"{camera_name}/notifications/suspended",
             str(
-                int(self.web_push_client.suspended_cameras.get(camera_name, 0))
-                if camera_name in self.web_push_client.suspended_cameras
+                int(self.notification_client.suspended_cameras.get(camera_name, 0))
+                if camera_name in self.notification_client.suspended_cameras
                 else 0
             ),
             retain=True,

@@ -854,6 +854,7 @@ class EmbeddingMaintainer(threading.Thread):
                             "sub_label",
                             "face_score",
                             "artifact_path",
+                            "transaction_id",
                         )
                     }
                     try:

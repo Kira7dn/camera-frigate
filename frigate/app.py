@@ -25,7 +25,6 @@ from frigate.comms.event_metadata_updater import EventMetadataPublisher
 from frigate.comms.inter_process import InterProcessCommunicator
 from frigate.comms.mqtt import MqttClient
 from frigate.comms.object_detector_signaler import DetectorProxy
-from frigate.comms.webpush import WebPushClient
 from frigate.comms.ws import WebSocketClient
 from frigate.comms.zmq_proxy import ZmqProxy
 from frigate.config.camera.updater import CameraConfigUpdatePublisher
@@ -59,6 +58,7 @@ from frigate.log import _stop_logging
 from frigate.models import (
     Event,
     Export,
+    NotificationDelivery,
     Previews,
     Recordings,
     RecordingsToDelete,
@@ -68,6 +68,7 @@ from frigate.models import (
     Trigger,
     User,
 )
+from frigate.notifications.client import NotificationClient
 from frigate.object_detection.base import ObjectDetectProcess
 from frigate.output.output import OutputProcess
 from frigate.ptz.autotrack import PtzAutoTrackerThread
@@ -318,6 +319,7 @@ class FrigateApp:
             Timeline,
             User,
             Trigger,
+            NotificationDelivery,
         ]
         self.db.bind(models)
 
@@ -352,14 +354,9 @@ class FrigateApp:
         if self.config.mqtt.enabled:
             comms.append(MqttClient(self.config))
 
-        notification_cameras = [
-            c
-            for c in self.config.cameras.values()
-            if c.enabled and c.notifications.enabled_in_config
-        ]
-
-        if notification_cameras:
-            comms.append(WebPushClient(self.config, self.stop_event))
+        # The shared client always exists so provider/config changes take effect
+        # on hot reload without restarting Frigate.
+        comms.append(NotificationClient(self.config, self.stop_event))
 
         comms.append(WebSocketClient(self.config))
         comms.append(self.inter_process_communicator)

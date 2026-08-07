@@ -13,8 +13,10 @@ from frigate.embeddings.maintainer import EmbeddingMaintainer  # noqa: F401
 from frigate.data_processing.common.face.model import ArcFaceRecognizer
 from frigate.data_processing.common.face.pipeline import (
     FaceCaptureRequest,
+    FaceCandidate,
     FaceRecognitionPipeline,
     LatestFaceCandidateStore,
+    PreparedFaceCandidate,
     crop_yuv_region_to_bgr,
 )
 from frigate.detectors.detection_runners import CudaGraphRunner
@@ -90,6 +92,31 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
         self.assertEqual(len({item.camera for item in second}), 4)
         self.assertEqual({item.camera for item in first + second}, {f"cam-{i}" for i in range(8)})
         self.assertTrue(all(item.vote_count == 0 for item in first + second))
+
+    def test_prepared_candidate_flushes_once_after_100ms(self) -> None:
+        item = request("cam", "track")
+        candidate = FaceCandidate(
+            item,
+            (0, 0, 4, 4),
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            1.0,
+            16.0,
+        )
+        prepared = PreparedFaceCandidate(
+            candidate,
+            np.zeros((112, 112, 3), dtype=np.float32),
+            0.0,
+            1.0,
+            time.monotonic(),
+        )
+        store = LatestFaceCandidateStore[PreparedFaceCandidate]()
+        store.submit(prepared)
+        started = time.monotonic()
+        selected = store.take_fair(4, 0.1, flush_seconds=0.1)
+        elapsed = time.monotonic() - started
+        self.assertEqual(selected, [prepared])
+        self.assertGreaterEqual(elapsed, 0.09)
+        self.assertLess(elapsed, 0.16)
 
     def test_yuv_person_crop_maps_back_to_full_frame(self) -> None:
         bgr = np.zeros((16, 20, 3), dtype=np.uint8)

@@ -523,7 +523,7 @@ class EventProcessor(threading.Thread):
             worker.get("replaced", 0) + self.face_snapshot_metrics["replaced"],
             worker.get("rejected", 0) + self.face_snapshot_metrics["rejected"],
             self.face_snapshot_metrics["committed"],
-            worker.get("failed", 0),
+            worker.get("failed", 0) + self.face_snapshot_metrics["failed"],
             self.face_snapshot_metrics["released"],
             self.face_snapshot_metrics["stale_result"],
             self.face_snapshot_metrics["late_result"],

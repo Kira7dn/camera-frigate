@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 import time
-from collections import Counter
+from collections import Counter, deque
 from typing import Any
 
 import cv2
@@ -75,6 +75,16 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.face_tracks: dict[tuple[str, str], FaceTrackState] = {}
         self.face_generation_counter = 0
         self.face_counters: Counter[str] = Counter()
+        self.face_latency_samples: dict[str, deque[float]] = {
+            name: deque(maxlen=512)
+            for name in (
+                "batch_wait_ms",
+                "embedding_ms",
+                "end_to_end_ms",
+                "first_attempt_ms",
+                "confirmed_ms",
+            )
+        }
         self.last_face_metrics_log = time.monotonic()
         removed = reap_stale_staging()
         if removed:
@@ -265,6 +275,10 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         identities, training_images = self.__face_library_stats()
         pipeline = getattr(self, "face_pipeline", None)
         batch_candidates = self.face_counters["batch_candidates"]
+        latency = {
+            name: self.__latency_summary(samples)
+            for name, samples in self.face_latency_samples.items()
+        }
         structured = {
             "candidate_age_ms": round(
                 self.face_counters["candidate_age_ms_total"]
@@ -286,6 +300,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 / max(1, batch_candidates),
                 1,
             ),
+            "batch_wait_ms_p95": latency["batch_wait_ms"][1],
+            "batch_wait_ms_max": latency["batch_wait_ms"][2],
             "yunet_ms": round(
                 self.face_counters["yunet_ms_total"] / max(1, batch_candidates),
                 1,
@@ -300,21 +316,29 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 / max(1, batch_candidates),
                 1,
             ),
+            "embedding_ms_p95": latency["embedding_ms"][1],
+            "embedding_ms_max": latency["embedding_ms"][2],
             "end_to_end_ms": round(
                 self.face_counters["candidate_age_ms_total"]
                 / max(1, batch_candidates),
                 1,
             ),
+            "end_to_end_ms_p95": latency["end_to_end_ms"][1],
+            "end_to_end_ms_max": latency["end_to_end_ms"][2],
             "first_attempt_ms": round(
                 self.face_counters["first_attempt_ms_total"]
                 / max(1, self.face_counters["first_attempt_count"]),
                 1,
             ),
+            "first_attempt_ms_p95": latency["first_attempt_ms"][1],
+            "first_attempt_ms_max": latency["first_attempt_ms"][2],
             "confirmed_ms": round(
                 self.face_counters["confirmed_ms_total"]
                 / max(1, self.face_counters["confirmed_count"]),
                 1,
             ),
+            "confirmed_ms_p95": latency["confirmed_ms"][1],
+            "confirmed_ms_max": latency["confirmed_ms"][2],
             "commit_state": {
                 "queued": self.face_counters["snapshot_queued"],
                 "rejected": self.face_counters["face_snapshot_rejected"],
@@ -359,7 +383,20 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             "confirmed_ms_total",
         ):
             self.face_counters[key] = 0
+        for samples in self.face_latency_samples.values():
+            samples.clear()
         self.last_face_metrics_log = now
+
+    @staticmethod
+    def __latency_summary(samples: deque[float]) -> tuple[float, float, float]:
+        if not samples:
+            return (0.0, 0.0, 0.0)
+        values = np.asarray(samples, dtype=np.float64)
+        return (
+            round(float(values.mean()), 1),
+            round(float(np.percentile(values, 95)), 1),
+            round(float(values.max()), 1),
+        )
 
     def submit_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> bool:
         """Conflate one eligible person track into the bounded face pipeline."""
@@ -938,16 +975,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 state.result_emitted = True
                 self.face_counters["snapshot_queued"] += 1
                 self.face_counters["confirmed_count"] += 1
-                self.face_counters["confirmed_ms_total"] += int(
-                    (
-                        outcome.completed_monotonic
-                        - state.first_match_monotonic.get(
-                            weighted_sub_label,
-                            state.first_attempt_monotonic,
-                        )
+                confirmed_ms = (
+                    outcome.completed_monotonic
+                    - state.first_match_monotonic.get(
+                        weighted_sub_label,
+                        state.first_attempt_monotonic,
                     )
-                    * 1000
-                )
+                ) * 1000
+                self.face_counters["confirmed_ms_total"] += int(confirmed_ms)
+                self.face_latency_samples["confirmed_ms"].append(confirmed_ms)
             else:
                 self.face_counters["face_snapshot_rejected"] += 1
 
@@ -957,15 +993,18 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.face_counters["yunet_ms_total"] += int(candidate.capture_ms)
         self.face_counters["alignment_ms_total"] += int(outcome.alignment_ms)
         self.face_counters["embedding_ms_total"] += int(outcome.embedding_ms)
-        self.face_counters["candidate_age_ms_total"] += int(
-            (outcome.completed_monotonic - request.created_monotonic) * 1000
-        )
+        end_to_end_ms = (
+            outcome.completed_monotonic - request.created_monotonic
+        ) * 1000
+        self.face_counters["candidate_age_ms_total"] += int(end_to_end_ms)
+        self.face_latency_samples["batch_wait_ms"].append(outcome.batch_wait_ms)
+        self.face_latency_samples["embedding_ms"].append(outcome.embedding_ms)
+        self.face_latency_samples["end_to_end_ms"].append(end_to_end_ms)
         if not state.first_attempt_completed:
             state.first_attempt_completed = True
             self.face_counters["first_attempt_count"] += 1
-            self.face_counters["first_attempt_ms_total"] += int(
-                (outcome.completed_monotonic - request.created_monotonic) * 1000
-            )
+            self.face_counters["first_attempt_ms_total"] += int(end_to_end_ms)
+            self.face_latency_samples["first_attempt_ms"].append(end_to_end_ms)
         processing_seconds = (
             candidate.capture_ms + outcome.alignment_ms + outcome.embedding_ms
         ) / 1000

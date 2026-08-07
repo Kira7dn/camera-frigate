@@ -61,6 +61,15 @@ import { sanitizeSectionData } from "@/utils/configUtil";
 import { isReplayCamera } from "@/utils/cameraUtil";
 import type { SectionRendererProps } from "./registry";
 
+type ProviderStatus = {
+  enabled: boolean;
+  configured: boolean;
+  readiness: "ready" | "missing" | "degraded";
+  pending: number;
+  last_success?: string | null;
+  last_error?: string | null;
+};
+
 const NOTIFICATION_SERVICE_WORKER = "/notifications-worker.js";
 import {
   SettingsGroupCard,
@@ -86,6 +95,12 @@ export default function NotificationsSettingsExtras({
 
   // config
   const { data: config } = useSWR<FrigateConfig>("config", {
+    revalidateOnFocus: false,
+  });
+  const { data: providerStatus, mutate: refreshProviderStatus } = useSWR<
+    Record<string, ProviderStatus>
+  >(isAdmin ? "notifications/providers/status" : null, {
+    refreshInterval: 5000,
     revalidateOnFocus: false,
   });
 
@@ -438,7 +453,7 @@ export default function NotificationsSettingsExtras({
     return <ActivityIndicator />;
   }
 
-  if (!("Notification" in window) || !window.isSecureContext) {
+  if ((!("Notification" in window) || !window.isSecureContext) && !isAdmin) {
     // iOS only exposes web push to apps installed to the Home Screen, so a
     // secure-context iOS browser tab that isn't an installed PWA has no
     // Notification API. Android supports web push in a normal tab, so it never
@@ -642,13 +657,27 @@ export default function NotificationsSettingsExtras({
             </SettingsGroupCard>
           )}
 
+          {isAdmin && (
+            <NotificationProviderCards
+              config={config}
+              formContext={formContext}
+              status={providerStatus}
+              onTestComplete={() => refreshProviderStatus()}
+            />
+          )}
+
           <div className="space-y-6">
             <SettingsGroupCard title={t("notification.deviceSpecific")}>
               <div className={cn("space-y-2", isAdmin && "md:max-w-[50%]")}>
                 <Button
                   aria-label={t("notification.registerDevice")}
                   className="w-full md:w-auto"
-                  disabled={!shouldFetchPubKey || publicKey == undefined}
+                  disabled={
+                    !("Notification" in window) ||
+                    !window.isSecureContext ||
+                    !shouldFetchPubKey ||
+                    publicKey == undefined
+                  }
                   onClick={() => {
                     if (registration == null) {
                       Notification.requestPermission().then((permission) => {
@@ -729,6 +758,156 @@ export default function NotificationsSettingsExtras({
         </div>
       </div>
     </div>
+  );
+}
+
+function NotificationProviderCards({
+  config,
+  formContext,
+  status,
+  onTestComplete,
+}: {
+  config: FrigateConfig;
+  formContext?: SectionRendererProps["formContext"];
+  status?: Record<string, ProviderStatus>;
+  onTestComplete: () => void;
+}) {
+  const { t } = useTranslation(["views/settings"]);
+  const providers = ["webpush", "telegram", "zalo"] as const;
+  const providerNames = {
+    webpush: t("notification.providers.names.webpush"),
+    telegram: t("notification.providers.names.telegram"),
+    zalo: t("notification.providers.names.zalo"),
+  };
+  const pendingProviders = ((formContext?.formData as JsonObject | undefined)
+    ?.providers ?? {}) as Record<string, { enabled?: boolean }>;
+
+  const setProviderEnabled = (
+    provider: (typeof providers)[number],
+    enabled: boolean,
+  ) => {
+    if (!formContext?.onFormDataChange) {
+      return;
+    }
+    const nextData = cloneDeep(
+      ((formContext.formData as JsonObject | undefined) ??
+        (config.notifications as JsonObject)) as JsonObject,
+    );
+    set(nextData, `providers.${provider}.enabled`, enabled);
+    formContext.onFormDataChange(nextData as ConfigSectionData);
+  };
+
+  const sendTest = async (
+    provider: (typeof providers)[number],
+    recipientId = "",
+  ) => {
+    try {
+      await axios.post(`notifications/providers/${provider}/test`, {
+        recipient_id: recipientId,
+      });
+      toast.success(t("notification.providers.testQueued"));
+      onTestComplete();
+    } catch {
+      toast.error(t("notification.providers.testFailed"));
+    }
+  };
+
+  return (
+    <SettingsGroupCard title={t("notification.providers.title")}>
+      <div className="grid gap-4 lg:grid-cols-3">
+        {providers.map((provider) => {
+          const providerConfig = config.notifications.providers?.[provider];
+          const providerState = status?.[provider];
+          const recipients =
+            providerConfig &&
+            provider !== "webpush" &&
+            "recipients" in providerConfig
+              ? providerConfig.recipients
+              : [];
+          return (
+            <div
+              key={provider}
+              className="space-y-3 rounded-lg bg-secondary p-4"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-medium">{providerNames[provider]}</div>
+                <div
+                  className={cn(
+                    "text-xs font-medium uppercase",
+                    providerState?.readiness === "ready"
+                      ? "text-success"
+                      : providerState?.readiness === "degraded"
+                        ? "text-warning"
+                        : "text-danger",
+                  )}
+                >
+                  {providerState?.readiness ??
+                    t("notification.providers.loading")}
+                </div>
+              </div>
+              <div className="text-sm text-primary-variant">
+                {t("notification.providers.pending", {
+                  count: providerState?.pending ?? 0,
+                })}
+              </div>
+              <FilterSwitch
+                label={t("notification.providers.enabled")}
+                isChecked={
+                  pendingProviders[provider]?.enabled ??
+                  providerConfig?.enabled ??
+                  false
+                }
+                onCheckedChange={(checked) =>
+                  setProviderEnabled(provider, checked)
+                }
+              />
+              {provider === "zalo" &&
+                !config.notifications.providers?.zalo?.public_base_url && (
+                  <div className="text-xs text-warning">
+                    {t("notification.providers.zaloDegraded")}
+                  </div>
+                )}
+              {provider === "webpush" ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={!providerState?.configured}
+                  onClick={() => sendTest(provider)}
+                >
+                  {t("notification.providers.test")}
+                </Button>
+              ) : (
+                <div className="space-y-2">
+                  {recipients.map((recipient) => (
+                    <div
+                      key={recipient.id}
+                      className="flex items-center justify-between gap-2 text-sm"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate">{recipient.name}</div>
+                        <div className="truncate text-xs text-primary-variant">
+                          {recipient.chat_id}
+                        </div>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={
+                          !recipient.enabled || !providerState?.configured
+                        }
+                        onClick={() => sendTest(provider, recipient.id)}
+                      >
+                        {t("notification.providers.test")}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </SettingsGroupCard>
   );
 }
 

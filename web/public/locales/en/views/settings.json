@@ -1176,6 +1176,23 @@
       "desc": "Select which cameras to enable notifications for."
     },
     "deviceSpecific": "Device Specific Settings",
+    "providers": {
+      "title": "Notification Providers",
+      "enabled": "Enabled",
+      "names": {
+        "webpush": "WebPush",
+        "telegram": "Telegram",
+        "zalo": "Zalo"
+      },
+      "loading": "Loading",
+      "pending": "{{count}} pending",
+      "test": "Test",
+      "testQueued": "Test notification queued.",
+      "testFailed": "Unable to queue the test notification.",
+      "zaloDegraded": "No public base URL is configured. Zalo will send text and links without a snapshot.",
+      "pending_one": "{{count}} pending",
+      "pending_other": "{{count}} pending"
+    },
     "registerDevice": "Register This Device",
     "unregisterDevice": "Unregister This Device",
     "sendTestNotification": "Send a test notification",

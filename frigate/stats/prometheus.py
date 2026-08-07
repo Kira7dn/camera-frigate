@@ -10,6 +10,8 @@ from prometheus_client.core import (
     InfoMetricFamily,
 )
 
+from frigate.notifications.metrics import snapshot as notification_metrics_snapshot
+
 
 class CustomCollector:
     def __init__(self, _url):
@@ -485,6 +487,40 @@ class CustomCollector:
                 )
 
         yield camera_events
+
+        notification_deliveries = CounterMetricFamily(
+            "frigate_notification_deliveries",
+            "Notification delivery outcomes since Frigate started",
+            labels=["provider", "outcome"],
+        )
+        notification_queue_depth = GaugeMetricFamily(
+            "frigate_notification_queue_depth",
+            "Pending notification outbox deliveries",
+            labels=["provider"],
+        )
+        notification_latency = CounterMetricFamily(
+            "frigate_notification_delivery_latency_seconds",
+            "Total notification provider request latency",
+            labels=["provider"],
+        )
+        for provider, provider_metrics in notification_metrics_snapshot().items():
+            for outcome, value in provider_metrics.items():
+                if outcome in (
+                    "latency_seconds_total",
+                    "latency_count",
+                    "queue_depth",
+                ):
+                    continue
+                notification_deliveries.add_metric([provider, outcome], value)
+            notification_queue_depth.add_metric(
+                [provider], provider_metrics.get("queue_depth", 0)
+            )
+            notification_latency.add_metric(
+                [provider], provider_metrics.get("latency_seconds_total", 0)
+            )
+        yield notification_deliveries
+        yield notification_queue_depth
+        yield notification_latency
 
 
 collector = CustomCollector(None)

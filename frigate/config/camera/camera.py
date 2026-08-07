@@ -30,7 +30,7 @@ from .ffmpeg import CameraFfmpegConfig, CameraInput
 from .live import CameraLiveConfig
 from .motion import MotionConfig
 from .mqtt import CameraMqttConfig
-from .notification import NotificationConfig
+from .notification import CameraNotificationConfig
 from .objects import ObjectConfig
 from .onvif import OnvifConfig
 from .profile import CameraProfileConfig
@@ -159,8 +159,8 @@ class CameraConfig(FrigateBaseModel):
         title="MQTT",
         description="MQTT image publishing settings.",
     )
-    notifications: NotificationConfig = Field(
-        default_factory=NotificationConfig,
+    notifications: CameraNotificationConfig = Field(
+        default_factory=CameraNotificationConfig,
         title="Notifications",
         description="Settings to enable and control notifications for this camera.",
     )

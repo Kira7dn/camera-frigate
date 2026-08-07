@@ -9,7 +9,7 @@ from .audio import AudioConfig
 from .birdseye import BirdseyeCameraConfig
 from .detect import DetectConfig
 from .motion import MotionConfig
-from .notification import NotificationConfig
+from .notification import CameraNotificationConfig
 from .objects import ObjectConfig
 from .record import RecordConfig
 from .review import ReviewConfig
@@ -34,7 +34,7 @@ class CameraProfileConfig(FrigateBaseModel):
     face_recognition: CameraFaceRecognitionConfig | None = None
     lpr: CameraLicensePlateRecognitionConfig | None = None
     motion: MotionConfig | None = None
-    notifications: NotificationConfig | None = None
+    notifications: CameraNotificationConfig | None = None
     objects: ObjectConfig | None = None
     record: RecordConfig | None = None
     review: ReviewConfig | None = None

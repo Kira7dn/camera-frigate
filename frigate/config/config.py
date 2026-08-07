@@ -262,7 +262,8 @@ class RuntimeDeploymentConfig(FrigateBaseModel):
 
     image: str = "camera-frigate:0.18.0-33c00a27e-runtime3-reviewfix1-tensorrt"
     build_base_image: str = "camera-frigate:0.18.0-33c00a27e-runtime3-tensorrt"
-    cpu_limit: float = Field(default=4, gt=0, le=8)
+    # The launcher validates this against Docker's exposed CPU capacity.
+    cpu_limit: float = Field(default=4, gt=0)
     model_path: str = "models/yolov9-t-320.onnx"
     config_dir: str = "runtime/config"
     media_dir: str = "runtime/media"
@@ -803,6 +804,9 @@ class FrigateConfig(FrigateBaseModel):
                 "face_recognition": ["enabled", "min_area"],
                 "lpr": ["enabled", "expire_time", "min_area", "enhancement"],
                 "audio_transcription": ["enabled", "live_enabled"],
+                # Provider credentials and recipient lists are global-only.
+                # Cameras inherit policy but default to webpush selection.
+                "notifications": ["enabled", "cooldown"],
             }
 
             for section in allowed_fields_map:

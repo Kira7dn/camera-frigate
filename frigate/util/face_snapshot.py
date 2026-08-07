@@ -335,7 +335,15 @@ class LatestPerObjectWorker:
                     self._condition.wait()
                 if self._stopping:
                     return
-                if self._control and (not self._pending or not self._last_was_control):
+                conflicting_key = self._conflicting_pending_key()
+                if conflicting_key is not None:
+                    key = conflicting_key
+                    job = self._pending.pop(key)
+                    self._active_key = key
+                    self._last_was_control = False
+                elif self._control and (
+                    not self._pending or not self._last_was_control
+                ):
                     key = None
                     job = self._control.popleft()
                     self._last_was_control = True
@@ -358,6 +366,20 @@ class LatestPerObjectWorker:
                     self._counters["committed"] += 1
                 if key is not None:
                     self._active_key = None
+
+    def _conflicting_pending_key(self) -> FaceTrackKey | None:
+        """Return a commit that must run before the next artifact cleanup."""
+        if not self._control or not isinstance(self._control[0], CleanupJob):
+            return None
+        cleanup_paths = {
+            os.path.abspath(path) for path in self._control[0].paths if path
+        }
+        for key, pending in self._pending.items():
+            if not isinstance(pending, SnapshotCommitJob):
+                continue
+            if os.path.abspath(pending.result.artifact_path) in cleanup_paths:
+                return key
+        return None
 
     def _drop(self, job: Any) -> None:
         try:

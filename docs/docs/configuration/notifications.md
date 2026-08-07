@@ -9,7 +9,10 @@ import NavPath from "@site/src/components/NavPath";
 
 # Notifications
 
-Frigate offers native notifications using the [WebPush Protocol](https://web.dev/articles/push-notifications-web-push-protocol) which uses the [VAPID spec](https://tools.ietf.org/html/draft-thomson-webpush-vapid) to deliver notifications to web apps using encryption.
+Frigate offers native notifications through WebPush, Telegram, and Zalo. All
+providers use the same camera enablement, cooldown, and suspension policy.
+WebPush uses the [WebPush Protocol](https://web.dev/articles/push-notifications-web-push-protocol)
+and [VAPID spec](https://tools.ietf.org/html/draft-thomson-webpush-vapid).
 
 :::info
 
@@ -51,9 +54,34 @@ Notifications will be prevented if either:
 
 ```yaml
 notifications:
-  enabled: True
+  enabled: true
   email: "johndoe@gmail.com"
   cooldown: 10 # wait 10 seconds before sending another notification from any camera
+  providers:
+    webpush:
+      enabled: true
+    telegram:
+      enabled: true
+      recipients:
+        - id: security_team
+          name: Security Team
+          chat_id: "-100123456789"
+          cameras: [doorbell]
+    zalo:
+      enabled: true
+      public_base_url: https://camera.example.com
+      media_url_ttl: 300
+      recipients:
+        - id: operators
+          name: Operators
+          chat_id: "123456789"
+          cameras: [doorbell]
+  delivery:
+    max_attempts: 5
+    initial_backoff: 5
+    max_backoff: 300
+    retention_days: 7
+    max_pending: 5000
 ```
 
 </TabItem>
@@ -78,10 +106,27 @@ cameras:
     notifications:
       enabled: True
       cooldown: 30 # wait 30 seconds before sending another notification from the doorbell camera
+      providers: [webpush, telegram, zalo]
 ```
 
 </TabItem>
 </ConfigTabs>
+
+If `providers` is omitted for a camera, only WebPush is selected. An empty
+recipient `cameras` list grants that recipient all notification-enabled cameras.
+Provider and recipient enablement must also be on.
+
+Telegram and Zalo tokens are secrets and are never stored in YAML. Set them in
+the Frigate process environment:
+
+```dotenv
+FRIGATE_TELEGRAM_BOT_TOKEN=
+FRIGATE_ZALO_BOT_TOKEN=
+```
+
+Telegram uploads event snapshots directly. Zalo receives a short-lived signed
+snapshot URL. Without `public_base_url`, Zalo remains available in degraded
+text/link mode.
 
 ### Registration
 
@@ -89,7 +134,9 @@ Once notifications are enabled, press the `Register for Notifications` button on
 
 ## Supported Notifications
 
-Currently notifications are only supported for review alerts. More notifications will be supported in the future.
+Native notifications support review alerts, semantic triggers, camera monitoring
+alerts, test notifications, and finalized car events with a recognized license
+plate.
 
 :::note
 

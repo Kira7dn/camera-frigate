@@ -139,7 +139,8 @@ export interface CameraConfig {
   name: string;
   notifications: {
     enabled: boolean;
-    email?: string;
+    cooldown: number;
+    providers: ("webpush" | "telegram" | "zalo")[];
     enabled_in_config: boolean;
   };
   objects: {
@@ -394,6 +395,19 @@ export type GenAIAgentConfig = {
   runtime_options?: Record<string, unknown>;
 };
 
+export type NotificationRecipientConfig = {
+  id: string;
+  name: string;
+  chat_id: string;
+  enabled: boolean;
+  cameras: string[];
+};
+
+export type NotificationSocialProviderConfig = {
+  enabled: boolean;
+  recipients: NotificationRecipientConfig[];
+};
+
 export interface FrigateConfig {
   version: string;
   safe_mode: boolean;
@@ -555,6 +569,22 @@ export interface FrigateConfig {
   notifications: {
     enabled: boolean;
     email?: string;
+    cooldown: number;
+    providers: {
+      webpush: { enabled: boolean };
+      telegram: NotificationSocialProviderConfig;
+      zalo: NotificationSocialProviderConfig & {
+        public_base_url?: string | null;
+        media_url_ttl: number;
+      };
+    };
+    delivery: {
+      max_attempts: number;
+      initial_backoff: number;
+      max_backoff: number;
+      retention_days: number;
+      max_pending: number;
+    };
     enabled_in_config: boolean;
   };
 

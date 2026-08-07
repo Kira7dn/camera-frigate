@@ -4,7 +4,7 @@ const notifications: SectionConfigOverrides = {
   base: {
     sectionDocs: "/configuration/notifications",
     restartRequired: [],
-    fieldOrder: ["enabled", "email"],
+    fieldOrder: ["enabled", "email", "providers", "delivery"],
     fieldGroups: {},
     hiddenFields: ["enabled_in_config"],
     advancedFields: [],
@@ -20,6 +20,10 @@ const notifications: SectionConfigOverrides = {
   },
   camera: {
     hiddenFields: ["enabled_in_config", "email"],
+    fieldOrder: ["enabled", "cooldown", "providers"],
+    uiSchema: {
+      providers: { "ui:widget": "checkboxes" },
+    },
   },
 };
 

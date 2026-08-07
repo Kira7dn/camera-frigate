@@ -26,18 +26,15 @@ cameras: {}
     assert config.runtime.integrations.enabled is True
 
 
-def test_runtime_cpu_limit_is_bounded() -> None:
-    try:
-        FrigateConfig.parse_yaml(
-            """
+def test_runtime_cpu_limit_above_eight_is_accepted() -> None:
+    config = FrigateConfig.parse_yaml(
+        """
 mqtt:
   enabled: false
 runtime:
-  cpu_limit: 9
+  cpu_limit: 10
 cameras: {}
 """
-        )
-    except ValueError as error:
-        assert "cpu_limit" in str(error)
-    else:
-        raise AssertionError("runtime.cpu_limit above eight must be rejected")
+    )
+
+    assert config.runtime.cpu_limit == 10

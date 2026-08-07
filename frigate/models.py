@@ -177,3 +177,27 @@ class Trigger(Model):
 
     class Meta:
         primary_key = CompositeKey("camera", "name")
+
+
+class NotificationDelivery(Model):
+    """Durable social notification outbox entry."""
+
+    id = CharField(null=False, primary_key=True, max_length=36)
+    provider = CharField(null=False, max_length=20, index=True)
+    recipient_id = CharField(null=False, max_length=64)
+    source_type = CharField(null=False, max_length=30)
+    source_id = CharField(null=False, max_length=64)
+    payload = JSONField()
+    status = CharField(null=False, max_length=20, default="pending", index=True)
+    attempts = IntegerField(null=False, default=0)
+    next_attempt = DateTimeField(null=False, index=True)
+    created_at = DateTimeField(null=False)
+    updated_at = DateTimeField(null=False)
+    completed_at = DateTimeField(null=True)
+    last_error = TextField(null=True)
+
+    class Meta:
+        table_name = "notification_delivery"
+        indexes = (
+            (("provider", "recipient_id", "source_type", "source_id"), True),
+        )
