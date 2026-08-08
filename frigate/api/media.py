@@ -254,6 +254,7 @@ async def latest_frame(
 
         headers = {
             "Cache-Control": "no-store" if not params.store else "private, max-age=60",
+            "X-Frame-Time": str(frame_processor.get_current_frame_time(camera_name)),
         }
 
         if is_offline:

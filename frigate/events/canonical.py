@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import logging
 import os
 import threading
 import uuid
@@ -31,6 +32,8 @@ from frigate.models import (
 RENDER_VERSION = 1
 OBSERVATION_RETENTION_DAYS = 2
 DEFAULT_ARTIFACT_RETENTION_DAYS = 30
+
+logger = logging.getLogger(__name__)
 
 
 class EvidenceMismatch(ValueError):
@@ -441,9 +444,16 @@ class EventAggregator:
         if chosen_evidence:
             evidence = EventEvidence.get_or_none(EventEvidence.id == chosen_evidence)
             if evidence:
-                artifact = self.media.materialize(
-                    RenderSpec(event_id, revision, chosen_evidence), evidence, label
-                )
+                try:
+                    artifact = self.media.materialize(
+                        RenderSpec(event_id, revision, chosen_evidence), evidence, label
+                    )
+                except FileNotFoundError:
+                    logger.warning(
+                        "Canonical evidence file is missing for event %s: %s",
+                        event_id,
+                        evidence.frame_ref,
+                    )
         Event.update(
             state="FINALIZED",
             finalized_at=utcnow(),

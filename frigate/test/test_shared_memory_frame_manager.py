@@ -137,13 +137,13 @@ class TestSharedMemoryFrameManagerGetRecreatesLargerSegment(unittest.TestCase):
     def test_segment_grows_then_get_succeeds(self) -> None:
         manager = SharedMemoryFrameManager()
 
-        # Phase 1: existing camera at 320x240 YUV — 320 * 240 * 1.5 = 115_200
+        # Initial allocation: existing camera at 320x240 YUV — 320 * 240 * 1.5 = 115_200
         small = _fake_shm(size=115_200)
         manager.shm_store["cam_frame0"] = small
         arr_small = np.ndarray((360, 320), dtype=np.uint8, buffer=small.buf)
         self.assertEqual(arr_small.shape, (360, 320))
 
-        # Phase 2: restart at 1920x1080 — new SHM segment, larger size.
+        # Restart allocation: 1920x1080 — new SHM segment, larger size.
         large = _fake_shm(size=3_110_400)
         with patch("frigate.util.image.UntrackedSharedMemory", return_value=large):
             arr_large = manager.get("cam_frame0", (1620, 1920))

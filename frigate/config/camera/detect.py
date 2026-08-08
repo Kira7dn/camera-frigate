@@ -69,7 +69,7 @@ class DetectConfig(FrigateBaseModel):
         default=None,
         title="Minimum initialization frames",
         description="Number of consecutive detection hits required before creating a tracked object. Increase to reduce false initializations. Default value is fps divided by 2.",
-        ge=2,
+        ge=1,
     )
     max_disappeared: int | None = Field(
         default=None,

@@ -190,6 +190,26 @@ def test_restart_preserves_enrichment_and_late_identity_creates_revision(canonic
     assert MediaArtifact.get_by_id(first_artifact).sha256
 
 
+def test_missing_evidence_file_does_not_abort_finalization(canonical_db):
+    _, root = canonical_db
+    event = create_event("event-missing-evidence")
+    aggregator = EventAggregator(CanonicalMediaStore(root / "artifacts"), 0)
+    evidence = create_evidence(aggregator, root, event.id, "frame-missing")
+    Path(evidence.frame_ref).unlink()
+    aggregator.observe(
+        observation_id="end-missing",
+        event_id=event.id,
+        kind="event_ended",
+        payload={},
+        observed_at=datetime.datetime.now(datetime.UTC) - datetime.timedelta(seconds=1),
+    )
+
+    assert aggregator.finalize_due() == [event.id]
+    event = Event.get_by_id(event.id)
+    assert event.state == "FINALIZED"
+    assert event.canonical_artifact_id is None
+
+
 def test_pending_delivery_protects_expired_artifact(canonical_db):
     _, root = canonical_db
     store = CanonicalMediaStore(root / "artifacts")

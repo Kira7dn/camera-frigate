@@ -45,6 +45,7 @@ from frigate.util.face_snapshot import (
     write_face_snapshot_artifact,
 )
 from frigate.util.image import area
+from frigate.util.passage_trace import passage_trace
 
 from ..types import DataProcessorMetrics
 from .api import RealTimeProcessorApi
@@ -499,6 +500,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             created_monotonic=time.monotonic(),
             quality=float(obj_data.get("area", area(person_box))),
         )
+        passage_trace(
+            "first_qualified_face",
+            camera=camera,
+            frame_time=frame_time,
+            track_id=str(event_id),
+            generation=state.generation,
+            person_box=list(person_box),
+            face_box=list(attribute_face_box) if attribute_face_box else None,
+        )
         state.last_attempt_time = frame_time
         if state.first_attempt_monotonic == 0:
             state.first_attempt_monotonic = request.created_monotonic
@@ -508,6 +518,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         accepted = self.face_pipeline.submit(request)
         if accepted:
             self.face_counters["candidate_submitted"] += 1
+            passage_trace("candidate_submitted", camera=camera, frame_time=frame_time, track_id=str(event_id), generation=state.generation, identity=obj_data.get("sub_label") or "unknown", person_box=list(person_box))
         return accepted
 
     def __next_track_generation(self) -> int:
@@ -984,6 +995,18 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 ) * 1000
                 self.face_counters["confirmed_ms_total"] += int(confirmed_ms)
                 self.face_latency_samples["confirmed_ms"].append(confirmed_ms)
+                passage_trace(
+                    "confirmed_result",
+                    camera=request.camera,
+                    frame_time=request.frame_time,
+                    track_id=str(request.event_id),
+                    generation=request.generation,
+                    identity=weighted_sub_label,
+                    score=weighted_score,
+                    bbox=list(candidate.face_box),
+                    person_box=list(request.person_box),
+                    confirmed_ms=confirmed_ms,
+                )
             else:
                 self.face_counters["face_snapshot_rejected"] += 1
 
@@ -1001,6 +1024,19 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.face_latency_samples["embedding_ms"].append(outcome.embedding_ms)
         self.face_latency_samples["end_to_end_ms"].append(end_to_end_ms)
         if not state.first_attempt_completed:
+            passage_trace(
+                "first_attempt",
+                camera=request.camera,
+                frame_time=request.frame_time,
+                track_id=str(request.event_id),
+                generation=request.generation,
+                identity=sub_label,
+                score=score,
+                person_box=list(request.person_box),
+                face_box=list(candidate.face_box),
+                first_attempt_ms=end_to_end_ms,
+                embedding_ms=outcome.embedding_ms,
+            )
             state.first_attempt_completed = True
             self.face_counters["first_attempt_count"] += 1
             self.face_counters["first_attempt_ms_total"] += int(end_to_end_ms)

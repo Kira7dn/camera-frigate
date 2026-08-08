@@ -35,6 +35,7 @@ from frigate.embeddings.onnx.lpr_embedding import LPR_EMBEDDING_SIZE
 from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.image import area
+from frigate.util.passage_trace import passage_trace
 
 from ...types import DataProcessorMetrics
 
@@ -1152,21 +1153,36 @@ class LicensePlateProcessingMixin:
                 f"  Cluster {j + 1}: size {cluster_size}, max conf {max_conf:.3f}, variants: {sample_variants}{'...' if cluster_size > 3 else ''}"
             )
 
-        # Best cluster: largest size, tiebroken by max conf
-        def cluster_score(c: list[dict[str, Any]]) -> tuple[int, float]:
-            return (len(c), max(v["conf"] for v in c))
+        # Support is primary; use character confidence and text area to choose
+        # the representative. A one-frame high OCR score must not replace a
+        # repeatedly observed, clearer reading.
+        def cluster_score(c: list[dict[str, Any]]) -> tuple[int, float, float, float]:
+            char_conf = sum(
+                sum(float(value) for value in v.get("char_confidences", []))
+                / max(1, len(v.get("char_confidences", [])))
+                for v in c
+            ) / len(c)
+            area_score = sum(float(v.get("area", 0)) for v in c) / len(c)
+            return (len(c), char_conf, max(v["conf"] for v in c), area_score)
 
         best_cluster_idx = max(
             range(len(clusters)), key=lambda j: cluster_score(clusters[j])
         )
         best_cluster = clusters[best_cluster_idx]
-        best_size, best_max_conf = cluster_score(best_cluster)
+        best_size, best_char_conf, best_max_conf, best_area = cluster_score(best_cluster)
         logger.debug(
             f"  Selected best cluster {best_cluster_idx + 1}: size {best_size}, max conf {best_max_conf:.3f}"
         )
 
-        # Rep: highest conf in best cluster
-        rep = max(best_cluster, key=lambda v: v["conf"])
+        rep = max(
+            best_cluster,
+            key=lambda v: (
+                sum(float(value) for value in v.get("char_confidences", []))
+                / max(1, len(v.get("char_confidences", []))),
+                float(v.get("area", 0)),
+                float(v["conf"]),
+            ),
+        )
         logger.debug(
             f"  Selected rep from best cluster: '{rep['plate']}' (conf: {rep['conf']:.3f})"
         )
@@ -1214,6 +1230,14 @@ class LicensePlateProcessingMixin:
         if not self.config.cameras[camera].lpr.enabled:
             return
 
+        passage_trace(
+            "track_seen",
+            camera=camera,
+            frame_time=current_time,
+            track_id=None if dedicated_lpr else str(obj_data.get("id")),
+            object_box=None if dedicated_lpr else obj_data.get("box"),
+        )
+
         # dedicated LPR cam without frigate+
         if dedicated_lpr:
             id = "dedicated-lpr"
@@ -1252,6 +1276,7 @@ class LicensePlateProcessingMixin:
                 return
 
             plate_box = license_plate
+            passage_trace("plate_detected", camera=camera, frame_time=current_time, track_id=str(id), plate_box=plate_box, object_box=None if dedicated_lpr else obj_data.get("box"))
 
             license_plate_frame = rgb[
                 license_plate[1] : license_plate[3],
@@ -1280,16 +1305,11 @@ class LicensePlateProcessingMixin:
                 )
                 return
 
-            # don't run for non-stationary objects with no position changes to avoid processing uncertain moving objects
-            # zero position_changes is the initial state after registering a new tracked object
-            # LPR will run 2 frames after detect.min_initialized is reached
-            if obj_data.get("position_changes", 0) == 0 and not obj_data.get(
-                "stationary", False
-            ):
-                logger.debug(
-                    f"{camera}: Skipping LPR for non-stationary {obj_data['label']} object {id} with no position changes.  (Detected in {self.config.cameras[camera].detect.min_initialized + 1} concurrent frames, threshold to run is {self.config.cameras[camera].detect.min_initialized + 2} frames)"  # type: ignore[operator]
-                )
-                return
+            # A newly initialized track is already a valid passage candidate.
+            # Waiting for position_changes discarded slow/near-stationary vehicles
+            # before the first plate detector call. Stationary timeout below still
+            # bounds repeated scans.
+            passage_trace("lpr_eligible", camera=camera, frame_time=current_time, track_id=str(id), object_box=obj_data.get("box"))
 
             # run for stationary objects for a limited time after they become stationary
             if obj_data.get("stationary") == True:
@@ -1330,6 +1350,12 @@ class LicensePlateProcessingMixin:
                 rgb[self.config.cameras[camera].motion.rasterized_mask == 0] = [0, 0, 0]  # type: ignore[attr-defined]
 
                 left, top, right, bottom = car_box
+                width = right - left
+                height = bottom - top
+                left = max(0, int(left - width * 0.05))
+                top = max(0, int(top - height * 0.05))
+                right = min(rgb.shape[1], int(right + width * 0.05))
+                bottom = min(rgb.shape[0], int(bottom + height * 0.10))
                 car = rgb[top:bottom, left:right]
 
                 # double the size of the car for better box detection
@@ -1382,11 +1408,20 @@ class LicensePlateProcessingMixin:
                     left + plate_box_in_car[2],
                     top + plate_box_in_car[3],
                 )
+                passage_trace("plate_detected", camera=camera, frame_time=current_time, track_id=str(id), plate_box=plate_box, object_box=obj_data.get("box"))
 
                 license_plate_frame = car[
                     license_plate[1] : license_plate[3],
                     license_plate[0] : license_plate[2],
                 ]
+                if license_plate_frame.size:
+                    ph, pw = license_plate_frame.shape[:2]
+                    license_plate_frame = cv2.copyMakeBorder(
+                        license_plate_frame,
+                        int(ph * 0.05), int(ph * 0.05),
+                        int(pw * 0.10), int(pw * 0.10),
+                        cv2.BORDER_REPLICATE,
+                    )
             else:
                 # don't run for object without attributes if this isn't dedicated lpr with frigate+
                 if (
@@ -1503,6 +1538,7 @@ class LicensePlateProcessingMixin:
             if top_char_confidences
             else 0
         )
+        passage_trace("ocr_result", camera=camera, frame_time=current_time, track_id=str(id), plate=top_plate, score=avg_confidence, plate_box=plate_box, object_box=None if dedicated_lpr else obj_data.get("box"))
 
         # Check against minimum confidence threshold
         if avg_confidence < self.lpr_config.recognition_threshold:
@@ -1743,6 +1779,7 @@ class LicensePlateProcessingMixin:
             (id, "recognized_license_plate", rep_plate, rep_conf),
             EventMetadataTypeEnum.attribute.value,
         )
+        passage_trace("event_published", camera=camera, frame_time=current_time, track_id=str(id), plate=rep_plate, score=rep_conf, plate_box=plate_box, object_box=None if dedicated_lpr else obj_data.get("box"), evidence_id=evidence_id, frame_ref=str(evidence_path))
 
         # save the best snapshot for dedicated lpr cams not using frigate+
         if (

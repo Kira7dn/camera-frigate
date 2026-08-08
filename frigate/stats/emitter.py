@@ -43,11 +43,15 @@ class StatsEmitter(threading.Thread):
         if len(self.stats_history) > 0:
             return self.stats_history[-1]
         else:
-            stats = stats_snapshot(
+            # Do not cache an on-demand startup snapshot. The API can be
+            # queried before camera processes emit their first frame; caching
+            # that all-zero sample makes readiness consumers see stale values
+            # until the periodic emitter's first collection (up to 25 seconds
+            # later). Return a live snapshot on each request until the emitter
+            # owns the history.
+            return stats_snapshot(
                 self.config, self.stats_tracking, self.hwaccel_errors
             )
-            self.stats_history.append(stats)
-            return stats
 
     def get_stats_history(self, keys: list[str] | None = None) -> list[dict[str, Any]]:
         """Get stats history.

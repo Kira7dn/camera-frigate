@@ -47,6 +47,7 @@ from frigate.util.object import (
     is_object_filtered,
     reduce_detections,
 )
+from frigate.util.passage_trace import passage_trace
 from frigate.util.process import FrigateProcess
 from frigate.util.time import get_tomorrow_at_time
 
@@ -429,6 +430,16 @@ def process_frames(
                 )
 
             consolidated_detections = reduce_detections(frame_shape, detections)
+            for detection in consolidated_detections:
+                if detection[0] in {"car", "person"}:
+                    passage_trace(
+                        "detector_hit",
+                        camera=camera_config.name,
+                        frame_time=frame_time,
+                        label=detection[0],
+                        score=float(detection[1]),
+                        object_box=list(detection[2]),
+                    )
 
             # if detection was run on this frame, consolidate
             if len(regions) > 0:

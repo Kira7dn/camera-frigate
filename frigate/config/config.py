@@ -887,6 +887,14 @@ class FrigateConfig(FrigateBaseModel):
             max_disappeared = camera_config.detect.fps * 5
             if camera_config.detect.max_disappeared is None:
                 camera_config.detect.max_disappeared = max_disappeared
+            if (
+                camera_config.detect.min_initialized
+                >= camera_config.detect.max_disappeared
+            ):
+                raise ValueError(
+                    f"{camera_config.name}.detect.max_disappeared must be greater "
+                    "than detect.min_initialized"
+                )
 
             # Default stationary_threshold configuration
             stationary_threshold = camera_config.detect.fps * 10

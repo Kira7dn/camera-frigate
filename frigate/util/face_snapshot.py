@@ -24,7 +24,9 @@ Box = tuple[int, int, int, int]
 FACE_COMMIT_ROOT = "/media/frigate/.face-commits"
 FACE_EVENT_STAGING_DIR = os.path.join(FACE_COMMIT_ROOT, "staging")
 FACE_COMMIT_JOURNAL_DIR = os.path.join(FACE_COMMIT_ROOT, "journal")
-FACE_PROCESS_INTERVAL = 0.5
+# Use the detector cadence (5 FPS in the passage fixture) while keeping the
+# existing bounded worker and attempt limits.
+FACE_PROCESS_INTERVAL = 0.2
 EXCLUDED_FACE_DIRECTORIES = frozenset({"train", "events", "staging", "face-events"})
 _LEGACY_ARTIFACT = re.compile(r"^.+-.+-\d+(?:\.\d+)?\.webp(?:\.tmp-\d+-\d+\.webp)?$")
 _FACE_ATTEMPT_IMAGE_EXTENSIONS = frozenset({".webp", ".png", ".jpg", ".jpeg"})
