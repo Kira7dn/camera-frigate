@@ -1,5 +1,7 @@
 """Tests for bounded multi-camera face capture and ArcFace batching."""
 
+# ruff: noqa: I001
+
 import threading
 import time
 import unittest
@@ -10,35 +12,79 @@ import cv2
 import numpy as np
 
 from frigate.embeddings.maintainer import EmbeddingMaintainer  # noqa: F401
+from frigate.data_processing.common.evidence import (
+    EvidenceBufferPolicy,
+    EvidenceCandidate,
+    EvidenceRingBuffer,
+)
 from frigate.data_processing.common.face.model import ArcFaceRecognizer
 from frigate.data_processing.common.face.pipeline import (
-    FaceCaptureRequest,
     FaceCandidate,
+    FaceCaptureRequest,
     FaceRecognitionPipeline,
     LatestFaceCandidateStore,
     PreparedFaceCandidate,
     crop_yuv_region_to_bgr,
 )
+from frigate.data_processing.common.quality import QualitySelector, QualityThresholds
 from frigate.detectors.detection_runners import CudaGraphRunner
 from frigate.embeddings.onnx.face_embedding import ArcfaceEmbedding
 from frigate.embeddings.types import EnrichmentModelTypeEnum
 
 
-def request(camera: str, event_id: str, frame_time: float = 1.0) -> FaceCaptureRequest:
+def request(
+    camera: str,
+    event_id: str,
+    frame_time: float = 1.0,
+    ring: EvidenceRingBuffer | None = None,
+    yuv_frame: np.ndarray | None = None,
+) -> FaceCaptureRequest:
+    ring = ring or EvidenceRingBuffer(
+        {camera: EvidenceBufferPolicy(3.0, 8 * 1024 * 1024, 100.0)}
+    )
+    yuv_frame = yuv_frame if yuv_frame is not None else np.zeros((6, 4), dtype=np.uint8)
+    ref = ring.ingest(camera, "detect", event_id, frame_time, yuv_frame)
+    if ref is None:
+        raise AssertionError("test evidence ingest failed")
+    lease = ring.acquire(ref)
+    if lease is None:
+        raise AssertionError("test evidence lease failed")
     return FaceCaptureRequest(
         camera=camera,
         event_id=event_id,
         frame_time=frame_time,
         generation=0,
         person_box=(0, 0, 4, 4),
-        yuv_frame=np.zeros((6, 4), dtype=np.uint8),
+        evidence_lease=lease,
         detection_threshold=0.5,
         min_area=1,
         requires_face_detection=True,
         attribute_face_box=None,
         vote_count=0,
         created_monotonic=time.monotonic(),
+        quality_enabled=False,
+        quality_thresholds=QualityThresholds(1, 1, 0, 1, 1),
+        top_k=3,
         quality=frame_time,
+    )
+
+
+def evidence(item: FaceCaptureRequest) -> EvidenceCandidate:
+    return EvidenceCandidate(
+        "candidate",
+        "face",
+        item.camera,
+        item.event_id,
+        item.generation,
+        item.evidence_lease.ref,
+        item.person_box,
+        (0, 0, 4, 4),
+        1.0,
+        {"dimensions": 1.0},
+        (),
+        (),
+        item.evidence_lease.ref.source_role,
+        item.evidence_lease.fork(),
     )
 
 
@@ -90,7 +136,9 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
         self.assertEqual(len(second), 4)
         self.assertEqual(len({item.camera for item in first}), 4)
         self.assertEqual(len({item.camera for item in second}), 4)
-        self.assertEqual({item.camera for item in first + second}, {f"cam-{i}" for i in range(8)})
+        self.assertEqual(
+            {item.camera for item in first + second}, {f"cam-{i}" for i in range(8)}
+        )
         self.assertTrue(all(item.vote_count == 0 for item in first + second))
 
     def test_prepared_candidate_flushes_once_after_100ms(self) -> None:
@@ -101,6 +149,7 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
             np.zeros((4, 4, 3), dtype=np.uint8),
             1.0,
             16.0,
+            evidence(item),
         )
         prepared = PreparedFaceCandidate(
             candidate,
@@ -138,9 +187,7 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
 
     def test_dynamic_arcface_batch_does_not_use_fixed_cuda_graph_buffers(self) -> None:
         self.assertFalse(
-            CudaGraphRunner.is_model_supported(
-                EnrichmentModelTypeEnum.arcface.value
-            )
+            CudaGraphRunner.is_model_supported(EnrichmentModelTypeEnum.arcface.value)
         )
 
     def test_arcface_batch_preserves_order_and_library_swap_is_atomic(self) -> None:
@@ -153,6 +200,7 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
             np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
             1,
         )
+
         class Embedder:
             def embed_preprocessed(self, images):
                 return [
@@ -210,16 +258,24 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
                 return [("alice", 0.9) for _ in prepared]
 
         recognizer = Recognizer()
-        pipeline = FaceRecognitionPipeline(recognizer, detector_factory=Detector)
+        ring = EvidenceRingBuffer(
+            {
+                f"cam-{camera}": EvidenceBufferPolicy(3.0, 8 * 1024 * 1024, 100.0)
+                for camera in range(8)
+            }
+        )
+        selector = QualitySelector(ring)
+        pipeline = FaceRecognitionPipeline(
+            recognizer, detector_factory=Detector, quality_selector=selector
+        )
         try:
             bgr = np.full((16, 16, 3), 127, dtype=np.uint8)
             yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
             for camera in range(8):
-                item = request(f"cam-{camera}", "track")
+                item = request(f"cam-{camera}", "track", ring=ring, yuv_frame=yuv)
                 pipeline.submit(
                     replace(
                         item,
-                        yuv_frame=yuv,
                         person_box=(0, 0, 16, 16),
                         min_area=1,
                     )
@@ -232,13 +288,17 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
             self.assertEqual(len(outcomes), 8)
             self.assertTrue(all(size <= 4 for size in recognizer.batch_sizes))
             self.assertEqual(pipeline.pending_count(), 0)
+            for outcome in outcomes:
+                outcome.candidate.evidence.release()
         finally:
             pipeline.stop()
+            selector.shutdown()
+            ring.close()
 
     def test_hot_path_has_no_full_frame_yuv_to_bgr_conversion(self) -> None:
-        source = (
-            Path(__file__).parents[1] / "embeddings" / "maintainer.py"
-        ).read_text(encoding="utf-8")
+        source = (Path(__file__).parents[1] / "embeddings" / "maintainer.py").read_text(
+            encoding="utf-8"
+        )
         self.assertNotIn("COLOR_YUV2BGR_I420", source)
 
 

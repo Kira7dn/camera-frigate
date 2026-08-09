@@ -7,6 +7,7 @@ import numpy as np
 
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.const import MODEL_CACHE_DIR
+from frigate.data_processing.common.license_plate.constants import LPR_EMBEDDING_SIZE
 from frigate.detectors.detection_runners import BaseModelRunner, get_optimized_runner
 from frigate.embeddings.types import EnrichmentModelTypeEnum
 from frigate.types import ModelStatusTypesEnum
@@ -21,8 +22,6 @@ warnings.filterwarnings(
 )
 
 logger = logging.getLogger(__name__)
-
-LPR_EMBEDDING_SIZE = 256
 
 
 class PaddleOCRDetection(BaseEmbedding):

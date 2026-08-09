@@ -1,8 +1,10 @@
 """Handle post processing for license plate recognition."""
 
+from __future__ import annotations
+
 import datetime
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -16,15 +18,17 @@ from frigate.data_processing.common.license_plate.mixin import (
     WRITE_DEBUG_IMAGES,
     LicensePlateProcessingMixin,
 )
-from frigate.data_processing.common.license_plate.model import (
-    LicensePlateModelRunner,
-)
 from frigate.data_processing.types import PostProcessDataEnum
 from frigate.models import Recordings
 from frigate.util.image import get_image_from_recording
 
 from ..types import DataProcessorMetrics
 from .api import PostProcessorApi
+
+if TYPE_CHECKING:
+    from frigate.data_processing.common.license_plate.model import (
+        LicensePlateModelRunner,
+    )
 
 logger = logging.getLogger(__name__)
 

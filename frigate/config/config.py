@@ -868,6 +868,31 @@ class FrigateConfig(FrigateBaseModel):
                         else DEFAULT_DETECT_DIMENSIONS["height"]
                     )
 
+            # Detect dimensions may have been probed after CameraConfig validation.
+            if (
+                camera_config.quality.enabled
+                and camera_config.quality.buffer.sample_fps > camera_config.detect.fps
+            ):
+                raise ValueError(
+                    f"{camera_config.name}.quality.buffer.sample_fps must be less "
+                    "than or equal to detect.fps"
+                )
+            required_evidence_bytes = (
+                camera_config.detect.width
+                * camera_config.detect.height
+                * 3
+                // 2
+                * camera_config.quality.top_k
+            )
+            if (
+                camera_config.quality.enabled
+                and camera_config.quality.buffer.max_bytes < required_evidence_bytes
+            ):
+                raise ValueError(
+                    f"{camera_config.name}.quality.buffer.max_bytes must hold at "
+                    "least quality.top_k raw I420 detect frames"
+                )
+
             # Warn if detect fps > 10
             if camera_config.detect.fps > 10 and camera_config.type != "lpr":
                 logger.warning(

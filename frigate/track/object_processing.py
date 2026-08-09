@@ -643,7 +643,7 @@ class TrackedObjectProcessor(threading.Thread):
                     "frame_ref": payload["canonical_path"],
                     "person_box": payload["person_box"],
                     "face_box": payload["face_box"],
-                    "evidence_id": payload["transaction_id"],
+                "evidence_id": payload.get("transaction_id", ""),
                 }
             ),
         )

@@ -18,6 +18,7 @@ from frigate.comms.event_metadata_updater import EventMetadataPublisher
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.const import FACE_DIR, MODEL_CACHE_DIR
+from frigate.data_processing.common.evidence import EvidenceRingBuffer, FrameRef
 from frigate.data_processing.common.face.model import (
     ArcFaceRecognizer,
     FaceNetRecognizer,
@@ -28,6 +29,7 @@ from frigate.data_processing.common.face.pipeline import (
     FaceRecognitionOutcome,
     FaceRecognitionPipeline,
 )
+from frigate.data_processing.common.quality import QualitySelector, QualityThresholds
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.face_snapshot import (
     FACE_PROCESS_INTERVAL,
@@ -66,11 +68,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         requestor: InterProcessRequestor,
         sub_label_publisher: EventMetadataPublisher,
         metrics: DataProcessorMetrics,
+        evidence_ring: EvidenceRingBuffer | None = None,
+        quality_selector: QualitySelector | None = None,
     ):
         super().__init__(config, metrics)
         self.face_config = config.face_recognition
         self.requestor = requestor
         self.sub_label_publisher = sub_label_publisher
+        self.evidence_ring = evidence_ring
+        self.quality_selector = quality_selector
         self.face_detector: cv2.FaceDetectorYN | None = None
         self.requires_face_detection = "face" not in self.config.objects.all_objects
         self.face_tracks: dict[tuple[str, str], FaceTrackState] = {}
@@ -150,7 +156,9 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             self.recognizer = ArcFaceRecognizer(self.config)
 
         self.recognizer.build()
-        self.face_pipeline = FaceRecognitionPipeline(self.recognizer)
+        self.face_pipeline = FaceRecognitionPipeline(
+            self.recognizer, quality_selector=self.quality_selector
+        )
         identities, training_images = self.__face_library_stats()
         logger.info(
             "Face recognition initialized model=%s device=%s "
@@ -282,8 +290,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         }
         structured = {
             "candidate_age_ms": round(
-                self.face_counters["candidate_age_ms_total"]
-                / max(1, batch_candidates),
+                self.face_counters["candidate_age_ms_total"] / max(1, batch_candidates),
                 1,
             ),
             "candidate_drops": {
@@ -297,8 +304,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 2,
             ),
             "batch_wait_ms": round(
-                self.face_counters["batch_wait_ms_total"]
-                / max(1, batch_candidates),
+                self.face_counters["batch_wait_ms_total"] / max(1, batch_candidates),
                 1,
             ),
             "batch_wait_ms_p95": latency["batch_wait_ms"][1],
@@ -308,20 +314,17 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 1,
             ),
             "alignment_ms": round(
-                self.face_counters["alignment_ms_total"]
-                / max(1, batch_candidates),
+                self.face_counters["alignment_ms_total"] / max(1, batch_candidates),
                 1,
             ),
             "embedding_ms": round(
-                self.face_counters["embedding_ms_total"]
-                / max(1, batch_candidates),
+                self.face_counters["embedding_ms_total"] / max(1, batch_candidates),
                 1,
             ),
             "embedding_ms_p95": latency["embedding_ms"][1],
             "embedding_ms_max": latency["embedding_ms"][2],
             "end_to_end_ms": round(
-                self.face_counters["candidate_age_ms_total"]
-                / max(1, batch_candidates),
+                self.face_counters["candidate_age_ms_total"] / max(1, batch_candidates),
                 1,
             ),
             "end_to_end_ms_p95": latency["end_to_end_ms"][1],
@@ -399,7 +402,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             round(float(values.max()), 1),
         )
 
-    def submit_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> bool:
+    def submit_frame(self, obj_data: dict[str, Any], frame_ref: FrameRef) -> bool:
         """Conflate one eligible person track into the bounded face pipeline."""
         self.face_counters["frames"] += 1
         self.__log_pipeline_metrics()
@@ -411,6 +414,14 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             or not obj_data.get("box")
         ):
             return False
+        if self.evidence_ring is None or self.quality_selector is None:
+            self.face_counters["evidence_unavailable"] += 1
+            return False
+        evidence_lease = self.evidence_ring.acquire(frame_ref)
+        if evidence_lease is None:
+            self.quality_selector.record_reject("face", "frame_expired")
+            self.face_counters["frame_expired"] += 1
+            return False
 
         event_id = str(obj_data["id"])
         frame_time = float(obj_data["frame_time"])
@@ -420,6 +431,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         if state is not None:
             if frame_time <= state.last_frame_time:
                 self.face_counters["stale_frame_ingest"] += 1
+                evidence_lease.release()
                 return False
             if is_track_discontinuity(
                 state.last_box,
@@ -428,6 +440,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             ):
                 self.face_counters["face_track_discontinuity"] += 1
                 self.face_pipeline.expire(key)
+                self.quality_selector.expire("face", camera, event_id, state.generation)
+                self._release_face_votes(state.votes)
                 state = FaceTrackState(
                     last_frame_time=frame_time,
                     last_box=person_box,
@@ -449,23 +463,29 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             )
             self.face_tracks[key] = state
 
-        if frame_time - state.last_attempt_time < FACE_PROCESS_INTERVAL:
+        if frame_time - state.last_attempt_time <= FACE_PROCESS_INTERVAL + 1e-6:
             self.face_counters["rate_limited"] += 1
+            evidence_lease.release()
             return False
         if state.result_emitted:
             if frame_time - state.last_snapshot_time < 10:
+                evidence_lease.release()
                 return False
             state.result_emitted = False
+            self._release_face_votes(state.votes)
             state.votes.clear()
             state.first_attempt_monotonic = 0.0
             state.first_attempt_completed = False
             state.first_match_monotonic.clear()
             self.face_counters["snapshot_retry"] += 1
         if obj_data.get("sub_label") and not state.votes:
+            evidence_lease.release()
             return False
-        if len(state.votes) >= MAX_FACES_ATTEMPTS_AFTER_REC:
-            if obj_data.get("sub_label") or len(state.votes) >= MAX_FACE_ATTEMPTS:
-                return False
+        if len(state.votes) >= MAX_FACES_ATTEMPTS_AFTER_REC and (
+            obj_data.get("sub_label") or len(state.votes) >= MAX_FACE_ATTEMPTS
+        ):
+            evidence_lease.release()
+            return False
 
         attribute_face_box: tuple[int, int, int, int] | None = None
         if not self.requires_face_detection:
@@ -475,6 +495,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 if attr.get("label") == "face" and attr.get("box")
             ]
             if not faces:
+                evidence_lease.release()
                 return False
             best_face = max(faces, key=lambda attr: float(attr.get("score", 0.0)))
             attribute_face_box = tuple(int(value) for value in best_face["box"])
@@ -483,7 +504,11 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 < self.config.cameras[camera].face_recognition.min_area
             ):
                 self.face_counters["too_small"] += 1
+                evidence_lease.release()
                 return False
+
+        quality_config = self.config.cameras[camera].quality
+        task_quality = quality_config.face
 
         request = FaceCaptureRequest(
             camera=camera,
@@ -491,13 +516,27 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             frame_time=frame_time,
             generation=state.generation,
             person_box=person_box,
-            yuv_frame=frame,
+            evidence_lease=evidence_lease,
             detection_threshold=self.face_config.detection_threshold,
             min_area=self.config.cameras[camera].face_recognition.min_area,
             requires_face_detection=self.requires_face_detection,
             attribute_face_box=attribute_face_box,
             vote_count=len(state.votes),
             created_monotonic=time.monotonic(),
+            quality_enabled=quality_config.enabled,
+            quality_thresholds=QualityThresholds(
+                task_quality.min_detail_width_px,
+                task_quality.min_detail_height_px,
+                task_quality.min_laplacian_variance,
+                task_quality.max_dark_fraction,
+                task_quality.max_bright_fraction,
+            ),
+            top_k=quality_config.top_k,
+            detector_score=(
+                float(best_face.get("score", 0.0))
+                if attribute_face_box is not None
+                else None
+            ),
             quality=float(obj_data.get("area", area(person_box))),
         )
         passage_trace(
@@ -516,9 +555,19 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         if len(state.pending_frame_times) > 4:
             state.pending_frame_times = set(sorted(state.pending_frame_times)[-4:])
         accepted = self.face_pipeline.submit(request)
+        if not accepted:
+            evidence_lease.release()
         if accepted:
             self.face_counters["candidate_submitted"] += 1
-            passage_trace("candidate_submitted", camera=camera, frame_time=frame_time, track_id=str(event_id), generation=state.generation, identity=obj_data.get("sub_label") or "unknown", person_box=list(person_box))
+            passage_trace(
+                "candidate_submitted",
+                camera=camera,
+                frame_time=frame_time,
+                track_id=str(event_id),
+                generation=state.generation,
+                identity=obj_data.get("sub_label") or "unknown",
+                person_box=list(person_box),
+            )
         return accepted
 
     def __next_track_generation(self) -> int:
@@ -595,7 +644,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             )
             self.face_tracks[key] = track_state
 
-        if frame_time - track_state.last_attempt_time < FACE_PROCESS_INTERVAL:
+        if frame_time - track_state.last_attempt_time <= FACE_PROCESS_INTERVAL + 1e-6:
             self.face_counters["rate_limited"] += 1
             return
         track_state.last_attempt_time = frame_time
@@ -912,7 +961,13 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
 
     def expire_object(self, object_id: str, camera: str) -> None:
         key = (camera, object_id)
-        self.face_tracks.pop(key, None)
+        state = self.face_tracks.pop(key, None)
+        if state is not None:
+            self._release_face_votes(getattr(state, "votes", []))
+            if getattr(self, "quality_selector", None) is not None:
+                self.quality_selector.expire(
+                    "face", camera, object_id, getattr(state, "generation", None)
+                )
         if hasattr(self, "face_pipeline"):
             self.face_pipeline.expire(key)
 
@@ -920,7 +975,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         """Reconcile face state with the authoritative active detection set."""
         for key in list(self.face_tracks):
             if key[0] == camera and key[1] not in active_ids:
-                self.face_tracks.pop(key, None)
+                state = self.face_tracks.pop(key, None)
+                if state is not None:
+                    self._release_face_votes(getattr(state, "votes", []))
+                    if getattr(self, "quality_selector", None) is not None and hasattr(
+                        state, "generation"
+                    ):
+                        self.quality_selector.expire(
+                            "face", key[0], key[1], state.generation
+                        )
         if hasattr(self, "face_pipeline"):
             self.face_pipeline.expire_missing(camera, active_ids)
 
@@ -935,6 +998,15 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             or request.frame_time <= state.last_result_frame_time
         ):
             self.face_counters["stale_result"] += 1
+            candidate.evidence.release()
+            return
+        if (
+            self.config.cameras[request.camera].quality.enabled
+            and self.quality_selector is not None
+            and not self.quality_selector.is_selected(candidate.evidence)
+        ):
+            self.face_counters["stale_quality_result"] += 1
+            candidate.evidence.release()
             return
         state.pending_frame_times.discard(request.frame_time)
         state.last_result_frame_time = request.frame_time
@@ -958,8 +1030,34 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             sub_label,
             score,
         )
+        quality_enabled = self.config.cameras[request.camera].quality.enabled
+        active_ids = (
+            self.quality_selector.active_candidate_ids(
+                "face", request.camera, request.event_id, request.generation
+            )
+            if quality_enabled and self.quality_selector is not None
+            else {candidate.evidence.candidate_id}
+        )
+        retained_votes = []
+        for vote in state.votes:
+            if (
+                not quality_enabled
+                or not vote.candidate_id
+                or vote.candidate_id in active_ids
+            ):
+                retained_votes.append(vote)
+            elif vote.candidate is not None:
+                vote.candidate.evidence.release()
+        state.votes = retained_votes
         state.votes.append(
-            FaceVote(sub_label, score, candidate.face_frame.shape[0] * candidate.face_frame.shape[1])
+            FaceVote(
+                sub_label,
+                score,
+                candidate.face_frame.shape[0] * candidate.face_frame.shape[1],
+                candidate.evidence.candidate_id,
+                candidate.evidence.quality_score,
+                candidate,
+            )
         )
         weighted_sub_label, weighted_score = self.weighted_average(state.votes)
         if weighted_sub_label is None:
@@ -968,21 +1066,36 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             weighted_score >= self.face_config.recognition_threshold
             and not state.result_emitted
         ):
+            winning_vote = max(
+                (
+                    vote
+                    for vote in state.votes
+                    if vote.sub_label == weighted_sub_label
+                    and vote.candidate is not None
+                ),
+                key=lambda vote: (vote.score, vote.quality_score, vote.candidate_id),
+            )
+            winning_candidate = winning_vote.candidate
+            winning_request = winning_candidate.request
             queued = self.face_snapshot_worker.submit(
                 request.key,
                 FaceSnapshotJob(
-                    camera=request.camera,
-                    event_id=request.event_id,
-                    frame_time=request.frame_time,
-                    person_box=request.person_box,
-                    face_box=candidate.face_box,
+                    camera=winning_request.camera,
+                    event_id=winning_request.event_id,
+                    frame_time=winning_request.frame_time,
+                    person_box=winning_request.person_box,
+                    face_box=winning_candidate.face_box,
                     sub_label=weighted_sub_label,
                     face_score=weighted_score,
-                    frame=request.yuv_frame,
+                    frame=winning_candidate.evidence.frame.copy(),
+                    candidate_id=winning_candidate.evidence.candidate_id,
+                    quality_score=winning_candidate.evidence.quality_score,
+                    quality_components=winning_candidate.evidence.quality_components,
+                    source_role=winning_candidate.evidence.source_role.value,
                 ),
             )
             if queued:
-                state.last_snapshot_time = request.frame_time
+                state.last_snapshot_time = winning_request.frame_time
                 state.result_emitted = True
                 self.face_counters["snapshot_queued"] += 1
                 self.face_counters["confirmed_count"] += 1
@@ -998,13 +1111,19 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 passage_trace(
                     "confirmed_result",
                     camera=request.camera,
-                    frame_time=request.frame_time,
+                    frame_time=winning_request.frame_time,
                     track_id=str(request.event_id),
                     generation=request.generation,
                     identity=weighted_sub_label,
                     score=weighted_score,
-                    bbox=list(candidate.face_box),
-                    person_box=list(request.person_box),
+                    bbox=list(winning_candidate.face_box),
+                    face_box=list(winning_candidate.face_box),
+                    person_box=list(winning_request.person_box),
+                    candidate_id=winning_candidate.evidence.candidate_id,
+                    source_role=winning_candidate.evidence.source_role.value,
+                    quality_score=winning_candidate.evidence.quality_score,
+                    quality_components=winning_candidate.evidence.quality_components,
+                    quality_unavailable=winning_candidate.evidence.unavailable_metrics,
                     confirmed_ms=confirmed_ms,
                 )
             else:
@@ -1016,9 +1135,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self.face_counters["yunet_ms_total"] += int(candidate.capture_ms)
         self.face_counters["alignment_ms_total"] += int(outcome.alignment_ms)
         self.face_counters["embedding_ms_total"] += int(outcome.embedding_ms)
-        end_to_end_ms = (
-            outcome.completed_monotonic - request.created_monotonic
-        ) * 1000
+        end_to_end_ms = (outcome.completed_monotonic - request.created_monotonic) * 1000
         self.face_counters["candidate_age_ms_total"] += int(end_to_end_ms)
         self.face_latency_samples["batch_wait_ms"].append(outcome.batch_wait_ms)
         self.face_latency_samples["embedding_ms"].append(outcome.embedding_ms)
@@ -1034,6 +1151,11 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
                 score=score,
                 person_box=list(request.person_box),
                 face_box=list(candidate.face_box),
+                candidate_id=candidate.evidence.candidate_id,
+                source_role=candidate.evidence.source_role.value,
+                quality_score=candidate.evidence.quality_score,
+                quality_components=candidate.evidence.quality_components,
+                quality_unavailable=candidate.evidence.unavailable_metrics,
                 first_attempt_ms=end_to_end_ms,
                 embedding_ms=outcome.embedding_ms,
             )
@@ -1068,8 +1190,17 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         """Stop snapshot encoding during embeddings shutdown."""
         if hasattr(self, "face_pipeline"):
             self.face_pipeline.stop()
+        for state in self.face_tracks.values():
+            self._release_face_votes(state.votes)
+        self.face_tracks.clear()
         self.face_snapshot_worker.stop()
         self.face_attempt_worker.stop()
+
+    @staticmethod
+    def _release_face_votes(votes: list[FaceVote]) -> None:
+        for vote in votes:
+            if vote.candidate is not None:
+                vote.candidate.evidence.release()
 
     def weighted_average(
         self, results_list: list[FaceVote], max_weight: int = 4000
@@ -1140,10 +1271,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         sub_label: str,
         score: float,
     ) -> None:
-        if (
-            self.config.face_recognition.save_attempts
-            and sub_label == "unknown"
-        ):
+        if self.config.face_recognition.save_attempts and sub_label == "unknown":
             self.face_attempt_worker.submit(
                 (camera, event_id),
                 FaceAttemptJob(

@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 
 from frigate.const import MODEL_CACHE_DIR
+from frigate.data_processing.common.evidence import EvidenceCandidate, EvidenceLease
+from frigate.data_processing.common.quality import QualitySelector, QualityThresholds
 from frigate.util.image import area, calculate_region, yuv_region_2_bgr
 
 logger = logging.getLogger(__name__)
@@ -36,13 +38,17 @@ class FaceCaptureRequest:
     frame_time: float
     generation: int
     person_box: tuple[int, int, int, int]
-    yuv_frame: np.ndarray
+    evidence_lease: EvidenceLease
     detection_threshold: float
     min_area: int
     requires_face_detection: bool
     attribute_face_box: tuple[int, int, int, int] | None
     vote_count: int
     created_monotonic: float
+    quality_enabled: bool
+    quality_thresholds: QualityThresholds
+    top_k: int
+    detector_score: float | None = None
     quality: float = 0.0
 
     @property
@@ -57,6 +63,7 @@ class FaceCandidate:
     face_frame: np.ndarray
     capture_ms: float
     quality: float
+    evidence: EvidenceCandidate
 
     @property
     def key(self) -> FaceKey:
@@ -200,9 +207,7 @@ class LatestFaceCandidateStore(Generic[T]):
                 now = time.monotonic()
                 dropped.extend(self._prune_expired(now))
                 eligible = [
-                    item
-                    for key, item in self._items.items()
-                    if key not in excluded
+                    item for key, item in self._items.items() if key not in excluded
                 ]
                 oldest_age = max(
                     (
@@ -222,7 +227,9 @@ class LatestFaceCandidateStore(Generic[T]):
                     break
                 remaining = deadline - now
                 if remaining <= 0:
-                    selected = self._select_fair(eligible, max_items) if eligible else []
+                    selected = (
+                        self._select_fair(eligible, max_items) if eligible else []
+                    )
                     for item in selected:
                         self._items.pop(getattr(item, "key"), None)
                     break
@@ -343,18 +350,22 @@ class FaceRecognitionPipeline:
         self,
         recognizer: Any,
         detector_factory: Callable[[], cv2.FaceDetectorYN] = create_yunet_detector,
+        quality_selector: QualitySelector | None = None,
     ) -> None:
         self.recognizer = recognizer
+        self.quality_selector = quality_selector
         self.metrics: Counter[str] = Counter()
         self._stop = threading.Event()
         self._active_lock = threading.Lock()
         self._active_keys: set[FaceKey] = set()
-        self.capture_store = LatestFaceCandidateStore[FaceCaptureRequest]()
+        self.capture_store = LatestFaceCandidateStore[FaceCaptureRequest](
+            on_drop=self._drop_request
+        )
         self.candidate_store = LatestFaceCandidateStore[FaceCandidate](
-            on_drop=self._drop_active
+            on_drop=self._drop_candidate
         )
         self.prepared_store = LatestFaceCandidateStore[PreparedFaceCandidate](
-            on_drop=self._drop_active
+            on_drop=self._drop_prepared
         )
         self._results: queue.Queue[FaceRecognitionOutcome] = queue.Queue(maxsize=32)
         self._threads: list[threading.Thread] = []
@@ -421,6 +432,11 @@ class FaceRecognitionPipeline:
         self._stop.set()
         for thread in self._threads:
             thread.join(timeout=2)
+        for store in (self.capture_store, self.candidate_store, self.prepared_store):
+            for key in store.keys():
+                store.remove(key, "shutdown")
+        for outcome in self.drain_results():
+            outcome.candidate.evidence.release()
 
     def _capture_loop(self, detector: cv2.FaceDetectorYN) -> None:
         while not self._stop.is_set():
@@ -438,10 +454,12 @@ class FaceRecognitionPipeline:
             except Exception:
                 logger.exception("Face capture failed for %s/%s", *job.key)
                 self.metrics["capture_error"] += 1
+                job.evidence_lease.release()
                 self._release(job.key)
                 continue
             if candidate is None:
                 self.metrics["no_face"] += 1
+                job.evidence_lease.release()
                 self._release(job.key)
                 continue
             candidate = replace(
@@ -449,15 +467,15 @@ class FaceRecognitionPipeline:
             )
             self.metrics["captured"] += 1
             self.candidate_store.submit(candidate)
+            job.evidence_lease.release()
 
     def _capture(
         self, job: FaceCaptureRequest, detector: cv2.FaceDetectorYN
     ) -> FaceCandidate | None:
+        frame = job.evidence_lease.frame
         if job.requires_face_detection:
-            person, region = crop_yuv_region_to_bgr(job.yuv_frame, job.person_box)
-            local_box = detect_largest_face(
-                detector, person, job.detection_threshold
-            )
+            person, region = crop_yuv_region_to_bgr(frame, job.person_box)
+            local_box = detect_largest_face(detector, person, job.detection_threshold)
             if local_box is None:
                 return None
             face_box = (
@@ -474,7 +492,7 @@ class FaceRecognitionPipeline:
             if job.attribute_face_box is None:
                 return None
             face_box = job.attribute_face_box
-            region_frame, region = crop_yuv_region_to_bgr(job.yuv_frame, face_box)
+            region_frame, region = crop_yuv_region_to_bgr(frame, face_box)
             local_box = (
                 face_box[0] - region[0],
                 face_box[1] - region[1],
@@ -488,8 +506,28 @@ class FaceRecognitionPipeline:
         if area(face_box) < job.min_area or face_frame.size == 0:
             self.metrics["too_small_or_empty"] += 1
             return None
-        quality = float(area(face_box))
-        return FaceCandidate(job, face_box, face_frame, 0.0, quality)
+        if self.quality_selector is None:
+            raise RuntimeError("Face quality selector is unavailable")
+        evidence = self.quality_selector.select(
+            task="face",
+            camera=job.camera,
+            track_id=job.event_id,
+            generation=job.generation,
+            frame_ref=job.evidence_lease.ref,
+            object_bbox=job.person_box,
+            detail_bbox=face_box,
+            detail_frame=face_frame,
+            thresholds=job.quality_thresholds,
+            top_k=job.top_k,
+            enabled=job.quality_enabled,
+            detector_score=job.detector_score,
+        )
+        if evidence is None:
+            self.metrics["quality_rejected"] += 1
+            return None
+        return FaceCandidate(
+            job, face_box, face_frame, 0.0, evidence.quality_score, evidence
+        )
 
     def _preprocess_loop(self, landmark_detector: Any) -> None:
         while not self._stop.is_set():
@@ -505,6 +543,7 @@ class FaceRecognitionPipeline:
             except Exception:
                 logger.exception("Face alignment failed for %s/%s", *candidate.key)
                 self.metrics["alignment_error"] += 1
+                candidate.evidence.release()
                 self._release(candidate.key)
                 continue
             self.prepared_store.submit(
@@ -535,6 +574,7 @@ class FaceRecognitionPipeline:
                 logger.exception("Batched face recognition failed")
                 self.metrics["embedding_error"] += len(batch)
                 for item in batch:
+                    item.candidate.evidence.release()
                     self._release(item.key)
                 continue
             embedding_ms = (time.monotonic() - started) * 1000
@@ -543,6 +583,7 @@ class FaceRecognitionPipeline:
                 self._release(item.key)
                 if result is None:
                     self.metrics["classifier_unavailable"] += 1
+                    item.candidate.evidence.release()
                     continue
                 outcome = FaceRecognitionOutcome(
                     item.candidate,
@@ -558,7 +599,8 @@ class FaceRecognitionPipeline:
                     self._results.put_nowait(outcome)
                 except queue.Full:
                     try:
-                        self._results.get_nowait()
+                        dropped = self._results.get_nowait()
+                        dropped.candidate.evidence.release()
                     except queue.Empty:
                         pass
                     self._results.put_nowait(outcome)
@@ -570,6 +612,16 @@ class FaceRecognitionPipeline:
         with self._active_lock:
             self._active_keys.discard(key)
 
-    def _drop_active(self, item: Any, reason: str) -> None:
+    def _drop_request(self, item: FaceCaptureRequest, reason: str) -> None:
+        item.evidence_lease.release()
+        self.metrics[f"drop_{reason}"] += 1
+
+    def _drop_candidate(self, item: FaceCandidate, reason: str) -> None:
+        item.evidence.release()
+        self.metrics[f"drop_{reason}"] += 1
+        self._release(item.key)
+
+    def _drop_prepared(self, item: PreparedFaceCandidate, reason: str) -> None:
+        item.candidate.evidence.release()
         self.metrics[f"drop_{reason}"] += 1
         self._release(item.key)

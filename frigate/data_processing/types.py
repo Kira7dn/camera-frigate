@@ -22,6 +22,27 @@ class DataProcessorMetrics:
     alpr_pps: ValueProxy[float]
     yolov9_lpr_speed: ValueProxy[float]
     yolov9_lpr_pps: ValueProxy[float]
+    lpr_queue_depth: ValueProxy[float]
+    lpr_queue_replaced: ValueProxy[float]
+    lpr_queue_full_drops: ValueProxy[float]
+    lpr_queue_ttl_drops: ValueProxy[float]
+    lpr_stale_generation_drops: ValueProxy[float]
+    lpr_task_age: ValueProxy[float]
+    lpr_worker_latency: ValueProxy[float]
+    evidence_frames: ValueProxy[float]
+    evidence_bytes: ValueProxy[float]
+    evidence_pinned: ValueProxy[float]
+    evidence_time_evictions: ValueProxy[float]
+    evidence_capacity_evictions: ValueProxy[float]
+    evidence_pinned_capacity_drops: ValueProxy[float]
+    evidence_misses: ValueProxy[float]
+    evidence_camera_stats: Any
+    quality_accepted: ValueProxy[float]
+    quality_rejected: ValueProxy[float]
+    quality_deduped: ValueProxy[float]
+    quality_replaced: ValueProxy[float]
+    quality_top_k_depth: ValueProxy[float]
+    quality_reject_counts: dict[str, ValueProxy[float]]
     review_desc_speed: ValueProxy[float]
     review_desc_dps: ValueProxy[float]
     object_desc_speed: ValueProxy[float]
@@ -40,6 +61,41 @@ class DataProcessorMetrics:
         self.alpr_pps = manager.Value("d", 0.0)
         self.yolov9_lpr_speed = manager.Value("d", 0.0)
         self.yolov9_lpr_pps = manager.Value("d", 0.0)
+        self.lpr_queue_depth = manager.Value("d", 0.0)
+        self.lpr_queue_replaced = manager.Value("d", 0.0)
+        self.lpr_queue_full_drops = manager.Value("d", 0.0)
+        self.lpr_queue_ttl_drops = manager.Value("d", 0.0)
+        self.lpr_stale_generation_drops = manager.Value("d", 0.0)
+        self.lpr_task_age = manager.Value("d", 0.0)
+        self.lpr_worker_latency = manager.Value("d", 0.0)
+        self.evidence_frames = manager.Value("d", 0.0)
+        self.evidence_bytes = manager.Value("d", 0.0)
+        self.evidence_pinned = manager.Value("d", 0.0)
+        self.evidence_time_evictions = manager.Value("d", 0.0)
+        self.evidence_capacity_evictions = manager.Value("d", 0.0)
+        self.evidence_pinned_capacity_drops = manager.Value("d", 0.0)
+        self.evidence_misses = manager.Value("d", 0.0)
+        self.evidence_camera_stats = manager.dict()
+        self.quality_accepted = manager.Value("d", 0.0)
+        self.quality_rejected = manager.Value("d", 0.0)
+        self.quality_deduped = manager.Value("d", 0.0)
+        self.quality_replaced = manager.Value("d", 0.0)
+        self.quality_top_k_depth = manager.Value("d", 0.0)
+        quality_reasons = (
+            "detail_width_below_minimum",
+            "detail_height_below_minimum",
+            "blur_below_minimum",
+            "underexposed",
+            "overexposed",
+            "frame_expired",
+            "buffer_capacity",
+            "top_k_not_selected",
+        )
+        self.quality_reject_counts = {
+            f"{task}:{reason}": manager.Value("d", 0.0)
+            for task in ("face", "lpr")
+            for reason in quality_reasons
+        }
         self.review_desc_speed = manager.Value("d", 0.0)
         self.review_desc_dps = manager.Value("d", 0.0)
         self.object_desc_speed = manager.Value("d", 0.0)

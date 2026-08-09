@@ -453,7 +453,29 @@ def stats_snapshot(
             stats["embeddings"]["plate_recognition"] = round(
                 embeddings_metrics.alpr_pps.value, 2
             )
-
+            stats["embeddings"].update(
+                {
+                    "lpr_queue_depth": int(embeddings_metrics.lpr_queue_depth.value),
+                    "lpr_queue_replaced": int(
+                        embeddings_metrics.lpr_queue_replaced.value
+                    ),
+                    "lpr_queue_full_drops": int(
+                        embeddings_metrics.lpr_queue_full_drops.value
+                    ),
+                    "lpr_queue_ttl_drops": int(
+                        embeddings_metrics.lpr_queue_ttl_drops.value
+                    ),
+                    "lpr_stale_generation_drops": int(
+                        embeddings_metrics.lpr_stale_generation_drops.value
+                    ),
+                    "lpr_task_age": round(
+                        embeddings_metrics.lpr_task_age.value * 1000, 2
+                    ),
+                    "lpr_worker_latency": round(
+                        embeddings_metrics.lpr_worker_latency.value * 1000, 2
+                    ),
+                }
+            )
             if embeddings_metrics.yolov9_lpr_pps.value > 0.0:
                 stats["embeddings"]["yolov9_plate_detection_speed"] = round(
                     embeddings_metrics.yolov9_lpr_speed.value * 1000, 2
@@ -461,6 +483,36 @@ def stats_snapshot(
                 stats["embeddings"]["yolov9_plate_detection"] = round(
                     embeddings_metrics.yolov9_lpr_pps.value, 2
                 )
+
+        stats["embeddings"]["evidence"] = {
+            "frames": int(embeddings_metrics.evidence_frames.value),
+            "bytes": int(embeddings_metrics.evidence_bytes.value),
+            "pinned": int(embeddings_metrics.evidence_pinned.value),
+            "time_evictions": int(embeddings_metrics.evidence_time_evictions.value),
+            "capacity_evictions": int(
+                embeddings_metrics.evidence_capacity_evictions.value
+            ),
+            "pinned_capacity_drops": int(
+                embeddings_metrics.evidence_pinned_capacity_drops.value
+            ),
+            "misses": int(embeddings_metrics.evidence_misses.value),
+            "cameras": {
+                name: dict(value)
+                for name, value in embeddings_metrics.evidence_camera_stats.items()
+            },
+        }
+        stats["embeddings"]["quality_selector"] = {
+            "accepted": int(embeddings_metrics.quality_accepted.value),
+            "rejected": int(embeddings_metrics.quality_rejected.value),
+            "deduped": int(embeddings_metrics.quality_deduped.value),
+            "replaced": int(embeddings_metrics.quality_replaced.value),
+            "top_k_depth": int(embeddings_metrics.quality_top_k_depth.value),
+            "reject_reasons": {
+                name: int(metric.value)
+                for name, metric in embeddings_metrics.quality_reject_counts.items()
+                if metric.value
+            },
+        }
 
         if embeddings_metrics.review_desc_speed.value > 0.0:
             stats["embeddings"]["review_description_speed"] = round(

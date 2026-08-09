@@ -34,6 +34,7 @@ from .notification import CameraNotificationConfig
 from .objects import ObjectConfig
 from .onvif import OnvifConfig
 from .profile import CameraProfileConfig
+from .quality import CameraQualityConfig
 from .record import RecordConfig
 from .review import ReviewConfig
 from .snapshots import SnapshotsConfig
@@ -116,6 +117,11 @@ class CameraConfig(FrigateBaseModel):
         None,
         title="Motion detection",
         description="Default motion detection settings for this camera.",
+    )
+    quality: CameraQualityConfig = Field(
+        default_factory=CameraQualityConfig,
+        title="Recognition input quality",
+        description="Bounded detect-frame evidence and shared Face/LPR candidate quality settings.",
     )
     objects: ObjectConfig = Field(
         default_factory=ObjectConfig,
@@ -202,6 +208,27 @@ class CameraConfig(FrigateBaseModel):
     )
 
     _ffmpeg_cmds: list[dict[str, list[str]]] = PrivateAttr()
+
+    @model_validator(mode="after")
+    def validate_quality_contract(self) -> "CameraConfig":
+        if self.quality.enabled and self.quality.buffer.sample_fps > self.detect.fps:
+            raise ValueError(
+                "quality.buffer.sample_fps must be less than or equal to detect.fps"
+            )
+        if (
+            self.quality.enabled
+            and self.detect.width is not None
+            and self.detect.height is not None
+        ):
+            required = (
+                self.detect.width * self.detect.height * 3 // 2 * self.quality.top_k
+            )
+            if self.quality.buffer.max_bytes < required:
+                raise ValueError(
+                    "quality.buffer.max_bytes must hold at least quality.top_k "
+                    "raw I420 detect frames"
+                )
+        return self
 
     def __init__(self, **config):
         # Set zone colors

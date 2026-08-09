@@ -41,6 +41,9 @@ class FaceVote:
     sub_label: str
     score: float
     face_area: int
+    candidate_id: str = ""
+    quality_score: float = 0.0
+    candidate: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,10 @@ class FaceRecognitionResult:
     face_score: float
     artifact_path: str
     transaction_id: str = ""
+    candidate_id: str = ""
+    quality_score: float = 0.0
+    quality_components: dict[str, float] = field(default_factory=dict)
+    source_role: str = "detect"
 
     @property
     def key(self) -> FaceTrackKey:
@@ -73,6 +80,10 @@ class FaceRecognitionResult:
             "face_score": self.face_score,
             "artifact_path": self.artifact_path,
             "transaction_id": self.transaction_id,
+            "candidate_id": self.candidate_id,
+            "quality_score": self.quality_score,
+            "quality_components": self.quality_components,
+            "source_role": self.source_role,
         }
 
 
@@ -134,6 +145,10 @@ class FaceSnapshotJob:
     sub_label: str
     face_score: float
     frame: np.ndarray
+    candidate_id: str = ""
+    quality_score: float = 0.0
+    quality_components: dict[str, float] = field(default_factory=dict)
+    source_role: str = "detect"
 
     @property
     def key(self) -> FaceTrackKey:
@@ -431,6 +446,10 @@ def write_face_snapshot_artifact(
         face_score=job.face_score,
         artifact_path=artifact_path,
         transaction_id=transaction_id,
+        candidate_id=job.candidate_id,
+        quality_score=job.quality_score,
+        quality_components=job.quality_components,
+        source_role=job.source_role,
     )
 
 
@@ -484,9 +503,12 @@ def commit_snapshot_job(job: SnapshotCommitJob) -> SnapshotCommitted:
     thumbnail_backup = f"{job.thumbnail_path}.bak-{os.getpid()}-{threading.get_ident()}"
     had_canonical = os.path.isfile(job.canonical_path)
     had_thumbnail = os.path.isfile(job.thumbnail_path)
-    transaction_id = job.result.transaction_id or hashlib.sha256(
-        f"{job.result.camera}\0{job.result.event_id}\0{job.result.frame_time}".encode()
-    ).hexdigest()[:24]
+    transaction_id = (
+        job.result.transaction_id
+        or hashlib.sha256(
+            f"{job.result.camera}\0{job.result.event_id}\0{job.result.frame_time}".encode()
+        ).hexdigest()[:24]
+    )
     journal_path = os.path.join(FACE_COMMIT_JOURNAL_DIR, f"{transaction_id}.json")
     _atomic_write_json(
         journal_path,
@@ -635,11 +657,7 @@ def write_face_attempt(job: FaceAttemptJob) -> None:
         if files is None:
             files = deque(
                 sorted(
-                    (
-                        entry
-                        for entry in Path(folder).glob("*.webp")
-                        if entry.is_file()
-                    ),
+                    (entry for entry in Path(folder).glob("*.webp") if entry.is_file()),
                     key=lambda entry: entry.stat().st_ctime,
                     reverse=True,
                 )
@@ -712,7 +730,9 @@ def cleanup_legacy_face_events(face_dir: str) -> int:
     if not ownership_marker.is_file():
         quarantine = Path(face_dir) / f".events-quarantine-{int(time.time())}"
         legacy.rename(quarantine)
-        logger.warning("Quarantined unowned legacy face events directory at %s", quarantine)
+        logger.warning(
+            "Quarantined unowned legacy face events directory at %s", quarantine
+        )
         return 0
     for entry in entries:
         entry.unlink(missing_ok=True)

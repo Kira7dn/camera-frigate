@@ -1,9 +1,8 @@
 """Handle processing images for face detection and recognition."""
 
-import base64
+from __future__ import annotations
+
 import datetime
-import hashlib
-import json
 import logging
 import math
 import os
@@ -11,12 +10,12 @@ import random
 import re
 import string
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
 from pyclipper import ET_CLOSEDPOLYGON, JT_ROUND, PyclipperOffset
-from rapidfuzz.distance import JaroWinkler, Levenshtein
+from rapidfuzz.distance import JaroWinkler
 from shapely.geometry import Polygon
 
 from frigate.comms.event_metadata_updater import (
@@ -27,17 +26,20 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
-from frigate.data_processing.common.license_plate.association import (
-    is_lpr_track_discontinuity,
-)
-from frigate.data_processing.common.license_plate.model import LicensePlateModelRunner
-from frigate.embeddings.onnx.lpr_embedding import LPR_EMBEDDING_SIZE
-from frigate.types import TrackedObjectUpdateTypesEnum
+from frigate.data_processing.common.evidence import FrameRef
+from frigate.data_processing.common.quality import QualityThresholds
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.image import area
 from frigate.util.passage_trace import passage_trace
 
 from ...types import DataProcessorMetrics
+from .constants import LPR_EMBEDDING_SIZE
+from .pipeline import LprTrackKey, PlateObservation
+
+if TYPE_CHECKING:
+    from frigate.data_processing.common.license_plate.model import (
+        LicensePlateModelRunner,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1169,7 +1171,9 @@ class LicensePlateProcessingMixin:
             range(len(clusters)), key=lambda j: cluster_score(clusters[j])
         )
         best_cluster = clusters[best_cluster_idx]
-        best_size, best_char_conf, best_max_conf, best_area = cluster_score(best_cluster)
+        best_size, best_char_conf, best_max_conf, best_area = cluster_score(
+            best_cluster
+        )
         logger.debug(
             f"  Selected best cluster {best_cluster_idx + 1}: size {best_size}, max conf {best_max_conf:.3f}"
         )
@@ -1214,18 +1218,27 @@ class LicensePlateProcessingMixin:
         return event_id
 
     def lpr_process(
-        self, obj_data: dict[str, Any], frame: np.ndarray, dedicated_lpr: bool = False
-    ) -> None:
-        """Look for license plates in image."""
+        self,
+        obj_data: dict[str, Any] | str,
+        frame: np.ndarray,
+        dedicated_lpr: bool = False,
+        key: LprTrackKey | None = None,
+        frame_ref: FrameRef | None = None,
+    ) -> PlateObservation | None:
+        """Run detector/OCR and return an observation without side effects."""
         self.metrics.alpr_pps.value = self.plates_rec_second.eps()
         self.metrics.yolov9_lpr_pps.value = self.plates_det_second.eps()
-        camera = obj_data if dedicated_lpr else obj_data["camera"]
+        camera = str(obj_data) if dedicated_lpr else obj_data["camera"]
         current_time = (
             datetime.datetime.now().timestamp()
             if dedicated_lpr
-            else float(obj_data.get("frame_time") or datetime.datetime.now().timestamp())
+            else float(
+                obj_data.get("frame_time") or datetime.datetime.now().timestamp()
+            )
         )
         debug_frame_id = int(datetime.datetime.now().timestamp() * 1000)
+        detector_score: float | None = None
+        quality_candidate = None
 
         if not self.config.cameras[camera].lpr.enabled:
             return
@@ -1276,21 +1289,19 @@ class LicensePlateProcessingMixin:
                 return
 
             plate_box = license_plate
-            passage_trace("plate_detected", camera=camera, frame_time=current_time, track_id=str(id), plate_box=plate_box, object_box=None if dedicated_lpr else obj_data.get("box"))
+            passage_trace(
+                "plate_detected",
+                camera=camera,
+                frame_time=current_time,
+                track_id=str(id),
+                plate_box=plate_box,
+                object_box=None if dedicated_lpr else obj_data.get("box"),
+            )
 
             license_plate_frame = rgb[
                 license_plate[1] : license_plate[3],
                 license_plate[0] : license_plate[2],
             ]
-
-            # Double the size for better OCR
-            license_plate_frame = cv2.resize(
-                license_plate_frame,
-                (
-                    int(2 * license_plate_frame.shape[1]),
-                    int(2 * license_plate_frame.shape[0]),
-                ),
-            )
 
         else:
             id = obj_data["id"]
@@ -1309,7 +1320,13 @@ class LicensePlateProcessingMixin:
             # Waiting for position_changes discarded slow/near-stationary vehicles
             # before the first plate detector call. Stationary timeout below still
             # bounds repeated scans.
-            passage_trace("lpr_eligible", camera=camera, frame_time=current_time, track_id=str(id), object_box=obj_data.get("box"))
+            passage_trace(
+                "lpr_eligible",
+                camera=camera,
+                frame_time=current_time,
+                track_id=str(id),
+                object_box=obj_data.get("box"),
+            )
 
             # run for stationary objects for a limited time after they become stationary
             if obj_data.get("stationary") == True:
@@ -1408,7 +1425,14 @@ class LicensePlateProcessingMixin:
                     left + plate_box_in_car[2],
                     top + plate_box_in_car[3],
                 )
-                passage_trace("plate_detected", camera=camera, frame_time=current_time, track_id=str(id), plate_box=plate_box, object_box=obj_data.get("box"))
+                passage_trace(
+                    "plate_detected",
+                    camera=camera,
+                    frame_time=current_time,
+                    track_id=str(id),
+                    plate_box=plate_box,
+                    object_box=obj_data.get("box"),
+                )
 
                 license_plate_frame = car[
                     license_plate[1] : license_plate[3],
@@ -1418,8 +1442,10 @@ class LicensePlateProcessingMixin:
                     ph, pw = license_plate_frame.shape[:2]
                     license_plate_frame = cv2.copyMakeBorder(
                         license_plate_frame,
-                        int(ph * 0.05), int(ph * 0.05),
-                        int(pw * 0.10), int(pw * 0.10),
+                        int(ph * 0.05),
+                        int(ph * 0.05),
+                        int(pw * 0.10),
+                        int(pw * 0.10),
                         cv2.BORDER_REPLICATE,
                     )
             else:
@@ -1447,10 +1473,12 @@ class LicensePlateProcessingMixin:
                     # no license plates detected in this frame
                     if not license_plate:
                         return
+                    detector_score = float(license_plate.get("score", 0.0))
 
                 # we are using dedicated lpr with frigate+
                 if obj_data.get("label") == "license_plate":
                     license_plate = obj_data  # type: ignore[assignment]
+                    detector_score = float(obj_data.get("score", 0.0))
 
                 license_plate_box = license_plate.get("box")  # type: ignore[attr-defined]
 
@@ -1489,20 +1517,54 @@ class LicensePlateProcessingMixin:
                     int(expanded_box[0]) : int(expanded_box[2]),
                 ]
 
-            # double the size of the license plate frame for better OCR
-            license_plate_frame = cv2.resize(
-                license_plate_frame,
-                (
-                    int(2 * license_plate_frame.shape[1]),
-                    int(2 * license_plate_frame.shape[0]),
+        if (
+            frame_ref is not None
+            and getattr(self, "quality_selector", None) is not None
+        ):
+            quality_config = self.config.cameras[camera].quality
+            task_quality = quality_config.lpr
+            observation_key = key or LprTrackKey(camera, str(id), 0)
+            quality_candidate = self.quality_selector.select(
+                task="lpr",
+                camera=camera,
+                track_id=observation_key.track_id,
+                generation=observation_key.generation,
+                frame_ref=frame_ref,
+                object_bbox=None
+                if dedicated_lpr
+                else tuple(int(value) for value in obj_data.get("box"))
+                if obj_data.get("box")
+                else None,
+                detail_bbox=tuple(int(value) for value in plate_box),
+                detail_frame=license_plate_frame,
+                thresholds=QualityThresholds(
+                    task_quality.min_detail_width_px,
+                    task_quality.min_detail_height_px,
+                    task_quality.min_laplacian_variance,
+                    task_quality.max_dark_fraction,
+                    task_quality.max_bright_fraction,
                 ),
+                top_k=quality_config.top_k,
+                enabled=quality_config.enabled,
+                detector_score=detector_score,
             )
+            if quality_candidate is None:
+                return
 
-            if WRITE_DEBUG_IMAGES:
-                cv2.imwrite(
-                    f"debug/frames/license_plate_frame_{debug_frame_id}.jpg",
-                    license_plate_frame,
-                )
+        # double the size of the license plate frame for better OCR
+        license_plate_frame = cv2.resize(
+            license_plate_frame,
+            (
+                int(2 * license_plate_frame.shape[1]),
+                int(2 * license_plate_frame.shape[0]),
+            ),
+        )
+
+        if WRITE_DEBUG_IMAGES:
+            cv2.imwrite(
+                f"debug/frames/license_plate_frame_{debug_frame_id}.jpg",
+                license_plate_frame,
+            )
 
         logger.debug(f"{camera}: Found license plate. Bounding box: {list(plate_box)}")
         logger.debug(f"{camera}: Running plate recognition for id: {id}.")
@@ -1526,6 +1588,8 @@ class LicensePlateProcessingMixin:
                 )
         else:
             logger.debug(f"{camera}: No text detected")
+            if quality_candidate is not None:
+                quality_candidate.release()
             return
 
         top_plate, top_char_confidences, top_area = (
@@ -1538,263 +1602,35 @@ class LicensePlateProcessingMixin:
             if top_char_confidences
             else 0
         )
-        passage_trace("ocr_result", camera=camera, frame_time=current_time, track_id=str(id), plate=top_plate, score=avg_confidence, plate_box=plate_box, object_box=None if dedicated_lpr else obj_data.get("box"))
-
-        # Check against minimum confidence threshold
-        if avg_confidence < self.lpr_config.recognition_threshold:
-            logger.debug(
-                f"{camera}: Average character confidence {avg_confidence} is less than recognition_threshold ({self.lpr_config.recognition_threshold})"
-            )
-            return
-
-        # For dedicated LPR cameras, match or assign plate ID using Jaro-Winkler distance
-        if (
-            dedicated_lpr
-            and "license_plate" not in self.config.cameras[camera].objects.track
-        ):
-            plate_id = None
-
-            for existing_id, data in self.detected_license_plates.items():
-                if (
-                    data["camera"] == camera
-                    and data["last_seen"] is not None
-                    and current_time - data["last_seen"]
-                    <= self.config.cameras[camera].lpr.expire_time
-                ):
-                    similarity = JaroWinkler.similarity(data["plate"], top_plate)
-                    if similarity >= self.similarity_threshold:
-                        plate_id = existing_id
-                        logger.debug(
-                            f"{camera}: Matched plate {top_plate} to {data['plate']} (similarity: {similarity:.3f})"
-                        )
-                        break
-            if plate_id is None:
-                plate_id = self._generate_plate_event(camera, top_plate, avg_confidence)
-                logger.debug(
-                    f"{camera}: New plate event for dedicated LPR camera {plate_id}: {top_plate}"
-                )
-            else:
-                logger.debug(
-                    f"{camera}: Matched existing plate event for dedicated LPR camera {plate_id}: {top_plate}"
-                )
-                self.detected_license_plates[plate_id]["last_seen"] = current_time
-
-            id = plate_id
-
-        is_new = id not in self.detected_license_plates
-
-        # A tracker can briefly retain an id after a vehicle disappears and then
-        # associate the id with a different vehicle. Never combine the old plate
-        # cluster with the new vehicle's box. Require the new plate/box pairing in
-        # two OCR passes before replacing the old cluster; the first pass is
-        # deliberately not published because its association is ambiguous.
-        plate_state = self.detected_license_plates.get(id)
-        if plate_state is not None and not dedicated_lpr:
-            previous_obj = plate_state.get("obj_data") or {}
-            if is_lpr_track_discontinuity(
-                plate_state.get("plate"),
-                top_plate,
-                previous_obj.get("box"),
-                obj_data.get("box"),
-                self.cluster_threshold,
-            ):
-                switch_candidate = plate_state.get("switch_candidate") or {}
-                candidate_plate = switch_candidate.get("plate")
-                candidate_count = int(switch_candidate.get("count", 0))
-                if (
-                    candidate_plate
-                    and JaroWinkler.similarity(candidate_plate, top_plate)
-                    >= self.cluster_threshold
-                ):
-                    candidate_count += 1
-                else:
-                    candidate_count = 1
-
-                plate_state["switch_candidate"] = {
-                    "plate": top_plate,
-                    "count": candidate_count,
-                }
-                if candidate_count < 2:
-                    logger.warning(
-                        "%s: Suppressed ambiguous LPR association for tracker %s: "
-                        "%s -> %s",
-                        camera,
-                        id,
-                        plate_state.get("plate"),
-                        top_plate,
-                    )
-                    return
-
-                logger.warning(
-                    "%s: Reset LPR cluster after confirmed tracker discontinuity "
-                    "for %s: %s -> %s",
-                    camera,
-                    id,
-                    plate_state.get("plate"),
-                    top_plate,
-                )
-                plate_state["plates"] = []
-                plate_state.pop("plate", None)
-                plate_state.pop("switch_candidate", None)
-            else:
-                plate_state.pop("switch_candidate", None)
-
-        # Collect variant
-        variant = {
-            "plate": top_plate,
-            "conf": avg_confidence,
-            "char_confidences": top_char_confidences,
-            "area": top_area,
-            "timestamp": current_time,
-        }
-
-        # Initialize or append to plates
-        self.detected_license_plates.setdefault(id, {"plates": [], "camera": camera})
-        self.detected_license_plates[id]["plates"].append(variant)
-
-        # Prune old variants - this is probably higher than it needs to be
-        # since we don't detect a plate every frame
-        num_variants = self.config.cameras[camera].detect.fps * 5
-        if len(self.detected_license_plates[id]["plates"]) > num_variants:
-            self.detected_license_plates[id]["plates"] = self.detected_license_plates[
-                id
-            ]["plates"][-num_variants:]
-
-        # Cluster and select rep
-        plates = self.detected_license_plates[id]["plates"]
-        rep_plate, rep_conf, rep_char_confs, rep_area = self._get_cluster_rep(plates)
-
-        if rep_plate != top_plate:
-            logger.debug(
-                f"{camera}: Clustering changed top plate '{top_plate}' (conf: {avg_confidence:.3f}) to rep '{rep_plate}' (conf: {rep_conf:.3f})"
-            )
-
-        # Apply length and format filters to the clustered representative
-        # rather than individual OCR readings, so noisy variants still
-        # contribute to clustering even when they don't pass on their own.
-        if len(rep_plate) < self.lpr_config.min_plate_length:
-            logger.debug(
-                f"{camera}: Filtered out clustered plate '{rep_plate}' due to length ({len(rep_plate)} < {self.lpr_config.min_plate_length})"
-            )
-            return
-
-        if self.lpr_config.format:
-            try:
-                if not re.fullmatch(self.lpr_config.format, rep_plate):
-                    logger.debug(
-                        f"{camera}: Filtered out clustered plate '{rep_plate}' due to format mismatch"
-                    )
-                    return
-            except re.error:
-                logger.error(
-                    f"{camera}: Invalid regex in LPR format configuration: {self.lpr_config.format}"
-                )
-
-        # Update stored rep
-        self.detected_license_plates[id].update(
-            {
-                "plate": rep_plate,
-                "char_confidences": rep_char_confs,
-                "area": rep_area,
-                "last_seen": current_time if dedicated_lpr else None,
-            }
+        passage_trace(
+            "ocr_result",
+            camera=camera,
+            frame_time=current_time,
+            track_id=str(id),
+            plate=top_plate,
+            score=avg_confidence,
+            plate_box=plate_box,
+            object_box=None if dedicated_lpr else obj_data.get("box"),
         )
-
-        if not dedicated_lpr:
-            self.detected_license_plates[id]["obj_data"] = obj_data
-
-        if is_new:
-            if camera not in self.camera_current_cars:
-                self.camera_current_cars[camera] = []
-            self.camera_current_cars[camera].append(id)
-
-        # Determine subLabel based on known plates, use regex matching
-        # Default to the detected plate, use label name if there's a match
-        sub_label = None
-        try:
-            sub_label = next(
-                (
-                    label
-                    for label, plates_list in self.lpr_config.known_plates.items()  # type: ignore[union-attr]
-                    if any(
-                        re.match(f"^{plate}$", rep_plate)
-                        or Levenshtein.distance(plate, rep_plate)
-                        <= self.lpr_config.match_distance
-                        for plate in plates_list
-                    )
-                ),
-                None,
-            )
-        except re.error:
-            logger.error(
-                f"{camera}: Invalid regex in known plates configuration: {self.lpr_config.known_plates}"
-            )
-
-        # If it's a known plate, publish to sub_label
-        if sub_label is not None:
-            self.sub_label_publisher.publish(
-                (id, sub_label, rep_conf), EventMetadataTypeEnum.sub_label.value
-            )
-
-        # always publish to recognized_license_plate field
-        evidence_id = hashlib.sha256(
-            f"{id}:{current_time}:lpr".encode()
-        ).hexdigest()
-        evidence_dir = Path(CLIPS_DIR) / "artifacts" / "evidence"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        evidence_path = evidence_dir / f"{evidence_id}.jpg"
-        full_frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-        if not evidence_path.exists():
-            ok, encoded_evidence = cv2.imencode(
-                ".jpg", full_frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95]
-            )
-            if ok:
-                temporary = evidence_path.with_suffix(".tmp")
-                temporary.write_bytes(encoded_evidence.tobytes())
-                os.replace(temporary, evidence_path)
-        self.requestor.send_data(
-            "tracked_object_update",
-            json.dumps(
-                {
-                    "type": TrackedObjectUpdateTypesEnum.lpr,
-                    "name": sub_label,
-                    "plate": rep_plate,
-                    "score": rep_conf,
-                    "id": id,
-                    "camera": camera,
-                    "timestamp": start,
-                    "frame_time": current_time,
-                    "plate_box": plate_box,
-                    "object_box": plate_box
-                    if dedicated_lpr
-                    else obj_data.get("box"),
-                    "frame_ref": str(evidence_path),
-                    "frame_width": int(full_frame_bgr.shape[1]),
-                    "frame_height": int(full_frame_bgr.shape[0]),
-                    "evidence_id": evidence_id,
-                }
-            ),
+        observation_key = key or LprTrackKey(camera, str(id), 0)
+        if quality_candidate is None:
+            return None
+        return PlateObservation(
+            key=observation_key,
+            frame_time=current_time,
+            plate=top_plate,
+            char_confidences=tuple(float(value) for value in top_char_confidences),
+            text_area=int(top_area),
+            plate_box=tuple(int(value) for value in plate_box),
+            object_box=None
+            if dedicated_lpr
+            else tuple(int(value) for value in obj_data.get("box"))
+            if obj_data.get("box")
+            else None,
+            obj_data=None if dedicated_lpr else dict(obj_data),
+            dedicated_lpr=dedicated_lpr,
+            evidence=quality_candidate,
         )
-        self.sub_label_publisher.publish(
-            (id, "recognized_license_plate", rep_plate, rep_conf),
-            EventMetadataTypeEnum.attribute.value,
-        )
-        passage_trace("event_published", camera=camera, frame_time=current_time, track_id=str(id), plate=rep_plate, score=rep_conf, plate_box=plate_box, object_box=None if dedicated_lpr else obj_data.get("box"), evidence_id=evidence_id, frame_ref=str(evidence_path))
-
-        # save the best snapshot for dedicated lpr cams not using frigate+
-        if (
-            dedicated_lpr
-            and "license_plate" not in self.config.cameras[camera].objects.track
-        ):
-            logger.debug(
-                f"{camera}: Writing snapshot for {id}, {rep_plate}, {current_time}"
-            )
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-            _, encoded_img = cv2.imencode(".jpg", frame_bgr)
-            self.sub_label_publisher.publish(
-                (base64.b64encode(encoded_img.tobytes()).decode("ASCII"), id, camera),
-                EventMetadataTypeEnum.save_lpr_snapshot.value,
-            )
 
     def handle_request(
         self, topic: str, request_data: dict[str, Any]
