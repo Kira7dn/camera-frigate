@@ -21,6 +21,9 @@ class QualityThresholds:
     min_laplacian_variance: float
     max_dark_fraction: float
     max_bright_fraction: float
+    min_aspect_ratio: float = 0.0
+    max_aspect_ratio: float = 100.0
+    min_edge_clearance_px: int = 0
 
 
 def _box_iou(
@@ -105,6 +108,13 @@ class QualitySelector:
         )
         dark_fraction = float(np.mean(gray <= 32)) if gray.size else 1.0
         bright_fraction = float(np.mean(gray >= 223)) if gray.size else 1.0
+        aspect_ratio = width / max(1, height)
+        edge_clearance = min(
+            detail_bbox[0],
+            detail_bbox[1],
+            frame_ref.width - detail_bbox[2],
+            frame_ref.height - detail_bbox[3],
+        )
         components: dict[str, float] = {
             "dimensions": min(
                 1.0,
@@ -116,6 +126,16 @@ class QualitySelector:
                 laplacian_variance / max(1.0, thresholds.min_laplacian_variance * 2.0),
             ),
             "exposure": max(0.0, 1.0 - max(dark_fraction, bright_fraction)),
+            "aspect_ratio": 1.0
+            if thresholds.min_aspect_ratio <= aspect_ratio <= thresholds.max_aspect_ratio
+            else 0.0,
+            "edge_clearance": min(
+                1.0,
+                max(0, edge_clearance)
+                / max(1, thresholds.min_edge_clearance_px),
+            )
+            if thresholds.min_edge_clearance_px
+            else 1.0,
         }
         unavailable: list[str] = []
         if detector_score is None:
@@ -156,6 +176,14 @@ class QualitySelector:
                 reasons.append("underexposed")
             if bright_fraction > thresholds.max_bright_fraction:
                 reasons.append("overexposed")
+            if not (
+                thresholds.min_aspect_ratio
+                <= aspect_ratio
+                <= thresholds.max_aspect_ratio
+            ):
+                reasons.append("aspect_ratio_out_of_range")
+            if edge_clearance < thresholds.min_edge_clearance_px:
+                reasons.append("detail_box_edge_clipped")
             if enabled and reasons:
                 self._reject(task, reasons)
                 return None

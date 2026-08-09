@@ -90,7 +90,7 @@ class BirdClassificationConfig(FrigateBaseModel):
 
 
 class CustomClassificationStateCameraConfig(FrigateBaseModel):
-    crop: list[float, float, float, float] = Field(
+    crop: tuple[float, float, float, float] = Field(
         title="Classification crop",
         description="Crop coordinates to use for running classification on this camera.",
     )
@@ -282,6 +282,13 @@ class FaceRecognitionConfig(FrigateBaseModel):
         description="Face embedding distance threshold to consider two faces a match.",
         gt=0.0,
         le=1.0,
+    )
+    min_identity_margin: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        title="Minimum identity margin",
+        description="Minimum top-1 minus top-2 raw match-score margin.",
     )
     min_area: int = Field(
         default=750,

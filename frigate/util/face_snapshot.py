@@ -1,8 +1,10 @@
 """Bounded background work for event-safe face snapshots."""
 
-import logging
+from __future__ import annotations
+
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,10 +14,13 @@ from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:
+    from frigate.data_processing.common.face.pipeline import FaceCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +48,7 @@ class FaceVote:
     face_area: int
     candidate_id: str = ""
     quality_score: float = 0.0
-    candidate: Any | None = None
+    candidate: FaceCandidate | None = None
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,8 @@ class FaceTrackState:
     last_result_frame_time: float = 0.0
     first_attempt_completed: bool = False
     first_match_monotonic: dict[str, float] = field(default_factory=dict)
+    unknown_seen: bool = False
+    ambiguous_identity_seen: bool = False
 
 
 def parse_face_attempt_filename(filename: str) -> tuple[str, str] | None:
@@ -399,8 +406,11 @@ class LatestPerObjectWorker:
         return None
 
     def _drop(self, job: Any) -> None:
+        handler = self._drop_handler
+        if handler is None:
+            return
         try:
-            self._drop_handler(job)  # type: ignore[misc]
+            handler(job)
         except Exception:
             logger.exception("Face snapshot drop handler failed")
 
@@ -607,12 +617,26 @@ def load_snapshot_journal() -> list[SnapshotCommitted]:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             raw = payload["result"]
+            person_box_raw = raw["person_box"]
+            face_box_raw = raw["face_box"]
+            if len(person_box_raw) != 4 or len(face_box_raw) != 4:
+                raise ValueError("snapshot journal contains an invalid bbox")
             result = FaceRecognitionResult(
                 camera=str(raw["camera"]),
                 event_id=str(raw["event_id"]),
                 frame_time=float(raw["frame_time"]),
-                person_box=tuple(int(value) for value in raw["person_box"]),
-                face_box=tuple(int(value) for value in raw["face_box"]),
+                person_box=(
+                    int(person_box_raw[0]),
+                    int(person_box_raw[1]),
+                    int(person_box_raw[2]),
+                    int(person_box_raw[3]),
+                ),
+                face_box=(
+                    int(face_box_raw[0]),
+                    int(face_box_raw[1]),
+                    int(face_box_raw[2]),
+                    int(face_box_raw[3]),
+                ),
                 sub_label=str(raw["sub_label"]),
                 face_score=float(raw["face_score"]),
                 artifact_path=str(raw["artifact_path"]),

@@ -9,8 +9,6 @@ from concurrent.futures import Future
 from queue import Empty, Full, Queue
 from typing import Any
 
-import numpy as np
-
 from frigate.config import FrigateConfig
 
 from ..types import DataProcessorMetrics
@@ -30,7 +28,7 @@ class RealTimeProcessorApi(ABC):
         pass
 
     @abstractmethod
-    def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
+    def process_frame(self, obj_data: Any, frame: Any, **kwargs: Any) -> None:
         """Processes the frame with object data.
         Args:
             obj_data (dict): containing data about focused object in frame.
@@ -80,7 +78,7 @@ class RealTimeProcessorApi(ABC):
         """
         pass
 
-    def drain_results(self) -> list[dict[str, Any]]:
+    def drain_results(self) -> list[Any]:
         """Return pending results that need IPC side-effects.
 
         Deferred processors accumulate results on a worker thread.

@@ -110,21 +110,12 @@ class FrigateApp:
         self.detection_shms: list[mp.shared_memory.SharedMemory] = []
         self.log_queue: Queue = mp.Queue(maxsize=10000)
         self.camera_metrics: DictProxy = self.metrics_manager.dict()
-        self.embeddings_metrics: DataProcessorMetrics | None = (
-            DataProcessorMetrics(
-                self.metrics_manager, list(config.classification.custom.keys())
-            )
-            if (
-                config.semantic_search.enabled
-                or any(
-                    c.objects.genai.enabled or c.review.genai.enabled
-                    for c in config.cameras.values()
-                )
-                or config.lpr.enabled
-                or config.face_recognition.enabled
-                or len(config.classification.custom) > 0
-            )
-            else None
+        # The embeddings maintainer always runs, even when all enrichment
+        # features are disabled, and owns shared quality/lifecycle metrics.
+        # Keep its metrics contract total instead of passing None into every
+        # processor and crashing during the maintenance loop.
+        self.embeddings_metrics = DataProcessorMetrics(
+            self.metrics_manager, list(config.classification.custom.keys())
         )
         self.ptz_metrics: dict[str, PTZMetrics] = {}
         self.processes: dict[str, int] = {}

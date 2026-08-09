@@ -6,8 +6,8 @@ import logging
 import os
 import sys
 import threading
-from multiprocessing import Queue
 from json.decoder import JSONDecodeError
+from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
@@ -34,7 +34,7 @@ class EmbeddingProcess(FrigateProcess):
     def __init__(
         self,
         config: FrigateConfig,
-        metrics: DataProcessorMetrics | None,
+        metrics: DataProcessorMetrics,
         stop_event: MpEvent,
         face_result_queue: Queue,
     ) -> None:

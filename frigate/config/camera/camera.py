@@ -34,7 +34,7 @@ from .notification import CameraNotificationConfig
 from .objects import ObjectConfig
 from .onvif import OnvifConfig
 from .profile import CameraProfileConfig
-from .quality import CameraQualityConfig
+from .quality import CameraQualityConfig, RecognitionLifecycleConfig
 from .record import RecordConfig
 from .review import ReviewConfig
 from .snapshots import SnapshotsConfig
@@ -114,7 +114,7 @@ class CameraConfig(FrigateBaseModel):
         description="License plate recognition settings including detection thresholds, formatting, and known plates.",
     )
     motion: MotionConfig = Field(
-        None,
+        default_factory=MotionConfig,
         title="Motion detection",
         description="Default motion detection settings for this camera.",
     )
@@ -122,6 +122,11 @@ class CameraConfig(FrigateBaseModel):
         default_factory=CameraQualityConfig,
         title="Recognition input quality",
         description="Bounded detect-frame evidence and shared Face/LPR candidate quality settings.",
+    )
+    recognition_lifecycle: RecognitionLifecycleConfig = Field(
+        default_factory=RecognitionLifecycleConfig,
+        title="Recognition lifecycle",
+        description="Shared bounded retry and candidate diversity policy for Face and LPR.",
     )
     objects: ObjectConfig = Field(
         default_factory=ObjectConfig,
@@ -211,6 +216,28 @@ class CameraConfig(FrigateBaseModel):
 
     @model_validator(mode="after")
     def validate_quality_contract(self) -> "CameraConfig":
+        lifecycle = self.recognition_lifecycle
+        if (
+            lifecycle.min_candidate_interval_seconds
+            > self.quality.buffer.window_seconds
+        ):
+            raise ValueError(
+                "recognition_lifecycle.min_candidate_interval_seconds must not "
+                "exceed quality.buffer.window_seconds"
+            )
+        if (
+            lifecycle.candidate_collection_seconds
+            > self.quality.buffer.window_seconds
+        ):
+            raise ValueError(
+                "recognition_lifecycle.candidate_collection_seconds must not "
+                "exceed quality.buffer.window_seconds"
+            )
+        if self.quality.enabled and lifecycle.max_attempts > self.quality.top_k:
+            raise ValueError(
+                "recognition_lifecycle.max_attempts must be less than or equal "
+                "to quality.top_k when quality is enabled"
+            )
         if self.quality.enabled and self.quality.buffer.sample_fps > self.detect.fps:
             raise ValueError(
                 "quality.buffer.sample_fps must be less than or equal to detect.fps"
@@ -256,11 +283,14 @@ class CameraConfig(FrigateBaseModel):
 
     @property
     def frame_shape(self) -> tuple[int, int]:
+        if self.detect.height is None or self.detect.width is None:
+            raise RuntimeError("detect dimensions have not been resolved")
         return self.detect.height, self.detect.width
 
     @property
     def frame_shape_yuv(self) -> tuple[int, int]:
-        return self.detect.height * 3 // 2, self.detect.width
+        height, width = self.frame_shape
+        return height * 3 // 2, width
 
     @property
     def ffmpeg_cmds(self) -> list[dict[str, list[str]]]:
@@ -289,19 +319,22 @@ class CameraConfig(FrigateBaseModel):
             if ffmpeg_cmd is None:
                 continue
 
-            ffmpeg_cmds.append({"roles": ffmpeg_input.roles, "cmd": ffmpeg_cmd})
+            ffmpeg_cmds.append(
+                {"roles": [role.value for role in ffmpeg_input.roles], "cmd": ffmpeg_cmd}
+            )
         self._ffmpeg_cmds = ffmpeg_cmds
 
     def _get_ffmpeg_cmd(self, ffmpeg_input: CameraInput):
         ffmpeg_output_args = []
+        detect_height, detect_width = self.frame_shape
         if "detect" in ffmpeg_input.roles:
             detect_args = get_ffmpeg_arg_list(self.ffmpeg.output_args.detect)
             scale_detect_args = parse_preset_hardware_acceleration_scale(
                 ffmpeg_input.hwaccel_args or self.ffmpeg.hwaccel_args,
                 detect_args,
                 self.detect.fps,
-                self.detect.width,
-                self.detect.height,
+                detect_width,
+                detect_height,
             )
 
             ffmpeg_output_args = scale_detect_args + ffmpeg_output_args + ["pipe:"]
@@ -317,7 +350,9 @@ class CameraConfig(FrigateBaseModel):
 
             ffmpeg_output_args = (
                 record_args
-                + [f"{os.path.join(CACHE_DIR, self.name)}@{CACHE_SEGMENT_FORMAT}.mp4"]
+                + [
+                    f"{os.path.join(CACHE_DIR, self.name or '')}@{CACHE_SEGMENT_FORMAT}.mp4"
+                ]
                 + ffmpeg_output_args
             )
 
@@ -336,16 +371,16 @@ class CameraConfig(FrigateBaseModel):
             parse_preset_hardware_acceleration_decode(
                 ffmpeg_input.hwaccel_args,
                 self.detect.fps,
-                self.detect.width,
-                self.detect.height,
+                detect_width,
+                detect_height,
                 self.ffmpeg.gpu,
             )
             or ffmpeg_input.hwaccel_args
             or parse_preset_hardware_acceleration_decode(
                 camera_arg,
                 self.detect.fps,
-                self.detect.width,
-                self.detect.height,
+                detect_width,
+                detect_height,
                 self.ffmpeg.gpu,
             )
             or camera_arg

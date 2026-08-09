@@ -10,7 +10,7 @@ import threading
 from collections import deque
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 from peewee import DoesNotExist
 
@@ -53,6 +53,7 @@ from frigate.data_processing.common.license_plate.pipeline import (
     PlateCommit,
 )
 from frigate.data_processing.common.quality import QualitySelector
+from frigate.data_processing.common.recognition import RecognitionLifecycle
 from frigate.data_processing.post.api import PostProcessorApi
 from frigate.data_processing.post.audio_transcription import (
     AudioTranscriptionPostProcessor,
@@ -64,11 +65,6 @@ from frigate.data_processing.post.object_descriptions import ObjectDescriptionPr
 from frigate.data_processing.post.review_descriptions import ReviewDescriptionProcessor
 from frigate.data_processing.post.semantic_trigger import SemanticTriggerProcessor
 from frigate.data_processing.real_time.api import RealTimeProcessorApi
-from frigate.data_processing.real_time.bird import BirdRealTimeProcessor
-from frigate.data_processing.real_time.custom_classification import (
-    CustomObjectClassificationProcessor,
-    CustomStateClassificationProcessor,
-)
 from frigate.data_processing.real_time.face import FaceRealTimeProcessor
 from frigate.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
@@ -101,7 +97,7 @@ class EmbeddingMaintainer(threading.Thread):
     def __init__(
         self,
         config: FrigateConfig,
-        metrics: DataProcessorMetrics | None,
+        metrics: DataProcessorMetrics,
         stop_event: MpEvent,
         face_result_queue: Queue,
     ) -> None:
@@ -109,7 +105,7 @@ class EmbeddingMaintainer(threading.Thread):
         self.config = config
         self.metrics = metrics
         self.face_result_queue = face_result_queue
-        self.embeddings = None
+        self.embeddings: Embeddings | None = None
         self.config_updater = CameraConfigUpdateSubscriber(
             self.config,
             self.config.cameras,
@@ -149,15 +145,24 @@ class EmbeddingMaintainer(threading.Thread):
 
         self.genai_manager = GenAIClientManager(config)
 
-        if config.semantic_search.enabled:
+        needs_embeddings = (
+            config.semantic_search.enabled
+            or any(
+                camera.audio_transcription.enabled
+                or camera.objects.genai.enabled_in_config
+                for camera in config.cameras.values()
+            )
+        )
+        if needs_embeddings:
             self.embeddings = Embeddings(config, db, metrics, self.genai_manager)
 
             # Check if we need to re-index events
-            if config.semantic_search.reindex:
+            if config.semantic_search.enabled and config.semantic_search.reindex:
                 self.embeddings.reindex()
 
             # Sync semantic search triggers in db with config
-            self.embeddings.sync_triggers()
+            if config.semantic_search.enabled:
+                self.embeddings.sync_triggers()
 
         # create communication for updating event descriptions
         self.requestor = InterProcessRequestor()
@@ -195,6 +200,8 @@ class EmbeddingMaintainer(threading.Thread):
             }
         )
         self.quality_selector = QualitySelector(self.evidence_ring)
+        self.recognition_lifecycle = RecognitionLifecycle()
+        self._custom_processor_types: tuple[type[Any], type[Any]] | None = None
 
         self.detected_license_plates: dict[str, dict[str, Any]] = {}
         self._published_lpr_commits: set[str] = set()
@@ -204,7 +211,7 @@ class EmbeddingMaintainer(threading.Thread):
         if self.config.lpr.enabled:
             lpr_model_runner = LicensePlateModelRunner(
                 self.requestor,
-                device=self.config.lpr.device,
+                device=self.config.lpr.device or "CPU",
                 model_size=self.config.lpr.model_size,
             )
 
@@ -221,11 +228,14 @@ class EmbeddingMaintainer(threading.Thread):
                     metrics,
                     self.evidence_ring,
                     self.quality_selector,
+                    self.recognition_lifecycle,
                 )
             )
             logger.debug("FaceRealTimeProcessor initialized successfully")
 
         if self.config.classification.bird.enabled:
+            from frigate.data_processing.real_time.bird import BirdRealTimeProcessor
+
             self.realtime_processors.append(
                 BirdRealTimeProcessor(
                     self.config, self.event_metadata_publisher, metrics
@@ -243,6 +253,7 @@ class EmbeddingMaintainer(threading.Thread):
                     self.detected_license_plates,
                     self.evidence_ring,
                     self.quality_selector,
+                    self.recognition_lifecycle,
                 )
             )
 
@@ -250,12 +261,16 @@ class EmbeddingMaintainer(threading.Thread):
             if not model_config.enabled:
                 continue
 
+            state_processor_type, object_processor_type = (
+                self._get_custom_processor_types()
+            )
+
             self.realtime_processors.append(
-                CustomStateClassificationProcessor(
+                state_processor_type(
                     self.config, model_config, self.requestor, self.metrics
                 )
                 if model_config.state_config != None
-                else CustomObjectClassificationProcessor(
+                else object_processor_type(
                     self.config,
                     model_config,
                     self.event_metadata_publisher,
@@ -293,6 +308,8 @@ class EmbeddingMaintainer(threading.Thread):
             c.enabled_in_config and c.audio_transcription.enabled
             for c in self.config.cameras.values()
         ):
+            if self.embeddings is None:
+                raise RuntimeError("Audio transcription requires embeddings")
             self.post_processors.append(
                 AudioTranscriptionPostProcessor(
                     self.config, self.requestor, self.embeddings, metrics
@@ -301,6 +318,8 @@ class EmbeddingMaintainer(threading.Thread):
 
         semantic_trigger_processor: SemanticTriggerProcessor | None = None
         if self.config.semantic_search.enabled:
+            if self.embeddings is None:
+                raise RuntimeError("Semantic search requires embeddings")
             semantic_trigger_processor = SemanticTriggerProcessor(
                 db,
                 self.config,
@@ -312,6 +331,8 @@ class EmbeddingMaintainer(threading.Thread):
             self.post_processors.append(semantic_trigger_processor)
 
         if any(c.objects.genai.enabled_in_config for c in self.config.cameras.values()):
+            if self.embeddings is None:
+                raise RuntimeError("Object descriptions require embeddings")
             self.post_processors.append(
                 ObjectDescriptionProcessor(
                     self.config,
@@ -323,13 +344,34 @@ class EmbeddingMaintainer(threading.Thread):
                 )
             )
 
+        # Recordings availability is process-owned mutable state and must exist
+        # before the maintainer thread starts consuming updates.
+        self.recordings_available_through: dict[str, float] = {}
         self.stop_event = stop_event
 
-        # recordings data
-        self.recordings_available_through: dict[str, float] = {}
+    def _get_custom_processor_types(self) -> tuple[type[Any], type[Any]]:
+        if self._custom_processor_types is None:
+            from frigate.data_processing.real_time.custom_classification import (
+                CustomObjectClassificationProcessor,
+                CustomStateClassificationProcessor,
+            )
+
+            self._custom_processor_types = (
+                CustomStateClassificationProcessor,
+                CustomObjectClassificationProcessor,
+            )
+        return self._custom_processor_types
 
     def run(self) -> None:
         """Maintain a SQLite-vec database for semantic search."""
+        try:
+            self._run_loop()
+        except BaseException:
+            logger.exception("Embeddings maintainer failed")
+            raise
+
+    def _run_loop(self) -> None:
+        """Run the maintainer loop and surface failures to the process owner."""
         self._detection_reader.start()
         while not self.stop_event.is_set():
             self.config_updater.check_for_updates()
@@ -349,6 +391,7 @@ class EmbeddingMaintainer(threading.Thread):
         for processor in self.realtime_processors:
             processor.shutdown()
         self.quality_selector.shutdown()
+        self.recognition_lifecycle.shutdown()
         self.evidence_ring.close()
 
         self.config_updater.stop()
@@ -366,8 +409,12 @@ class EmbeddingMaintainer(threading.Thread):
 
     def _sync_quality_metrics(self) -> None:
         ring = self.evidence_ring.stats()
-        self.metrics.evidence_camera_stats.clear()
-        self.metrics.evidence_camera_stats.update(ring.get("cameras", {}))
+        camera_snapshot = ring.get("cameras", {})
+        self.metrics.evidence_camera_stats.update(camera_snapshot)
+        for stale_camera in set(self.metrics.evidence_camera_stats.keys()) - set(
+            camera_snapshot
+        ):
+            self.metrics.evidence_camera_stats.pop(stale_camera, None)
         camera_stats = ring.get("cameras", {}).values()
         self.metrics.evidence_frames.value = sum(
             camera.get("frames", 0) for camera in camera_stats
@@ -400,6 +447,9 @@ class EmbeddingMaintainer(threading.Thread):
         reject_counts = quality.get("reject_reasons", {})
         for name, metric in self.metrics.quality_reject_counts.items():
             metric.value = float(reject_counts.get(name, 0))
+        self.metrics.recognition_lifecycle_stats.update(
+            self.recognition_lifecycle.stats()
+        )
 
     def _check_enrichment_config_updates(self) -> None:
         """Check for enrichment config updates and delegate to processors."""
@@ -414,7 +464,10 @@ class EmbeddingMaintainer(threading.Thread):
             return
 
         if topic == "config/genai":
-            self.config.genai = payload
+            if not isinstance(payload, dict):
+                logger.warning("Ignoring invalid GenAI configuration update")
+                return
+            self.config.genai = cast(Any, payload)
             self.genai_manager.update_config(self.config)
 
         # Broadcast to all processors — each decides if the topic is relevant
@@ -426,16 +479,11 @@ class EmbeddingMaintainer(threading.Thread):
 
     def _remove_custom_classification_processor(self, model_name: str) -> None:
         """Shut down and drop any running processor for a custom model."""
+        custom_processor_types = self._get_custom_processor_types()
         remaining = []
         for processor in self.realtime_processors:
             if (
-                isinstance(
-                    processor,
-                    (
-                        CustomStateClassificationProcessor,
-                        CustomObjectClassificationProcessor,
-                    ),
-                )
+                isinstance(processor, custom_processor_types)
                 and processor.model_config.name == model_name
             ):
                 processor.shutdown()
@@ -457,6 +505,7 @@ class EmbeddingMaintainer(threading.Thread):
             return
 
         self.config.classification.custom[model_name] = model_config
+        state_processor_type, object_processor_type = self._get_custom_processor_types()
 
         # A disabled model must not run; tear down any existing processor and
         # do not register a new one.
@@ -467,13 +516,7 @@ class EmbeddingMaintainer(threading.Thread):
 
         for processor in self.realtime_processors:
             if (
-                isinstance(
-                    processor,
-                    (
-                        CustomStateClassificationProcessor,
-                        CustomObjectClassificationProcessor,
-                    ),
-                )
+                isinstance(processor, state_processor_type | object_processor_type)
                 and processor.model_config.name == model_name
             ):
                 processor.model_config = model_config
@@ -483,11 +526,11 @@ class EmbeddingMaintainer(threading.Thread):
                 return
 
         if model_config.state_config is not None:
-            processor = CustomStateClassificationProcessor(
+            processor = state_processor_type(
                 self.config, model_config, self.requestor, self.metrics
             )
         else:
-            processor = CustomObjectClassificationProcessor(
+            processor = object_processor_type(
                 self.config,
                 model_config,
                 self.event_metadata_publisher,
@@ -503,10 +546,12 @@ class EmbeddingMaintainer(threading.Thread):
     def _process_requests(self) -> None:
         """Process embeddings requests"""
 
-        def _handle_request(topic: str, data: dict[str, Any]) -> str:
+        def _handle_request(topic: str, data: dict[str, Any]) -> Any:
             try:
                 # First handle the embedding-specific topics when semantic search is enabled
                 if self.config.semantic_search.enabled:
+                    if self.embeddings is None:
+                        raise RuntimeError("Semantic search embeddings are unavailable")
                     if topic == EmbeddingsRequestEnum.embed_description.value:
                         return serialize(
                             self.embeddings.embed_description(
@@ -522,7 +567,9 @@ class EmbeddingMaintainer(threading.Thread):
                         )
                     elif topic == EmbeddingsRequestEnum.generate_search.value:
                         return serialize(
-                            self.embeddings.embed_description("", data, upsert=False),
+                            self.embeddings.embed_description(
+                                "", str(data.get("description", "")), upsert=False
+                            ),
                             pack=False,
                         )
                     elif topic == EmbeddingsRequestEnum.reindex.value:
@@ -540,6 +587,7 @@ class EmbeddingMaintainer(threading.Thread):
                 return None
             except Exception as e:
                 logger.exception(f"Unable to handle embeddings request {e}")
+                return None
 
         self.embeddings_responder.check_for_request(_handle_request)
 
@@ -562,7 +610,7 @@ class EmbeddingMaintainer(threading.Thread):
             )
             return
 
-        if self.config.semantic_search.enabled:
+        if self.config.semantic_search.enabled and self.embeddings is not None:
             self.embeddings.update_stats()
 
         camera_config = self.config.cameras.get(camera)
@@ -670,7 +718,8 @@ class EmbeddingMaintainer(threading.Thread):
                     continue
 
                 # Skip the event if not an object
-                if event.data.get("type") != "object":
+                event_data = event.data
+                if not isinstance(event_data, dict) or event_data.get("type") != "object":
                     for processor in self.post_processors:
                         if isinstance(processor, ObjectDescriptionProcessor):
                             processor.cleanup_event(event_id)
@@ -680,7 +729,8 @@ class EmbeddingMaintainer(threading.Thread):
                 thumbnail = get_event_thumbnail_bytes(event)
 
                 # Embed the thumbnail
-                self._embed_thumbnail(event_id, thumbnail)
+                if thumbnail is not None:
+                    self._embed_thumbnail(event_id, thumbnail)
 
             # call any defined post processors
             for processor in self.post_processors:
@@ -796,9 +846,11 @@ class EmbeddingMaintainer(threading.Thread):
 
     def _process_event_metadata(self):
         # Check for regenerate description requests
-        (topic, payload) = self.event_metadata_subscriber.check_for_update()
-
-        if topic is None:
+        update = self.event_metadata_subscriber.check_for_update()
+        if update is None:
+            return
+        topic, payload = update
+        if topic is None or not isinstance(payload, tuple | list) or len(payload) != 3:
             return
 
         event_id, source, force = payload
@@ -818,7 +870,10 @@ class EmbeddingMaintainer(threading.Thread):
     def _read_detection_updates(self) -> None:
         """Continuously conflate detection updates into one slot per camera."""
         while not self.stop_event.is_set():
-            _, data = self.detection_subscriber.check_for_update(timeout=0.1)
+            update = self.detection_subscriber.check_for_update(timeout=0.1)
+            if update is None:
+                continue
+            _, data = update
             if not data or not data[0]:
                 continue
             camera = str(data[0])
@@ -881,8 +936,23 @@ class EmbeddingMaintainer(threading.Thread):
             if isinstance(processor, FaceRealTimeProcessor)
         ]
         face_enabled = bool(face_processors and camera_config.face_recognition.enabled)
+        lpr_processors = [
+            processor
+            for processor in self.realtime_processors
+            if isinstance(processor, LicensePlateRealTimeProcessor)
+        ]
+        tracked_lpr_enabled = bool(
+            lpr_processors
+            and camera_config.lpr.enabled
+            and not dedicated_lpr_enabled
+        )
 
-        if not dedicated_lpr_enabled and not has_enabled_custom and not face_enabled:
+        if (
+            not dedicated_lpr_enabled
+            and not tracked_lpr_enabled
+            and not has_enabled_custom
+            and not face_enabled
+        ):
             # no active features that use this data
             return
 
@@ -914,12 +984,13 @@ class EmbeddingMaintainer(threading.Thread):
             ):
                 if face_enabled:
                     self.quality_selector.record_reject("face", "buffer_capacity")
-                if dedicated_lpr_enabled:
+                if dedicated_lpr_enabled or tracked_lpr_enabled:
                     self.quality_selector.record_reject("lpr", "buffer_capacity")
         else:
             # Compatibility for isolated processor tests that bypass __init__.
             evidence_ref = yuv_frame
 
+        owns_evidence = hasattr(self, "evidence_ring")
         for processor in self.realtime_processors:
             if face_enabled and isinstance(processor, FaceRealTimeProcessor):
                 people = [
@@ -927,25 +998,70 @@ class EmbeddingMaintainer(threading.Thread):
                     for obj in (tracked_objects or [])
                     if obj.get("label") == "person" and obj.get("box")
                 ]
-                processor.expire_missing_objects(
-                    camera, {str(obj["id"]) for obj in people}
-                )
                 people.sort(key=lambda obj: int(obj.get("area", 0)), reverse=True)
                 for obj in people[:4]:
-                    if hasattr(processor, "submit_frame") and evidence_ref is not None:
-                        processor.submit_frame(obj, evidence_ref)
+                    if owns_evidence and evidence_ref is not None:
+                        processor.submit_frame(obj, cast(FrameRef, evidence_ref))
                     else:
                         processor.process_frame(obj, yuv_frame)
+
+            if (
+                tracked_lpr_enabled
+                and isinstance(processor, LicensePlateRealTimeProcessor)
+                and owns_evidence
+                and evidence_ref is not None
+            ):
+                lpr_objects = [
+                    obj
+                    for obj in (tracked_objects or [])
+                    if obj.get("box")
+                    and (
+                        obj.get("label") in {"car", "motorcycle"}
+                        or obj.get("label") == "license_plate"
+                    )
+                ]
+                admissions, _ = processor.associate_frame_objects(camera, lpr_objects)
+                for admission in admissions:
+                    vehicle_track_id = getattr(admission, "vehicle_track_id", None)
+                    plate_track_ids = tuple(
+                        getattr(admission, "plate_track_ids", ())
+                    )
+                    passage_trace(
+                        "track_seen",
+                        camera=camera,
+                        frame_time=float(admission.obj_data.get("frame_time") or frame_time),
+                        passage_id=admission.passage_id,
+                        recognition_passage_id=admission.passage_id,
+                        track_id=vehicle_track_id
+                        or (plate_track_ids[0] if plate_track_ids else None),
+                        raw_track_lineage=[
+                            value
+                            for value in (
+                                vehicle_track_id,
+                                *plate_track_ids,
+                            )
+                            if value
+                        ],
+                        object_box=admission.obj_data.get("box"),
+                    )
+                    processor.process_frame(
+                        admission.obj_data, cast(FrameRef, evidence_ref)
+                    )
 
             if (
                 dedicated_lpr_enabled
                 and len(motion_boxes) > 0
                 and isinstance(processor, LicensePlateRealTimeProcessor)
+                and owns_evidence
                 and evidence_ref is not None
             ):
-                processor.process_frame(camera, evidence_ref, True)
+                processor.process_frame(camera, cast(FrameRef, evidence_ref), True)
 
-            if isinstance(processor, CustomStateClassificationProcessor):
+            custom_processor_types = getattr(self, "_custom_processor_types", None)
+            if (
+                custom_processor_types is not None
+                and isinstance(processor, custom_processor_types[0])
+            ):
                 processor.process_frame(
                     {"camera": camera, "motion": motion_boxes}, yuv_frame
                 )
@@ -1125,7 +1241,14 @@ class EmbeddingMaintainer(threading.Thread):
             "event_published",
             camera=commit.camera,
             frame_time=commit.frame_time,
+            passage_id=commit.key.passage_id,
             track_id=commit.event_id,
+            vehicle_track_id=(commit.obj_data or {}).get(
+                "_recognition_vehicle_track_id"
+            ),
+            plate_track_ids=list(
+                (commit.obj_data or {}).get("_recognition_plate_track_ids", ())
+            ),
             plate=commit.plate,
             score=commit.score,
             plate_box=commit.plate_box,
@@ -1141,6 +1264,9 @@ class EmbeddingMaintainer(threading.Thread):
     def _embed_thumbnail(self, event_id: str, thumbnail: bytes) -> None:
         """Embed the thumbnail for an event."""
         if not self.config.semantic_search.enabled:
+            return
+        if self.embeddings is None:
+            logger.error("Semantic search is enabled but embeddings are unavailable")
             return
 
         try:

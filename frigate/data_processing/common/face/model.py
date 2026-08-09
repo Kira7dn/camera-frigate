@@ -3,6 +3,8 @@ import os
 import queue
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -14,7 +16,20 @@ from frigate.embeddings.onnx.face_embedding import ArcfaceEmbedding, FaceNetEmbe
 from frigate.log import redirect_output_to_logger
 from frigate.util.face_snapshot import is_face_identity_directory
 
+cv2_face = cast(Any, cv2).face
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class FaceMatch:
+    top1_label: str
+    top1_score: float
+    top2_label: str | None
+    top2_score: float
+
+    @property
+    def margin(self) -> float:
+        return self.top1_score - self.top2_score
 
 
 class FaceRecognizer(ABC):
@@ -22,7 +37,7 @@ class FaceRecognizer(ABC):
 
     def __init__(self, config: FrigateConfig) -> None:
         self.config = config
-        self.landmark_detector: cv2.face.Facemark | None = None
+        self.landmark_detector: Any | None = None
         self.init_landmark_detector()
 
     @abstractmethod
@@ -44,12 +59,12 @@ class FaceRecognizer(ABC):
         self.landmark_detector = self.create_landmark_detector()
 
     @redirect_output_to_logger(logger, logging.DEBUG)  # type: ignore[misc]
-    def create_landmark_detector(self) -> cv2.face.Facemark | None:
+    def create_landmark_detector(self) -> Any | None:
         """Create one landmark detector for one owning CPU worker."""
         landmark_model = os.path.join(MODEL_CACHE_DIR, "facedet/landmarkdet.yaml")
         if not os.path.exists(landmark_model):
             return None
-        landmark_detector = cv2.face.createFacemarkLBF()
+        landmark_detector = cv2_face.createFacemarkLBF()
         landmark_detector.loadModel(landmark_model)
         return landmark_detector
 
@@ -65,7 +80,7 @@ class FaceRecognizer(ABC):
 
     @staticmethod
     def align_face_with(
-        landmark_detector: cv2.face.Facemark | None,
+        landmark_detector: Any | None,
         image: np.ndarray,
         output_width: int,
         output_height: int,
@@ -133,7 +148,7 @@ class FaceRecognizer(ABC):
     def prepare_face(
         self,
         face_image: np.ndarray,
-        landmark_detector: cv2.face.Facemark | None = None,
+        landmark_detector: Any | None = None,
     ) -> tuple[np.ndarray, float]:
         """Run CPU-only scoring and alignment with a worker-owned detector."""
         blur_reduction = self.get_blur_confidence_reduction(face_image)
@@ -150,6 +165,17 @@ class FaceRecognizer(ABC):
     ) -> list[tuple[str, float] | None]:
         """Default bounded sequential path used by the static-batch FaceNet model."""
         return [self.classify(image) for image, _ in prepared]
+
+    def classify_prepared_top2_batch(
+        self, prepared: list[tuple[np.ndarray, float]]
+    ) -> list[FaceMatch | None]:
+        """Compatibility adapter for recognizers without a ranked matcher."""
+        return [
+            FaceMatch(result[0], float(result[1]), None, 0.0)
+            if result is not None
+            else None
+            for result in self.classify_prepared_batch(prepared)
+        ]
 
     def get_blur_confidence_reduction(self, input: np.ndarray) -> float:
         """Calculates the reduction in confidence based on the blur of the image."""
@@ -227,11 +253,11 @@ def build_class_mean(
 
 
 def similarity_to_confidence(
-    cosine_similarity: float,
+    cosine_similarity: Any,
     median: float = 0.3,
     range_width: float = 0.6,
     slope_factor: float = 12,
-) -> float:
+) -> Any:
     """
     Default sigmoid function to map cosine similarity to confidence.
 
@@ -281,6 +307,7 @@ class FaceNetRecognizer(FaceRecognizer):
         def build_model() -> None:
             face_embeddings_map: dict[str, list[np.ndarray]] = {}
             idx = 0
+            landmark_detector = self.create_landmark_detector()
 
             dir = FACE_DIR
             for name in os.listdir(dir):
@@ -382,6 +409,14 @@ class FaceNetRecognizer(FaceRecognizer):
     def classify_prepared_batch(
         self, prepared: list[tuple[np.ndarray, float]]
     ) -> list[tuple[str, float] | None]:
+        return [
+            (match.top1_label, match.top1_score) if match is not None else None
+            for match in self.classify_prepared_top2_batch(prepared)
+        ]
+
+    def classify_prepared_top2_batch(
+        self, prepared: list[tuple[np.ndarray, float]]
+    ) -> list[FaceMatch | None]:
         """Keep FaceNet sequential because its TFLite input is static batch one."""
         if self.model_builder_queue is not None:
             self.build()
@@ -389,12 +424,11 @@ class FaceNetRecognizer(FaceRecognizer):
             self.build()
             if not self.mean_embs:
                 return [None] * len(prepared)
-        results: list[tuple[str, float] | None] = []
+        results: list[FaceMatch | None] = []
         for image, blur_reduction in prepared:
             with self.embedding_lock:
                 embedding = self.face_embedder([image])[0].squeeze()
-            score = 0.0
-            label = ""
+            ranked: list[tuple[float, str]] = []
             for name, mean_emb in self.mean_embs.items():
                 cosine_similarity = np.dot(embedding, mean_emb) / (
                     np.linalg.norm(embedding) * np.linalg.norm(mean_emb)
@@ -402,10 +436,21 @@ class FaceNetRecognizer(FaceRecognizer):
                 confidence = similarity_to_confidence(
                     cosine_similarity, median=0.5, range_width=0.6
                 )
-                if confidence > score:
-                    score = float(confidence)
-                    label = name
-            results.append((label, max(0, round(score - blur_reduction, 2))))
+                ranked.append((float(confidence), name))
+            ranked.sort(reverse=True)
+            if not ranked:
+                results.append(None)
+                continue
+            top1_score, top1_label = ranked[0]
+            top2_score, top2_label = ranked[1] if len(ranked) > 1 else (0.0, None)
+            results.append(
+                FaceMatch(
+                    top1_label,
+                    max(0, round(top1_score - blur_reduction, 2)),
+                    top2_label,
+                    max(0, round(top2_score - blur_reduction, 2)),
+                )
+            )
         return results
 
 
@@ -462,7 +507,7 @@ class ArcFaceRecognizer(FaceRecognizer):
                         landmark_detector, img, img.shape[1], img.shape[0]
                     )
                     with self.embedding_lock:
-                        emb = self.face_embedder([img])[0].squeeze()  # type: ignore[arg-type]
+                        emb = cast(Any, self.face_embedder)([img])[0].squeeze()
                     face_embeddings_map[name].append(emb)
 
                 idx += 1
@@ -533,7 +578,7 @@ class ArcFaceRecognizer(FaceRecognizer):
     def prepare_face(
         self,
         face_image: np.ndarray,
-        landmark_detector: cv2.face.Facemark | None = None,
+        landmark_detector: Any | None = None,
     ) -> tuple[np.ndarray, float]:
         """Align and normalize on CPU before work reaches the GPU executor."""
         aligned, blur_reduction = super().prepare_face(
@@ -544,6 +589,14 @@ class ArcFaceRecognizer(FaceRecognizer):
     def classify_prepared_batch(
         self, prepared: list[tuple[np.ndarray, float]]
     ) -> list[tuple[str, float] | None]:
+        return [
+            (match.top1_label, match.top1_score) if match is not None else None
+            for match in self.classify_prepared_top2_batch(prepared)
+        ]
+
+    def classify_prepared_top2_batch(
+        self, prepared: list[tuple[np.ndarray, float]]
+    ) -> list[FaceMatch | None]:
         """Embed a dynamic batch and classify it with one matrix multiply."""
         if not prepared:
             return []
@@ -567,10 +620,27 @@ class ArcFaceRecognizer(FaceRecognizer):
             ).astype(np.float32, copy=False)
         embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-9
         similarities = embeddings @ library.T
-        confidences = similarity_to_confidence(similarities)
-        best_indices = np.argmax(confidences, axis=1)
-        results: list[tuple[str, float] | None] = []
-        for row, best_index in enumerate(best_indices):
-            score = float(confidences[row, best_index]) - prepared[row][1]
-            results.append((labels[int(best_index)], max(0, round(score, 2))))
+        confidences = np.asarray(similarity_to_confidence(similarities))
+        results: list[FaceMatch | None] = []
+        for row in range(confidences.shape[0]):
+            order = np.argsort(-confidences[row])
+            best_index = int(order[0])
+            second_index = int(order[1]) if len(order) > 1 else None
+            reduction = prepared[row][1]
+            top1_score = max(
+                0, round(float(confidences[row, best_index]) - reduction, 2)
+            )
+            top2_score = (
+                max(0, round(float(confidences[row, second_index]) - reduction, 2))
+                if second_index is not None
+                else 0.0
+            )
+            results.append(
+                FaceMatch(
+                    labels[best_index],
+                    top1_score,
+                    labels[second_index] if second_index is not None else None,
+                    top2_score,
+                )
+            )
         return results

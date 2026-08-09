@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from multiprocessing import Manager
 
 import numpy as np
 
@@ -13,10 +14,33 @@ from frigate.data_processing.common.evidence import (
     EvidenceSourceRole,
 )
 from frigate.data_processing.common.quality import QualitySelector, QualityThresholds
+from frigate.data_processing.common.recognition import RecognitionLifecycle
+from frigate.data_processing.types import DataProcessorMetrics
+from frigate.embeddings.maintainer import EmbeddingMaintainer
 
 
 def i420(width: int = 8, height: int = 8, value: int = 96) -> np.ndarray:
     return np.full((height * 3 // 2, width), value, dtype=np.uint8)
+
+
+class TestMetricSync(unittest.TestCase):
+    def test_quality_metric_sync_publishes_atomic_proxy_snapshots(self) -> None:
+        with Manager() as manager:
+            maintainer = object.__new__(EmbeddingMaintainer)
+            maintainer.metrics = DataProcessorMetrics(manager, [])
+            maintainer.evidence_ring = EvidenceRingBuffer({})
+            maintainer.quality_selector = QualitySelector(maintainer.evidence_ring)
+            maintainer.recognition_lifecycle = RecognitionLifecycle()
+
+            # Shared dict readers use copy(), so the writer must update in place
+            # instead of exposing the transient empty state from clear/update.
+            maintainer.metrics.recognition_lifecycle_stats["exhausted"] = 2
+            maintainer._sync_quality_metrics()
+
+            snapshot = maintainer.metrics.recognition_lifecycle_stats.copy()
+            self.assertEqual(snapshot["exhausted"], 2)
+            self.assertEqual(snapshot["active_lifecycles"], 0)
+            self.assertEqual(snapshot["in_flight"], 0)
 
 
 class TestEvidenceRingBuffer(unittest.TestCase):
@@ -153,6 +177,38 @@ class TestQualitySelector(unittest.TestCase):
         )
         self.assertEqual(self.selector.stats()["deduped"], 1)
         candidate.release()
+
+    def test_lpr_aspect_and_edge_clipping_are_hard_quality_gates(self) -> None:
+        thresholds = QualityThresholds(
+            24, 14, 20.0, 0.75, 0.75, 1.2, 6.0, 1
+        )
+        clipped = self.selector.select(
+            task="lpr",
+            camera="cam",
+            track_id="edge",
+            generation=1,
+            frame_ref=self._ref(4),
+            object_bbox=(0, 0, 60, 40),
+            detail_bbox=(0, 3, 48, 35),
+            detail_frame=self.sharp,
+            thresholds=thresholds,
+        )
+        square = self.selector.select(
+            task="lpr",
+            camera="cam",
+            track_id="aspect",
+            generation=1,
+            frame_ref=self._ref(5),
+            object_bbox=(0, 0, 60, 40),
+            detail_bbox=(2, 3, 34, 35),
+            detail_frame=self.sharp,
+            thresholds=thresholds,
+        )
+        self.assertIsNone(clipped)
+        self.assertIsNone(square)
+        reasons = self.selector.stats()["reject_reasons"]
+        self.assertEqual(reasons["lpr:detail_box_edge_clipped"], 1)
+        self.assertEqual(reasons["lpr:aspect_ratio_out_of_range"], 1)
 
     def test_top_k_replacement_and_generation_reset_release_owners(self) -> None:
         first = self._select(1, self.sharp, top_k=1, detector_score=0.1)

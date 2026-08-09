@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import resource
 import shutil
 import signal
 import subprocess as sp
@@ -13,6 +12,11 @@ import time
 import traceback
 from datetime import datetime
 from typing import Any
+
+try:
+    import resource
+except ImportError:  # Windows development and type-check environments
+    resource = None  # type: ignore[assignment]
 
 import cv2
 import psutil
@@ -1426,6 +1430,9 @@ def set_file_limit() -> None:
     # Newer versions of containerd 2.X+ impose a very low soft file limit of 1024
     # This applies to OSs like HA OS (see https://github.com/home-assistant/operating-system/issues/4110)
     # Attempt to increase this limit
+    if resource is None:
+        return
+
     soft_limit = int(os.getenv("SOFT_FILE_LIMIT", "65536") or "65536")
 
     current_soft, current_hard = resource.getrlimit(resource.RLIMIT_NOFILE)

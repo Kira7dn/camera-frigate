@@ -109,7 +109,9 @@ def reopen_std_streams() -> None:
     sys.stderr = os.fdopen(2, "w")
 
 
-os.register_at_fork(after_in_child=reopen_std_streams)
+register_at_fork = getattr(os, "register_at_fork", None)
+if callable(register_at_fork):
+    register_at_fork(after_in_child=reopen_std_streams)
 
 
 # based on https://codereview.stackexchange.com/a/17959

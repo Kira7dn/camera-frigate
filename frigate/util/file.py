@@ -1,7 +1,7 @@
 """Path and file utilities."""
 
 import base64
-import fcntl
+import importlib
 import logging
 import os
 import time
@@ -17,6 +17,28 @@ from frigate.models import Event
 from frigate.util.image import get_snapshot_bytes, relative_box_to_absolute
 
 logger = logging.getLogger(__name__)
+
+_file_lock_module = importlib.import_module("msvcrt" if os.name == "nt" else "fcntl")
+
+
+def _lock_file_descriptor(fd: int) -> None:
+    if os.name == "nt":
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        _file_lock_module.locking(fd, _file_lock_module.LK_NBLCK, 1)
+    else:
+        _file_lock_module.flock(
+            fd, _file_lock_module.LOCK_EX | _file_lock_module.LOCK_NB
+        )
+
+
+def _unlock_file_descriptor(fd: int) -> None:
+    if os.name == "nt":
+        os.lseek(fd, 0, os.SEEK_SET)
+        _file_lock_module.locking(fd, _file_lock_module.LK_UNLCK, 1)
+    else:
+        _file_lock_module.flock(fd, _file_lock_module.LOCK_UN)
 
 
 def get_event_thumbnail_bytes(event: Event) -> bytes | None:
@@ -92,7 +114,7 @@ def _get_event_snapshot_overlay_boxes(
 
         draw_color = draw_box.get("color", (255, 0, 0))
         color = (
-            tuple(draw_color) if isinstance(draw_color, (list, tuple)) else (255, 0, 0)
+            tuple(draw_color) if isinstance(draw_color, list | tuple) else (255, 0, 0)
         )
         overlay_boxes.append(
             {
@@ -279,8 +301,8 @@ class FileLock:
     """
     A file-based lock for coordinating access to resources across processes.
 
-    Uses fcntl.flock() for proper POSIX file locking on Linux. Supports timeouts,
-    stale lock detection, and can be used as a context manager.
+    Uses the operating system file-lock primitive. Supports timeouts, stale lock
+    detection, and can be used as a context manager.
 
     Example:
         ```python
@@ -373,7 +395,7 @@ class FileLock:
 
     def acquire(self, timeout: int | None = None) -> bool:
         """
-        Acquire the file lock using fcntl.flock().
+        Acquire the file lock using the platform lock primitive.
 
         Args:
             timeout: Maximum time to wait for lock in seconds (uses instance timeout if None)
@@ -400,7 +422,7 @@ class FileLock:
             start_time = time.time()
             while time.time() - start_time < timeout:
                 try:
-                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _lock_file_descriptor(self._fd)
                     self._acquired = True
                     logger.debug(f"Acquired lock: {self.lock_path}")
                     return True
@@ -440,10 +462,10 @@ class FileLock:
             return
 
         try:
-            # Close file descriptor and release fcntl lock
+            # Close the file descriptor and release the platform lock.
             if self._fd is not None:
                 try:
-                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                    _unlock_file_descriptor(self._fd)
                     os.close(self._fd)
                 except Exception as e:
                     logger.warning(f"Error closing lock file descriptor: {e}")

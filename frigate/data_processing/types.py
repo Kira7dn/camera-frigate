@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from enum import Enum
 from multiprocessing.managers import DictProxy, SyncManager, ValueProxy
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
-import sherpa_onnx
+if TYPE_CHECKING:
+    import sherpa_onnx
 
-from frigate.data_processing.real_time.whisper_online import FasterWhisperASR
+    from frigate.data_processing.real_time.whisper_online import FasterWhisperASR
 
 
 class DataProcessorMetrics:
@@ -43,6 +44,7 @@ class DataProcessorMetrics:
     quality_replaced: ValueProxy[float]
     quality_top_k_depth: ValueProxy[float]
     quality_reject_counts: dict[str, ValueProxy[float]]
+    recognition_lifecycle_stats: Any
     review_desc_speed: ValueProxy[float]
     review_desc_dps: ValueProxy[float]
     object_desc_speed: ValueProxy[float]
@@ -96,6 +98,7 @@ class DataProcessorMetrics:
             for task in ("face", "lpr")
             for reason in quality_reasons
         }
+        self.recognition_lifecycle_stats = manager.dict()
         self.review_desc_speed = manager.Value("d", 0.0)
         self.review_desc_dps = manager.Value("d", 0.0)
         self.object_desc_speed = manager.Value("d", 0.0)
@@ -122,4 +125,9 @@ class PostProcessDataEnum(str, Enum):
     tracked_object = "tracked_object"
 
 
-AudioTranscriptionModel = FasterWhisperASR | sherpa_onnx.OnlineRecognizer | None
+if TYPE_CHECKING:
+    AudioTranscriptionModel: TypeAlias = (
+        FasterWhisperASR | sherpa_onnx.OnlineRecognizer | None
+    )
+else:
+    AudioTranscriptionModel = Any

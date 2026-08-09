@@ -16,6 +16,7 @@ from frigate.data_processing.common.license_plate.pipeline import (
     PlateCommit,
     PlateObservation,
 )
+from frigate.data_processing.common.recognition import RecognitionLifecycle
 from frigate.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
 )
@@ -28,6 +29,11 @@ def make_processor(threshold: float = 0.5) -> LicensePlateRealTimeProcessor:
             "cam": SimpleNamespace(
                 detect=SimpleNamespace(fps=5),
                 lpr=SimpleNamespace(expire_time=2.0),
+                recognition_lifecycle=SimpleNamespace(
+                    max_attempts=3,
+                    lpr_min_consensus_votes=2,
+                    lpr_observation_threshold=0.55,
+                ),
             )
         }
     )
@@ -41,6 +47,10 @@ def make_processor(threshold: float = 0.5) -> LicensePlateRealTimeProcessor:
     processor.cluster_threshold = 0.85
     processor._tasks = LatestLprTaskQueue(8)
     processor._states = OrderedDict()
+    processor._prepared = {}
+    processor._collection_started = {}
+    processor._terminal_keys = set()
+    processor.recognition_lifecycle = RecognitionLifecycle()
     processor.quality_selector = None
     processor.evidence_ring = EvidenceRingBuffer(
         {"cam": EvidenceBufferPolicy(10.0, 8 * 1024 * 1024, 100.0)}
@@ -131,35 +141,38 @@ def test_consensus_counts_each_frame_once_and_commits_decision_once() -> None:
     key = LprTrackKey("cam", "track", 0)
     first = observation(processor, key, 1.0)
 
-    assert processor._reduce(first) is not None
+    assert processor._reduce(first) is None
     duplicate = observation(processor, key, 1.0)
     assert processor._reduce(duplicate) is None
-    assert processor._reduce(observation(processor, key, 2.0)) is None
-    assert len(processor._states[key].variants) == 2
-    assert len(processor._states[key].seen_frames) == 2
+    assert processor._reduce(observation(processor, key, 2.0)) is not None
+    assert key not in processor._states
+    assert key in processor._terminal_keys
 
 
-def test_confirmed_close_follow_starts_a_new_generation() -> None:
+def test_new_generation_has_an_independent_lifecycle() -> None:
     processor = make_processor()
     old_key = LprTrackKey("cam", "track", 0)
+    assert processor._reduce(observation(processor, old_key, 1.0, "ABC1234")) is None
     assert (
-        processor._reduce(observation(processor, old_key, 1.0, "ABC1234")) is not None
+        processor._reduce(observation(processor, old_key, 1.5, "ABC1234")) is not None
     )
 
-    assert (
-        processor._reduce(
-            observation(processor, old_key, 2.0, "ZZZ9999", box=(500, 500, 700, 700))
+    new_key = LprTrackKey("cam", "track", 1)
+    assert processor._reduce(
+        observation(
+            processor,
+            new_key,
+            3.0,
+            "ZZZ9999",
+            box=(515, 515, 715, 715),
         )
-        is None
-    )
+    ) is None
     commit = processor._reduce(
-        observation(processor, old_key, 3.0, "ZZZ9999", box=(510, 510, 710, 710))
+        observation(processor, new_key, 4.0, "ZZZ9999", box=(515, 515, 715, 715))
     )
 
     assert commit is not None
     assert commit.key.generation == 1
-    assert not processor._tasks.is_current(old_key)
-    assert processor._states[commit.key].variants[0]["plate"] == "ZZZ9999"
 
 
 def test_state_is_bounded() -> None:
@@ -171,7 +184,7 @@ def test_state_is_bounded() -> None:
 
 
 def test_commit_uses_representative_candidate_frame_and_bbox() -> None:
-    processor = make_processor(threshold=1.0)
+    processor = make_processor(threshold=0.5)
     key = LprTrackKey("cam", "track", 0)
     representative = observation(
         processor,
@@ -183,7 +196,6 @@ def test_commit_uses_representative_candidate_frame_and_bbox() -> None:
     )
     assert processor._reduce(representative) is None
 
-    processor.lpr_config.recognition_threshold = 0.5
     current = observation(
         processor,
         key,
@@ -197,3 +209,62 @@ def test_commit_uses_representative_candidate_frame_and_bbox() -> None:
     assert commit is not None
     assert commit.frame_time == representative.frame_time
     assert commit.object_box == representative.object_box
+
+
+def test_wrong_correct_correct_uses_consensus_representative() -> None:
+    processor = make_processor()
+    key = LprTrackKey("cam", "track", 0)
+    assert processor._reduce(observation(processor, key, 1.0, "WRONG99", 0.91)) is None
+    correct_first = observation(processor, key, 2.0, "ABC1234", 0.94)
+    assert processor._reduce(correct_first) is None
+    commit = processor._reduce(observation(processor, key, 3.0, "ABC1234", 0.90))
+    assert commit is not None
+    assert commit.plate == "ABC1234"
+    assert commit.frame_time == correct_first.frame_time
+
+
+def test_below_threshold_votes_never_enter_consensus() -> None:
+    processor = make_processor(threshold=0.9)
+    key = LprTrackKey("cam", "track", 0)
+    assert processor._reduce(observation(processor, key, 1.0, "657648", 0.62)) is None
+    assert processor._reduce(observation(processor, key, 2.0, "657648", 0.68)) is None
+    assert processor._reduce(observation(processor, key, 3.0, "657648", 0.60)) is None
+    assert key not in processor._states
+    assert key in processor._terminal_keys
+
+
+def test_below_threshold_disagreement_does_not_publish() -> None:
+    processor = make_processor(threshold=0.9)
+    key = LprTrackKey("cam", "track", 0)
+    assert processor._reduce(observation(processor, key, 1.0, "657648", 0.68)) is None
+    assert processor._reduce(observation(processor, key, 2.0, "657648", 0.62)) is None
+    assert processor._reduce(observation(processor, key, 3.0, "657649", 0.65)) is None
+    assert key not in processor._states
+
+
+def test_three_non_consensus_results_do_not_publish() -> None:
+    processor = make_processor()
+    key = LprTrackKey("cam", "track", 0)
+    assert processor._reduce(observation(processor, key, 1.0, "ONE1111", 0.80)) is None
+    assert processor._reduce(observation(processor, key, 2.0, "TWO2222", 0.96)) is None
+    commit = processor._reduce(observation(processor, key, 3.0, "THR3333", 0.90))
+    assert commit is None
+    assert key not in processor._states
+
+
+def test_near_match_variants_are_not_independent_consensus() -> None:
+    processor = make_processor()
+    key = LprTrackKey("cam", "track", 0)
+    assert processor._reduce(observation(processor, key, 1.0, "FKH921", 0.92)) is None
+    assert processor._reduce(observation(processor, key, 2.0, "FKH9211", 0.93)) is None
+    assert processor._reduce(observation(processor, key, 3.0, "FKH921", 0.94)) is not None
+
+
+def test_expiry_before_consensus_does_not_publish() -> None:
+    processor = make_processor()
+    key = LprTrackKey("cam", "track", 0)
+    best = observation(processor, key, 1.0, "ABC1234", 0.93)
+    assert processor._reduce(best) is None
+    processor._finish_passage(key, "insufficient_quality", boundary=True)
+    assert key not in processor._states
+    assert key not in processor._terminal_keys

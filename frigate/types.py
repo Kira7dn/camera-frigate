@@ -1,14 +1,15 @@
 from enum import Enum
-from typing import TypedDict
+from typing import Any, TypedDict
 
-from frigate.camera import CameraMetrics
 from frigate.data_processing.types import DataProcessorMetrics
 from frigate.object_detection.base import ObjectDetectProcess
 
 
 class StatsTrackingTypes(TypedDict):
-    camera_metrics: dict[str, CameraMetrics]
-    embeddings_metrics: DataProcessorMetrics | None
+    # multiprocessing.Manager returns a DictProxy, not a builtin dict. Keep the
+    # IPC proxy intact so stats always observe live camera metric updates.
+    camera_metrics: Any
+    embeddings_metrics: DataProcessorMetrics
     detectors: dict[str, ObjectDetectProcess]
     started: int
     latest_frigate_version: str

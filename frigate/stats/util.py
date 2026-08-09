@@ -62,7 +62,7 @@ def get_latest_version(config: FrigateConfig) -> str:
 def stats_init(
     config: FrigateConfig,
     camera_metrics: DictProxy,
-    embeddings_metrics: DataProcessorMetrics | None,
+    embeddings_metrics: DataProcessorMetrics,
     detectors: dict[str, ObjectDetectProcess],
     processes: dict[str, int],
 ) -> StatsTrackingTypes:
@@ -238,7 +238,7 @@ async def set_gpu_stats(
             if args and args not in hwaccel_args:
                 hwaccel_args.append(args)
 
-    stats: dict[str, dict] = {}
+    stats: dict[str, Any] = {}
     intel_gpu_collected = False
     now = time.monotonic()
 
@@ -320,21 +320,24 @@ async def set_gpu_stats(
 
 
 async def set_npu_usages(config: FrigateConfig, all_stats: dict[str, Any]) -> None:
-    stats: dict[str, dict] = {}
+    stats: dict[str, Any] = {}
 
     for detector in config.detectors.values():
         if detector.type == "rknn":
             # Rockchip NPU usage
             rk_usage = get_rockchip_npu_stats()
-            stats["rockchip"] = rk_usage
-        elif detector.type == "openvino" and detector.device == "NPU":
+            if rk_usage is not None:
+                stats["rockchip"] = rk_usage
+        elif detector.type == "openvino" and getattr(detector, "device", None) == "NPU":
             # OpenVINO NPU usage
             ov_usage = get_openvino_npu_stats()
-            stats["openvino"] = ov_usage
+            if ov_usage is not None:
+                stats["openvino"] = ov_usage
         elif detector.type == "axengine":
             # AXERA NPU usage
             axcl_usage = get_axcl_npu_stats()
-            stats["axengine"] = axcl_usage
+            if axcl_usage is not None:
+                stats["axengine"] = axcl_usage
 
     if stats:
         all_stats["npu_usages"] = stats
@@ -498,7 +501,7 @@ def stats_snapshot(
             "misses": int(embeddings_metrics.evidence_misses.value),
             "cameras": {
                 name: dict(value)
-                for name, value in embeddings_metrics.evidence_camera_stats.items()
+                for name, value in embeddings_metrics.evidence_camera_stats.copy().items()
             },
         }
         stats["embeddings"]["quality_selector"] = {
@@ -513,6 +516,9 @@ def stats_snapshot(
                 if metric.value
             },
         }
+        stats["embeddings"]["recognition_lifecycle"] = (
+            embeddings_metrics.recognition_lifecycle_stats.copy()
+        )
 
         if embeddings_metrics.review_desc_speed.value > 0.0:
             stats["embeddings"]["review_description_speed"] = round(

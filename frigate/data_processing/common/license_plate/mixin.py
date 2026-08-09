@@ -10,11 +10,11 @@ import random
 import re
 import string
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cv2
 import numpy as np
-from pyclipper import ET_CLOSEDPOLYGON, JT_ROUND, PyclipperOffset
+import pyclipper
 from rapidfuzz.distance import JaroWinkler
 from shapely.geometry import Polygon
 
@@ -27,14 +27,18 @@ from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
 from frigate.data_processing.common.evidence import FrameRef
-from frigate.data_processing.common.quality import QualityThresholds
+from frigate.data_processing.common.quality import QualitySelector, QualityThresholds
+from frigate.data_processing.common.recognition import (
+    RecognitionLifecycle,
+    RecognitionStatus,
+)
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.image import area
 from frigate.util.passage_trace import passage_trace
 
 from ...types import DataProcessorMetrics
 from .constants import LPR_EMBEDDING_SIZE
-from .pipeline import LprTrackKey, PlateObservation
+from .pipeline import LprTrackKey, PlateObservation, PreparedPlateCandidate
 
 if TYPE_CHECKING:
     from frigate.data_processing.common.license_plate.model import (
@@ -44,6 +48,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 WRITE_DEBUG_IMAGES = False
+
+
+def _box4(values: Any) -> tuple[int, int, int, int]:
+    if len(values) != 4:
+        raise ValueError("plate bbox must contain exactly four coordinates")
+    return (int(values[0]), int(values[1]), int(values[2]), int(values[3]))
 
 
 class LicensePlateProcessingMixin:
@@ -56,6 +66,8 @@ class LicensePlateProcessingMixin:
     detected_license_plates: dict[str, dict[str, Any]]
     camera_current_cars: dict[str, list[str]]
     sub_label_publisher: EventMetadataPublisher
+    recognition_lifecycle: RecognitionLifecycle
+    quality_selector: QualitySelector | None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -121,7 +133,9 @@ class LicensePlateProcessingMixin:
             )
 
         try:
-            outputs = self.model_runner.detection_model([normalized_image])[0]  # type: ignore[arg-type]
+            outputs = cast(Any, self.model_runner.detection_model)(
+                [normalized_image]
+            )[0]
         except Exception as e:
             logger.warning(f"Error running LPR box detection model: {e}")
             return []
@@ -162,7 +176,7 @@ class LicensePlateProcessingMixin:
                 norm_images.append(norm_img)
 
         try:
-            outputs = self.model_runner.classification_model(norm_images)  # type: ignore[arg-type]
+            outputs = cast(Any, self.model_runner.classification_model)(norm_images)
         except Exception as e:
             logger.warning(f"Error running LPR classification model: {e}")
             return None
@@ -170,7 +184,10 @@ class LicensePlateProcessingMixin:
         return self._process_classification_output(images, outputs)
 
     def _recognize(
-        self, camera: str, images: list[np.ndarray]
+        self,
+        camera: str,
+        images: list[np.ndarray],
+        enhancement_override: int | None = None,
     ) -> tuple[list[str], list[list[float]]]:
         """
         Recognize the characters on the detected license plates using the recognition model.
@@ -197,18 +214,23 @@ class LicensePlateProcessingMixin:
             # preprocess the images based on the max aspect ratio
             for i in range(index, min(num_images, index + self.batch_size)):
                 norm_image = self._preprocess_recognition_image(
-                    camera, images[i], max_wh_ratio
+                    camera, images[i], max_wh_ratio, enhancement_override
                 )
                 norm_image = norm_image[np.newaxis, :]
                 norm_images.append(norm_image)
 
         try:
-            outputs = self.model_runner.recognition_model(norm_images)  # type: ignore[arg-type]
+            recognition_model = cast(Any, self.model_runner.recognition_model)
+            outputs = recognition_model(norm_images)
         except Exception as e:
             logger.warning(f"Error running LPR recognition model: {e}")
             return [], []
 
         return self.ctc_decoder(outputs)
+
+    def _lpr_observation_threshold(self, camera: str) -> float:
+        lifecycle = self.config.cameras[camera].recognition_lifecycle
+        return float(lifecycle.lpr_observation_threshold)
 
     def _process_license_plate(
         self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
@@ -237,6 +259,8 @@ class LicensePlateProcessingMixin:
             logger.debug("Model runners not loaded")
             return [], [], []
 
+        self._last_ocr_path = "paddle_detected_text"
+        self._last_ocr_variant = None
         boxes = self._detect(image, debug_frame_id)
         if len(boxes) == 0:
             logger.debug(f"{camera}: No boxes found by OCR detector model")
@@ -311,7 +335,7 @@ class LicensePlateProcessingMixin:
         all_areas = []
         processed_indices = set()
 
-        recognition_threshold = self.lpr_config.recognition_threshold
+        recognition_threshold = self._lpr_observation_threshold(camera)
 
         for group in initial_groups:
             # Sort group by y-coordinate (top to bottom)
@@ -558,7 +582,7 @@ class LicensePlateProcessingMixin:
         # Add the last box
         merged_boxes.append(current_box)
 
-        return np.array(merged_boxes, dtype=np.int32)  # type: ignore[return-value]
+        return merged_boxes
 
     def _boxes_from_bitmap(
         self, output: np.ndarray, mask: np.ndarray, dest_width: int, dest_height: int
@@ -600,7 +624,7 @@ class LicensePlateProcessingMixin:
             if self.box_thresh > score:
                 continue
 
-            points = self._expand_box(points)  # type: ignore[assignment]
+            points = self._expand_box(points)
 
             # Get the minimum area rectangle again after expansion
             points, sside = self._get_min_boxes(points.reshape(-1, 1, 2))  # type: ignore[attr-defined]
@@ -662,11 +686,11 @@ class LicensePlateProcessingMixin:
         x1, y1 = np.clip(contour.min(axis=0), 0, [w - 1, h - 1])
         x2, y2 = np.clip(contour.max(axis=0), 0, [w - 1, h - 1])
         mask = np.zeros((y2 - y1 + 1, x2 - x1 + 1), dtype=np.uint8)
-        cv2.fillPoly(mask, [contour - [x1, y1]], 1)  # type: ignore[call-overload]
+        cast(Any, cv2.fillPoly)(mask, [contour - [x1, y1]], 1)
         return cv2.mean(bitmap[y1 : y2 + 1, x1 : x2 + 1], mask)[0]
 
     @staticmethod
-    def _expand_box(points: list[tuple[float, float]]) -> np.ndarray:
+    def _expand_box(points: Any) -> np.ndarray:
         """
         Expand a polygonal shape slightly by a factor determined by the area-to-perimeter ratio.
 
@@ -678,14 +702,15 @@ class LicensePlateProcessingMixin:
         """
         polygon = Polygon(points)
         distance = polygon.area / polygon.length
-        offset = PyclipperOffset()
-        offset.AddPath(points, JT_ROUND, ET_CLOSEDPOLYGON)
+        clipper = cast(Any, pyclipper)
+        offset = clipper.PyclipperOffset()
+        offset.AddPath(points, clipper.JT_ROUND, clipper.ET_CLOSEDPOLYGON)
         expanded = np.array(offset.Execute(distance * 1.5)).reshape((-1, 2))
         return expanded
 
     def _filter_polygon(
-        self, points: list[np.ndarray], shape: tuple[int, int]
-    ) -> np.ndarray:
+        self, points: np.ndarray, shape: tuple[int, int]
+    ) -> list[np.ndarray]:
         """
         Filter a set of polygons to include only valid ones that fit within an image shape
         and meet size constraints.
@@ -698,13 +723,11 @@ class LicensePlateProcessingMixin:
             np.ndarray: List of filtered polygons.
         """
         height, width = shape
-        return np.array(
-            [
-                self._clockwise_order(point)
-                for point in points
-                if self._is_valid_polygon(point, width, height)
-            ]
-        )
+        return [
+            self._clockwise_order(point)
+            for point in points
+            if self._is_valid_polygon(point, width, height)
+        ]
 
     @staticmethod
     def _is_valid_polygon(point: np.ndarray, width: int, height: int) -> bool:
@@ -864,7 +887,7 @@ class LicensePlateProcessingMixin:
             classification results (label and confidence score).
         """
         labels = ["0", "180"]
-        results = [["", 0.0]] * len(images)
+        results: list[tuple[str, float]] = [("", 0.0)] * len(images)
         indices = np.argsort(np.array([x.shape[1] / x.shape[0] for x in images]))
 
         stacked_outputs = np.stack(outputs)
@@ -877,17 +900,21 @@ class LicensePlateProcessingMixin:
         for i in range(0, len(images), self.batch_size):
             for j in range(len(stacked_outputs)):
                 label, score = stacked_outputs[j]
-                results[indices[i + j]] = [label, score]
+                results[indices[i + j]] = (str(label), float(score))
                 # make sure we have high confidence if we need to flip a box
                 if "180" in label and score >= 0.7:
                     images[indices[i + j]] = cv2.rotate(
                         images[indices[i + j]], cv2.ROTATE_180
                     )
 
-        return images, results  # type: ignore[return-value]
+        return images, results
 
     def _preprocess_recognition_image(
-        self, camera: str, image: np.ndarray, max_wh_ratio: float
+        self,
+        camera: str,
+        image: np.ndarray,
+        max_wh_ratio: float,
+        enhancement_override: int | None = None,
     ) -> np.ndarray:
         """
         Preprocess an image for recognition by dynamically adjusting its width.
@@ -915,33 +942,39 @@ class LicensePlateProcessingMixin:
         else:
             gray = image
 
-        if self.config.cameras[camera].lpr.enhancement > 3:
+        enhancement = (
+            self.config.cameras[camera].lpr.enhancement
+            if enhancement_override is None
+            else enhancement_override
+        )
+
+        if enhancement > 3:
             # denoise using a configurable pixel neighborhood value
             logger.debug(
-                f"{camera}: Denoising recognition image (level: {self.config.cameras[camera].lpr.enhancement})"
+                f"{camera}: Denoising recognition image (level: {enhancement})"
             )
             smoothed = cv2.bilateralFilter(
                 gray,
-                d=5 + self.config.cameras[camera].lpr.enhancement,
-                sigmaColor=10 * self.config.cameras[camera].lpr.enhancement,
-                sigmaSpace=10 * self.config.cameras[camera].lpr.enhancement,
+                d=5 + enhancement,
+                sigmaColor=10 * enhancement,
+                sigmaSpace=10 * enhancement,
             )
             sharpening_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
             processed = cv2.filter2D(smoothed, -1, sharpening_kernel)
         else:
             processed = gray
 
-        if self.config.cameras[camera].lpr.enhancement > 0:
+        if enhancement > 0:
             # always apply the same CLAHE for contrast enhancement when enhancement level is above 3
             logger.debug(
-                f"{camera}: Enhancing contrast for recognition image (level: {self.config.cameras[camera].lpr.enhancement})"
+                f"{camera}: Enhancing contrast for recognition image (level: {enhancement})"
             )
             grid_size = (
                 max(4, input_w // 40),
                 max(4, input_h // 40),
             )
             clahe = cv2.createCLAHE(
-                clipLimit=2 if self.config.cameras[camera].lpr.enhancement > 5 else 1.5,
+                clipLimit=2 if enhancement > 5 else 1.5,
                 tileGridSize=grid_size,
             )
             enhanced = clahe.apply(processed)
@@ -955,7 +988,8 @@ class LicensePlateProcessingMixin:
         input_w = int(input_h * max_wh_ratio)
 
         # check for model-specific input width
-        model_input_w = self.model_runner.recognition_model.runner.get_input_width()  # type: ignore[union-attr]
+        runner = self.model_runner.recognition_model.runner
+        model_input_w = runner.get_input_width() if runner is not None else None
         if isinstance(model_input_w, int) and model_input_w > 0:
             input_w = model_input_w
 
@@ -1039,7 +1073,7 @@ class LicensePlateProcessingMixin:
         Return the dimensions of the detected plate as [x1, y1, x2, y2].
         """
         try:
-            predictions = self.model_runner.yolov9_detection_model(input)  # type: ignore[arg-type]
+            predictions = cast(Any, self.model_runner.yolov9_detection_model)(input)
         except Exception as e:
             logger.warning(f"Error running YOLOv9 license plate detection model: {e}")
             return None
@@ -1097,7 +1131,12 @@ class LicensePlateProcessingMixin:
                 ]
             ).clip(0, [input.shape[1], input.shape[0]] * 2)
 
-            return tuple(int(x) for x in expanded_box)  # type: ignore[return-value]
+            return (
+                int(expanded_box[0]),
+                int(expanded_box[1]),
+                int(expanded_box[2]),
+                int(expanded_box[3]),
+            )
         else:
             return None  # No detection above the threshold
 
@@ -1224,21 +1263,30 @@ class LicensePlateProcessingMixin:
         dedicated_lpr: bool = False,
         key: LprTrackKey | None = None,
         frame_ref: FrameRef | None = None,
-    ) -> PlateObservation | None:
-        """Run detector/OCR and return an observation without side effects."""
+    ) -> PlateObservation | PreparedPlateCandidate | None:
+        """Prepare one deterministic plate crop; realtime OCR is scheduled later."""
         self.metrics.alpr_pps.value = self.plates_rec_second.eps()
         self.metrics.yolov9_lpr_pps.value = self.plates_det_second.eps()
-        camera = str(obj_data) if dedicated_lpr else obj_data["camera"]
+        if dedicated_lpr:
+            camera = str(obj_data)
+            object_data: dict[str, Any] = {}
+        elif isinstance(obj_data, dict):
+            camera = str(obj_data["camera"])
+            object_data = obj_data
+        else:
+            return None
         current_time = (
             datetime.datetime.now().timestamp()
             if dedicated_lpr
             else float(
-                obj_data.get("frame_time") or datetime.datetime.now().timestamp()
+                object_data.get("frame_time")
+                or datetime.datetime.now().timestamp()
             )
         )
         debug_frame_id = int(datetime.datetime.now().timestamp() * 1000)
         detector_score: float | None = None
         quality_candidate = None
+        attempt = None
 
         if not self.config.cameras[camera].lpr.enabled:
             return
@@ -1247,8 +1295,8 @@ class LicensePlateProcessingMixin:
             "track_seen",
             camera=camera,
             frame_time=current_time,
-            track_id=None if dedicated_lpr else str(obj_data.get("id")),
-            object_box=None if dedicated_lpr else obj_data.get("box"),
+            track_id=None if dedicated_lpr else str(object_data.get("id")),
+            object_box=None if dedicated_lpr else object_data.get("box"),
         )
 
         # dedicated LPR cam without frigate+
@@ -1258,7 +1306,11 @@ class LicensePlateProcessingMixin:
             rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
 
             # apply motion mask
-            rgb[self.config.cameras[camera].motion.rasterized_mask == 0] = [0, 0, 0]  # type: ignore[attr-defined]
+            motion_mask = getattr(
+                self.config.cameras[camera].motion, "rasterized_mask", None
+            )
+            if motion_mask is not None:
+                rgb[motion_mask == 0] = [0, 0, 0]
 
             if WRITE_DEBUG_IMAGES:
                 cv2.imwrite(
@@ -1295,7 +1347,7 @@ class LicensePlateProcessingMixin:
                 frame_time=current_time,
                 track_id=str(id),
                 plate_box=plate_box,
-                object_box=None if dedicated_lpr else obj_data.get("box"),
+                object_box=None if dedicated_lpr else object_data.get("box"),
             )
 
             license_plate_frame = rgb[
@@ -1304,12 +1356,12 @@ class LicensePlateProcessingMixin:
             ]
 
         else:
-            id = obj_data["id"]
+            id = object_data["id"]
 
             # don't run for non car/motorcycle or non license plate (dedicated lpr with frigate+) objects
             if (
-                obj_data.get("label") not in self.lp_objects
-                and obj_data.get("label") != "license_plate"
+                object_data.get("label") not in self.lp_objects
+                and object_data.get("label") != "license_plate"
             ):
                 logger.debug(
                     f"{camera}: Not a processing license plate for non car/motorcycle object."
@@ -1325,15 +1377,15 @@ class LicensePlateProcessingMixin:
                 camera=camera,
                 frame_time=current_time,
                 track_id=str(id),
-                object_box=obj_data.get("box"),
+                object_box=object_data.get("box"),
             )
 
             # run for stationary objects for a limited time after they become stationary
-            if obj_data.get("stationary") == True:
+            if object_data.get("stationary") is True:
                 threshold = self.config.cameras[camera].detect.stationary.threshold
-                if obj_data.get("motionless_count", 0) >= threshold:
+                if object_data.get("motionless_count", 0) >= threshold:
                     frames_since_stationary = (
-                        obj_data.get("motionless_count", 0) - threshold
+                        object_data.get("motionless_count", 0) - threshold
                     )
                     fps = self.config.cameras[camera].detect.fps
                     time_since_stationary = frames_since_stationary / fps
@@ -1345,7 +1397,7 @@ class LicensePlateProcessingMixin:
                         <= self.stationary_scan_duration + 1
                     ):
                         logger.debug(
-                            f"{camera}: {obj_data.get('label', 'An')} object {id} has been stationary for > {self.stationary_scan_duration} seconds, skipping LPR."
+                            f"{camera}: {object_data.get('label', 'An')} object {id} has been stationary for > {self.stationary_scan_duration} seconds, skipping LPR."
                         )
 
                     if time_since_stationary > self.stationary_scan_duration:
@@ -1356,7 +1408,7 @@ class LicensePlateProcessingMixin:
             if "license_plate" not in self.config.cameras[camera].objects.track:
                 logger.debug(f"{camera}: Running manual license_plate detection.")
 
-                car_box = obj_data.get("box")
+                car_box = object_data.get("box")
 
                 if not car_box:
                     return
@@ -1364,7 +1416,11 @@ class LicensePlateProcessingMixin:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
 
                 # apply motion mask
-                rgb[self.config.cameras[camera].motion.rasterized_mask == 0] = [0, 0, 0]  # type: ignore[attr-defined]
+                motion_mask = getattr(
+                    self.config.cameras[camera].motion, "rasterized_mask", None
+                )
+                if motion_mask is not None:
+                    rgb[motion_mask == 0] = [0, 0, 0]
 
                 left, top, right, bottom = car_box
                 width = right - left
@@ -1431,7 +1487,7 @@ class LicensePlateProcessingMixin:
                     frame_time=current_time,
                     track_id=str(id),
                     plate_box=plate_box,
-                    object_box=obj_data.get("box"),
+                    object_box=object_data.get("box"),
                 )
 
                 license_plate_frame = car[
@@ -1451,14 +1507,14 @@ class LicensePlateProcessingMixin:
             else:
                 # don't run for object without attributes if this isn't dedicated lpr with frigate+
                 if (
-                    not obj_data.get("current_attributes")
-                    and obj_data.get("label") != "license_plate"
+                    not object_data.get("current_attributes")
+                    and object_data.get("label") != "license_plate"
                 ):
                     logger.debug(f"{camera}: No attributes to parse.")
                     return
 
-                if obj_data.get("label") in self.lp_objects:
-                    attributes: list[dict[str, Any]] = obj_data.get(
+                if object_data.get("label") in self.lp_objects:
+                    attributes: list[dict[str, Any]] = object_data.get(
                         "current_attributes", []
                     )
                     for attr in attributes:
@@ -1476,11 +1532,14 @@ class LicensePlateProcessingMixin:
                     detector_score = float(license_plate.get("score", 0.0))
 
                 # we are using dedicated lpr with frigate+
-                if obj_data.get("label") == "license_plate":
-                    license_plate = obj_data  # type: ignore[assignment]
-                    detector_score = float(obj_data.get("score", 0.0))
+                if object_data.get("label") == "license_plate":
+                    license_plate = object_data
+                    detector_score = float(object_data.get("score", 0.0))
 
-                license_plate_box = license_plate.get("box")  # type: ignore[attr-defined]
+                if not isinstance(license_plate, dict):
+                    return
+
+                license_plate_box = license_plate.get("box")
 
                 # check that license plate is valid
                 if (
@@ -1524,7 +1583,10 @@ class LicensePlateProcessingMixin:
             quality_config = self.config.cameras[camera].quality
             task_quality = quality_config.lpr
             observation_key = key or LprTrackKey(camera, str(id), 0)
-            quality_candidate = self.quality_selector.select(
+            selector = self.quality_selector
+            if selector is None:
+                return None
+            quality_candidate = selector.select(
                 task="lpr",
                 camera=camera,
                 track_id=observation_key.track_id,
@@ -1532,10 +1594,10 @@ class LicensePlateProcessingMixin:
                 frame_ref=frame_ref,
                 object_bbox=None
                 if dedicated_lpr
-                else tuple(int(value) for value in obj_data.get("box"))
-                if obj_data.get("box")
+                else _box4(object_data.get("box"))
+                if object_data.get("box")
                 else None,
-                detail_bbox=tuple(int(value) for value in plate_box),
+                detail_bbox=_box4(plate_box),
                 detail_frame=license_plate_frame,
                 thresholds=QualityThresholds(
                     task_quality.min_detail_width_px,
@@ -1543,6 +1605,9 @@ class LicensePlateProcessingMixin:
                     task_quality.min_laplacian_variance,
                     task_quality.max_dark_fraction,
                     task_quality.max_bright_fraction,
+                    task_quality.min_aspect_ratio,
+                    task_quality.max_aspect_ratio,
+                    task_quality.min_edge_clearance_px,
                 ),
                 top_k=quality_config.top_k,
                 enabled=quality_config.enabled,
@@ -1550,6 +1615,37 @@ class LicensePlateProcessingMixin:
             )
             if quality_candidate is None:
                 return
+
+            # This resize is the one deterministic preprocessing transform for
+            # this evidence. OCR output must never select between crop variants.
+            prepared_frame = cv2.resize(
+                license_plate_frame,
+                (
+                    int(2 * license_plate_frame.shape[1]),
+                    int(2 * license_plate_frame.shape[0]),
+                ),
+            )
+            return PreparedPlateCandidate(
+                key=observation_key,
+                frame_time=current_time,
+                plate_box=_box4(plate_box),
+                object_box=None
+                if dedicated_lpr
+                else _box4(object_data.get("box"))
+                if object_data.get("box")
+                else None,
+                obj_data=None if dedicated_lpr else dict(object_data),
+                dedicated_lpr=dedicated_lpr,
+                evidence=quality_candidate,
+                plate_frame=prepared_frame,
+                detector_score=detector_score,
+                vehicle_track_id=None
+                if dedicated_lpr
+                else object_data.get("_recognition_vehicle_track_id"),
+                plate_track_ids=()
+                if dedicated_lpr
+                else tuple(object_data.get("_recognition_plate_track_ids", ())),
+            )
 
         # double the size of the license plate frame for better OCR
         license_plate_frame = cv2.resize(
@@ -1588,6 +1684,51 @@ class LicensePlateProcessingMixin:
                 )
         else:
             logger.debug(f"{camera}: No text detected")
+            if attempt is not None:
+                self.recognition_lifecycle.complete_attempt(
+                    attempt, reason="no_ocr_result"
+                )
+                passage_trace(
+                    "recognition_attempt",
+                    camera=camera,
+                    frame_time=current_time,
+                    track_id=str(id),
+                    generation=attempt.key.generation,
+                    task="lpr",
+                    attempt_index=attempt.attempt_index,
+                    candidate_id=attempt.candidate_id,
+                    bbox=list(attempt.detail_bbox),
+                    quality_score=attempt.quality_score,
+                    ocr=None,
+                    confidence=0.0,
+                    decision_reason="no_ocr_result",
+                    inference_started=True,
+                )
+                lifecycle_config = self.config.cameras[camera].recognition_lifecycle
+                if attempt.attempt_index >= lifecycle_config.max_attempts:
+                    self.recognition_lifecycle.terminal(
+                        attempt.key,
+                        RecognitionStatus.EXHAUSTED,
+                        "attempt_budget_exhausted",
+                    )
+                    self.quality_selector.expire(
+                        "lpr",
+                        attempt.key.camera,
+                        attempt.key.track_id,
+                        attempt.key.generation,
+                    )
+                    passage_trace(
+                        "recognition_terminal",
+                        camera=camera,
+                        frame_time=current_time,
+                        track_id=str(id),
+                        generation=attempt.key.generation,
+                        task="lpr",
+                        status=RecognitionStatus.EXHAUSTED.value,
+                        reason="attempt_budget_exhausted",
+                        winner=None,
+                        best_effort=False,
+                    )
             if quality_candidate is not None:
                 quality_candidate.release()
             return
@@ -1610,10 +1751,19 @@ class LicensePlateProcessingMixin:
             plate=top_plate,
             score=avg_confidence,
             plate_box=plate_box,
-            object_box=None if dedicated_lpr else obj_data.get("box"),
+            object_box=None if dedicated_lpr else object_data.get("box"),
+            ocr_path=getattr(self, "_last_ocr_path", "paddle_detected_text"),
+            ocr_variant=getattr(self, "_last_ocr_variant", None),
         )
         observation_key = key or LprTrackKey(camera, str(id), 0)
         if quality_candidate is None:
+            return None
+        if attempt is None or not self.recognition_lifecycle.complete_attempt(
+            attempt,
+            result=top_plate,
+            confidence=float(avg_confidence),
+        ):
+            quality_candidate.release()
             return None
         return PlateObservation(
             key=observation_key,
@@ -1630,6 +1780,9 @@ class LicensePlateProcessingMixin:
             obj_data=None if dedicated_lpr else dict(obj_data),
             dedicated_lpr=dedicated_lpr,
             evidence=quality_candidate,
+            attempt=attempt,
+            ocr_path=getattr(self, "_last_ocr_path", "paddle_detected_text"),
+            ocr_variant=getattr(self, "_last_ocr_variant", None),
         )
 
     def handle_request(

@@ -4,7 +4,7 @@ import io
 import json
 import logging
 import os
-from typing import Any, Self
+from typing import Any, Self, cast
 
 import numpy as np
 from pydantic import (
@@ -121,7 +121,7 @@ stream_info_retriever = StreamInfoRetriever()
 class RuntimeMotionConfig(MotionConfig):
     """Runtime version of MotionConfig with rasterized masks."""
 
-    rasterized_mask: np.ndarray = Field(default=None, exclude=True)
+    rasterized_mask: np.ndarray | None = Field(default=None, exclude=True)
 
     def __init__(self, **config):
         frame_shape = config.get("frame_shape", (1, 1))
@@ -153,6 +153,8 @@ class RuntimeMotionConfig(MotionConfig):
         # Rasterize only enabled masks
         enabled_coords = []
         for mask_config in self.mask.values():
+            if mask_config is None:
+                continue
             if mask_config.enabled and mask_config.coordinates:
                 coords = mask_config.coordinates
                 if isinstance(coords, list):
@@ -225,6 +227,8 @@ class RuntimeFilterConfig(FilterConfig):
         # Rasterize only enabled masks
         enabled_coords = []
         for mask_config in self.mask.values():
+            if mask_config is None:
+                continue
             if mask_config.enabled and mask_config.coordinates:
                 coords = mask_config.coordinates
                 if isinstance(coords, list):
@@ -535,7 +539,7 @@ class FrigateConfig(FrigateBaseModel):
 
     # Detector config
     detectors: dict[str, BaseDetectorConfig] = Field(
-        default=DEFAULT_DETECTORS,
+        default=cast(dict[str, BaseDetectorConfig], DEFAULT_DETECTORS),
         title="Detector hardware",
         description="Configuration for object detectors (CPU, GPU, ONNX backends) and any detector-specific model settings.",
     )
@@ -656,10 +660,12 @@ class FrigateConfig(FrigateBaseModel):
         exclude=True,
     )
 
-    _plus_api: PlusApi
+    _plus_api: PlusApi | None
 
     @property
     def plus_api(self) -> PlusApi:
+        if self._plus_api is None:
+            self._plus_api = PlusApi()
         return self._plus_api
 
     @model_validator(mode="after")
@@ -845,7 +851,11 @@ class FrigateConfig(FrigateBaseModel):
                     logger.info(
                         f"detect.width and detect.height not set for {camera_config.name}, probing detect stream to determine resolution."
                     )
-                    stream_info = {"width": 0, "height": 0, "fourcc": None}
+                    stream_info: dict[str, int | str | None] = {
+                        "width": 0,
+                        "height": 0,
+                        "fourcc": None,
+                    }
                     try:
                         stream_info = stream_info_retriever.get_stream_info(
                             self.ffmpeg, input.path
@@ -857,14 +867,16 @@ class FrigateConfig(FrigateBaseModel):
                         stream_info = {"width": 0, "height": 0, "fourcc": None}
 
                 if need_detect_dimensions:
+                    stream_width = stream_info.get("width")
+                    stream_height = stream_info.get("height")
                     camera_config.detect.width = (
-                        stream_info["width"]
-                        if stream_info.get("width")
+                        stream_width
+                        if isinstance(stream_width, int) and stream_width > 0
                         else DEFAULT_DETECT_DIMENSIONS["width"]
                     )
                     camera_config.detect.height = (
-                        stream_info["height"]
-                        if stream_info.get("height")
+                        stream_height
+                        if isinstance(stream_height, int) and stream_height > 0
                         else DEFAULT_DETECT_DIMENSIONS["height"]
                     )
 
@@ -877,9 +889,15 @@ class FrigateConfig(FrigateBaseModel):
                     f"{camera_config.name}.quality.buffer.sample_fps must be less "
                     "than or equal to detect.fps"
                 )
+            detect_width = camera_config.detect.width
+            detect_height = camera_config.detect.height
+            if detect_width is None or detect_height is None:
+                raise ValueError(
+                    f"{camera_config.name}.detect dimensions were not resolved"
+                )
             required_evidence_bytes = (
-                camera_config.detect.width
-                * camera_config.detect.height
+                detect_width
+                * detect_height
                 * 3
                 // 2
                 * camera_config.quality.top_k
@@ -891,6 +909,25 @@ class FrigateConfig(FrigateBaseModel):
                 raise ValueError(
                     f"{camera_config.name}.quality.buffer.max_bytes must hold at "
                     "least quality.top_k raw I420 detect frames"
+                )
+            if (
+                camera_config.face_recognition.enabled
+                and self.face_recognition.min_faces
+                > camera_config.recognition_lifecycle.max_attempts
+            ):
+                raise ValueError(
+                    f"{camera_config.name}.recognition_lifecycle.max_attempts must "
+                    "be greater than or equal to face_recognition.min_faces"
+                )
+            if (
+                camera_config.lpr.enabled
+                and camera_config.recognition_lifecycle.lpr_observation_threshold
+                > self.lpr.recognition_threshold
+            ):
+                raise ValueError(
+                    f"{camera_config.name}.recognition_lifecycle."
+                    "lpr_observation_threshold must be less than or equal to "
+                    "lpr.recognition_threshold"
                 )
 
             # Warn if detect fps > 10
@@ -981,10 +1018,12 @@ class FrigateConfig(FrigateBaseModel):
                 for mask_id, mask_config in camera_config.objects.mask.items():
                     if mask_config:
                         coords = mask_config.coordinates
+                        if coords is None:
+                            continue
                         relative_coords = get_relative_coordinates(
                             coords,
                             camera_config.frame_shape,
-                            camera_name=camera_config.name,
+                            camera_name=camera_config.name or "",
                         )
                         # Create a new ObjectMaskConfig with raw_coordinates set
                         processed_global_masks[mask_id] = ObjectMaskConfig(
@@ -1077,7 +1116,7 @@ class FrigateConfig(FrigateBaseModel):
             verify_profile_overrides_match_base(camera_config)
             verify_autotrack_zones(camera_config)
             verify_motion_and_detect(camera_config)
-            verify_objects_track(camera_config, labelmap_objects)
+            verify_objects_track(camera_config, list(labelmap_objects))
             verify_lpr_and_face(self, camera_config)
 
         # Validate camera profiles reference top-level profile definitions
@@ -1094,7 +1133,7 @@ class FrigateConfig(FrigateBaseModel):
             config.name = name
 
         self.objects.parse_all_objects(self.cameras)
-        self.model.create_colormap(sorted(self.objects.all_objects))
+        self.model.create_colormap(set(self.objects.all_objects))
         self.model.check_and_load_plus_model(self.plus_api)
 
         # Check audio transcription and audio detection requirements

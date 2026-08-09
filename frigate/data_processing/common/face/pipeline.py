@@ -8,8 +8,9 @@ import queue
 import threading
 import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, replace
-from typing import Any, Callable, Generic, TypeVar
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
+from typing import Any, Generic, TypeVar
 
 import cv2
 import numpy as np
@@ -17,14 +18,22 @@ import numpy as np
 from frigate.const import MODEL_CACHE_DIR
 from frigate.data_processing.common.evidence import EvidenceCandidate, EvidenceLease
 from frigate.data_processing.common.quality import QualitySelector, QualityThresholds
+from frigate.data_processing.common.recognition import (
+    RecognitionAttemptLease,
+    RecognitionKey,
+    RecognitionLifecycle,
+    RecognitionPolicy,
+    RecognitionStatus,
+)
 from frigate.util.image import area, calculate_region, yuv_region_2_bgr
+from frigate.util.passage_trace import passage_trace
 
 logger = logging.getLogger(__name__)
 
 FACE_CAPTURE_WORKERS = 2
 FACE_PREPROCESS_WORKERS = 2
 FACE_BATCH_SIZE = 4
-FACE_BATCH_FLUSH_SECONDS = 0.1
+FACE_BATCH_FLUSH_SECONDS = 0.4
 FACE_CANDIDATE_TTL_SECONDS = 1.5
 MAX_TRACKS_PER_CAMERA = 4
 
@@ -48,8 +57,10 @@ class FaceCaptureRequest:
     quality_enabled: bool
     quality_thresholds: QualityThresholds
     top_k: int
+    candidate_collection_seconds: float = FACE_BATCH_FLUSH_SECONDS
     detector_score: float | None = None
     quality: float = 0.0
+    lifecycle_policy: RecognitionPolicy = field(default_factory=RecognitionPolicy)
 
     @property
     def key(self) -> FaceKey:
@@ -110,17 +121,24 @@ class PreparedFaceCandidate:
     def quality(self) -> float:
         return self.candidate.quality
 
+    @property
+    def collection_seconds(self) -> float:
+        return self.candidate.request.candidate_collection_seconds
+
 
 @dataclass(frozen=True)
 class FaceRecognitionOutcome:
     candidate: FaceCandidate
     sub_label: str
     score: float
+    top2_label: str | None
+    top2_score: float
     batch_size: int
     batch_wait_ms: float
     alignment_ms: float
     embedding_ms: float
     completed_monotonic: float
+    attempt: RecognitionAttemptLease
 
 
 T = TypeVar("T")
@@ -134,6 +152,7 @@ class LatestFaceCandidateStore(Generic[T]):
         max_per_camera: int = MAX_TRACKS_PER_CAMERA,
         ttl_seconds: float = FACE_CANDIDATE_TTL_SECONDS,
         on_drop: Callable[[T, str], None] | None = None,
+        prefer_quality: bool = False,
     ) -> None:
         self.max_per_camera = max_per_camera
         self.ttl_seconds = ttl_seconds
@@ -141,6 +160,7 @@ class LatestFaceCandidateStore(Generic[T]):
         self._condition = threading.Condition()
         self._camera_cursor = 0
         self._on_drop = on_drop
+        self.prefer_quality = prefer_quality
 
     def __len__(self) -> int:
         with self._condition:
@@ -154,23 +174,33 @@ class LatestFaceCandidateStore(Generic[T]):
         key = getattr(item, "key")
         camera = getattr(item, "camera")
         dropped: list[tuple[T, str]] = []
+        accepted = True
         with self._condition:
             previous = self._items.pop(key, None)
             if previous is not None:
-                dropped.append((previous, "replaced"))
-            camera_keys = [k for k in self._items if k[0] == camera]
-            if len(camera_keys) >= self.max_per_camera:
-                evicted_key = max(
-                    camera_keys,
-                    key=lambda candidate_key: self._priority(
-                        self._items[candidate_key]
-                    ),
-                )
-                dropped.append((self._items.pop(evicted_key), "camera_limit"))
-            self._items[key] = item
-            self._condition.notify_all()
+                if (
+                    self.prefer_quality
+                    and self._quality_rank(previous) >= self._quality_rank(item)
+                ):
+                    self._items[key] = previous
+                    dropped.append((item, "lower_quality"))
+                    accepted = False
+                else:
+                    dropped.append((previous, "replaced"))
+            if accepted:
+                camera_keys = [k for k in self._items if k[0] == camera]
+                if len(camera_keys) >= self.max_per_camera:
+                    evicted_key = max(
+                        camera_keys,
+                        key=lambda candidate_key: self._priority(
+                            self._items[candidate_key]
+                        ),
+                    )
+                    dropped.append((self._items.pop(evicted_key), "camera_limit"))
+                self._items[key] = item
+                self._condition.notify_all()
         self._notify_drops(dropped)
-        return True
+        return accepted
 
     def remove(self, key: FaceKey, reason: str = "removed") -> bool:
         with self._condition:
@@ -198,6 +228,7 @@ class LatestFaceCandidateStore(Generic[T]):
         timeout: float,
         excluded: set[FaceKey] | None = None,
         flush_seconds: float = 0.0,
+        per_item_flush: bool = False,
     ) -> list[T]:
         deadline = time.monotonic() + timeout
         excluded = excluded or set()
@@ -209,6 +240,16 @@ class LatestFaceCandidateStore(Generic[T]):
                 eligible = [
                     item for key, item in self._items.items() if key not in excluded
                 ]
+                ready = (
+                    [
+                        item
+                        for item in eligible
+                        if now - float(getattr(item, "created_monotonic"))
+                        >= float(getattr(item, "collection_seconds", flush_seconds))
+                    ]
+                    if per_item_flush
+                    else eligible
+                )
                 oldest_age = max(
                     (
                         now - float(getattr(item, "created_monotonic"))
@@ -216,25 +257,38 @@ class LatestFaceCandidateStore(Generic[T]):
                     ),
                     default=0.0,
                 )
-                if eligible and (
-                    flush_seconds <= 0
-                    or len(eligible) >= max_items
+                if ready and (
+                    per_item_flush
+                    or flush_seconds <= 0
+                    or len(ready) >= max_items
                     or oldest_age >= flush_seconds
                 ):
-                    selected = self._select_fair(eligible, max_items)
+                    selected = self._select_fair(ready, max_items)
                     for item in selected:
                         self._items.pop(getattr(item, "key"), None)
                     break
                 remaining = deadline - now
                 if remaining <= 0:
                     selected = (
-                        self._select_fair(eligible, max_items) if eligible else []
+                        self._select_fair(ready, max_items) if ready else []
                     )
                     for item in selected:
                         self._items.pop(getattr(item, "key"), None)
                     break
                 wait_for = remaining
-                if eligible and flush_seconds > 0:
+                if eligible and per_item_flush:
+                    wait_for = min(
+                        wait_for,
+                        max(
+                            0.001,
+                            min(
+                                float(getattr(item, "collection_seconds", flush_seconds))
+                                - (now - float(getattr(item, "created_monotonic")))
+                                for item in eligible
+                            ),
+                        ),
+                    )
+                elif eligible and flush_seconds > 0:
                     wait_for = min(wait_for, max(0.001, flush_seconds - oldest_age))
                 self._condition.wait(wait_for)
         self._notify_drops(dropped)
@@ -256,6 +310,16 @@ class LatestFaceCandidateStore(Generic[T]):
             float(vote_rank),
             float(getattr(item, "created_monotonic")),
             -float(getattr(item, "quality", 0.0)),
+        )
+
+    @staticmethod
+    def _quality_rank(item: T) -> tuple[float, float, str]:
+        evidence = getattr(getattr(item, "candidate", item), "evidence", None)
+        candidate_id = str(getattr(evidence, "candidate_id", ""))
+        return (
+            float(getattr(item, "quality", 0.0)),
+            -float(getattr(item, "created_monotonic", 0.0)),
+            candidate_id,
         )
 
     def _select_fair(self, eligible: list[T], max_items: int) -> list[T]:
@@ -340,7 +404,13 @@ def crop_yuv_region_to_bgr(
     region = calculate_region(
         (height, width), *box, model_size=model_size, multiplier=1.0
     )
-    return yuv_region_2_bgr(frame, region), tuple(int(value) for value in region)
+    normalized_region = (
+        int(region[0]),
+        int(region[1]),
+        int(region[2]),
+        int(region[3]),
+    )
+    return yuv_region_2_bgr(frame, region), normalized_region
 
 
 class FaceRecognitionPipeline:
@@ -351,13 +421,18 @@ class FaceRecognitionPipeline:
         recognizer: Any,
         detector_factory: Callable[[], cv2.FaceDetectorYN] = create_yunet_detector,
         quality_selector: QualitySelector | None = None,
+        recognition_lifecycle: RecognitionLifecycle | None = None,
     ) -> None:
         self.recognizer = recognizer
         self.quality_selector = quality_selector
+        self.recognition_lifecycle = recognition_lifecycle or RecognitionLifecycle()
         self.metrics: Counter[str] = Counter()
         self._stop = threading.Event()
         self._active_lock = threading.Lock()
         self._active_keys: set[FaceKey] = set()
+        self._retry_lock = threading.Lock()
+        self._retry_candidates: dict[FaceKey, list[FaceCandidate]] = {}
+        self._retry_prepared: dict[FaceKey, list[PreparedFaceCandidate]] = {}
         self.capture_store = LatestFaceCandidateStore[FaceCaptureRequest](
             on_drop=self._drop_request
         )
@@ -365,7 +440,7 @@ class FaceRecognitionPipeline:
             on_drop=self._drop_candidate
         )
         self.prepared_store = LatestFaceCandidateStore[PreparedFaceCandidate](
-            on_drop=self._drop_prepared
+            on_drop=self._drop_prepared, prefer_quality=True
         )
         self._results: queue.Queue[FaceRecognitionOutcome] = queue.Queue(maxsize=32)
         self._threads: list[threading.Thread] = []
@@ -400,17 +475,57 @@ class FaceRecognitionPipeline:
             thread.start()
 
     def submit(self, request: FaceCaptureRequest) -> bool:
+        key = RecognitionKey(
+            "face", request.camera, request.event_id, request.generation
+        )
+        if self.recognition_lifecycle.is_terminal(key):
+            request.evidence_lease.release()
+            self.metrics["terminal_skip"] += 1
+            return False
         return self.capture_store.submit(request)
 
     def expire(self, key: FaceKey) -> None:
         self.capture_store.remove(key, "track_ended")
         self.candidate_store.remove(key, "track_ended")
         self.prepared_store.remove(key, "track_ended")
+        self._release_retry_key(key)
 
     def expire_missing(self, camera: str, active_ids: set[str]) -> None:
         self.capture_store.remove_camera_missing(camera, active_ids)
         self.candidate_store.remove_camera_missing(camera, active_ids)
         self.prepared_store.remove_camera_missing(camera, active_ids)
+        with self._retry_lock:
+            missing = {
+                key
+                for key in (*self._retry_candidates, *self._retry_prepared)
+                if key[0] == camera and key[1] not in active_ids
+            }
+        for key in missing:
+            self._release_retry_key(key)
+
+    def retry(self, key: FaceKey) -> bool:
+        """Schedule the best retained independent candidate after a failed vote."""
+        with self._retry_lock:
+            prepared = self._retry_prepared.get(key, [])
+            if prepared:
+                prepared_item = max(
+                    prepared, key=LatestFaceCandidateStore._quality_rank
+                )
+                prepared.remove(prepared_item)
+                if not prepared:
+                    self._retry_prepared.pop(key, None)
+                return self.prepared_store.submit(prepared_item)
+            else:
+                candidates = self._retry_candidates.get(key, [])
+                if not candidates:
+                    return False
+                candidate_item = max(
+                    candidates, key=LatestFaceCandidateStore._quality_rank
+                )
+                candidates.remove(candidate_item)
+                if not candidates:
+                    self._retry_candidates.pop(key, None)
+                return self.candidate_store.submit(candidate_item)
 
     def drain_results(self) -> list[FaceRecognitionOutcome]:
         results: list[FaceRecognitionOutcome] = []
@@ -426,6 +541,9 @@ class FaceRecognitionPipeline:
         keys.update(self.capture_store.keys())
         keys.update(self.candidate_store.keys())
         keys.update(self.prepared_store.keys())
+        with self._retry_lock:
+            keys.update(self._retry_candidates)
+            keys.update(self._retry_prepared)
         return len(keys)
 
     def stop(self) -> None:
@@ -435,6 +553,10 @@ class FaceRecognitionPipeline:
         for store in (self.capture_store, self.candidate_store, self.prepared_store):
             for key in store.keys():
                 store.remove(key, "shutdown")
+        with self._retry_lock:
+            retry_keys = set(self._retry_candidates) | set(self._retry_prepared)
+        for key in retry_keys:
+            self._release_retry_key(key)
         for outcome in self.drain_results():
             outcome.candidate.evidence.release()
 
@@ -525,6 +647,25 @@ class FaceRecognitionPipeline:
         if evidence is None:
             self.metrics["quality_rejected"] += 1
             return None
+        passage_trace(
+            "recognition_candidate",
+            task="face",
+            camera=job.camera,
+            passage_id=job.event_id,
+            recognition_passage_id=job.event_id,
+            track_id=job.event_id,
+            raw_track_lineage=[job.event_id],
+            generation=job.generation,
+            candidate_id=evidence.candidate_id,
+            evidence_id=evidence.frame_ref.identity,
+            frame_id=evidence.frame_ref.frame_id,
+            frame_time=job.frame_time,
+            bbox=list(face_box),
+            object_box=list(job.person_box),
+            quality_score=evidence.quality_score,
+            quality_components=evidence.quality_components,
+            admitted=True,
+        )
         return FaceCandidate(
             job, face_box, face_frame, 0.0, evidence.quality_score, evidence
         )
@@ -555,6 +696,7 @@ class FaceRecognitionPipeline:
                     time.monotonic(),
                 )
             )
+            self._release(candidate.key)
 
     def _recognition_loop(self) -> None:
         while not self._stop.is_set():
@@ -562,38 +704,124 @@ class FaceRecognitionPipeline:
                 FACE_BATCH_SIZE,
                 0.1,
                 flush_seconds=FACE_BATCH_FLUSH_SECONDS,
+                per_item_flush=True,
             )
             if not batch:
                 continue
+            admitted: list[tuple[PreparedFaceCandidate, RecognitionAttemptLease]] = []
+            for item in batch:
+                candidate = item.candidate
+                request = candidate.request
+                key = RecognitionKey(
+                    "face", request.camera, request.event_id, request.generation
+                )
+                lease, reason = self.recognition_lifecycle.begin_attempt(
+                    key,
+                    candidate_id=candidate.evidence.candidate_id,
+                    frame_time=request.frame_time,
+                    detail_bbox=candidate.face_box,
+                    quality_score=candidate.evidence.quality_score,
+                    policy=request.lifecycle_policy,
+                )
+                if lease is None:
+                    self.metrics[f"lifecycle_{reason}"] += 1
+                    candidate.evidence.release()
+                    self._release(item.key)
+                    if reason == "attempt_budget_exhausted":
+                        self.recognition_lifecycle.terminal(
+                            key,
+                            RecognitionStatus.EXHAUSTED,
+                            "insufficient_quality",
+                        )
+                    continue
+                admitted.append((item, lease))
+            if not admitted:
+                continue
             started = time.monotonic()
             try:
-                classified = self.recognizer.classify_prepared_batch(
-                    [(item.aligned_face, item.blur_reduction) for item in batch]
-                )
+                prepared_batch = [
+                    (item.aligned_face, item.blur_reduction) for item, _ in admitted
+                ]
+                if hasattr(self.recognizer, "classify_prepared_top2_batch"):
+                    classified = self.recognizer.classify_prepared_top2_batch(
+                        prepared_batch
+                    )
+                else:
+                    classified = self.recognizer.classify_prepared_batch(
+                        prepared_batch
+                    )
             except Exception:
                 logger.exception("Batched face recognition failed")
-                self.metrics["embedding_error"] += len(batch)
-                for item in batch:
+                self.metrics["embedding_error"] += len(admitted)
+                for item, lease in admitted:
+                    self.recognition_lifecycle.complete_attempt(
+                        lease, reason="inference_error"
+                    )
+                    if (
+                        lease.attempt_index
+                        >= item.candidate.request.lifecycle_policy.max_attempts
+                    ):
+                        self.recognition_lifecycle.terminal(
+                            lease.key,
+                            RecognitionStatus.EXHAUSTED,
+                            "insufficient_quality",
+                        )
                     item.candidate.evidence.release()
                     self._release(item.key)
                 continue
             embedding_ms = (time.monotonic() - started) * 1000
             completed = time.monotonic()
-            for item, result in zip(batch, classified):
+            for index, (item, lease) in enumerate(admitted):
+                result = classified[index] if index < len(classified) else None
                 self._release(item.key)
                 if result is None:
                     self.metrics["classifier_unavailable"] += 1
+                    self.recognition_lifecycle.complete_attempt(
+                        lease, reason="no_result"
+                    )
+                    if (
+                        lease.attempt_index
+                        >= item.candidate.request.lifecycle_policy.max_attempts
+                    ):
+                        self.recognition_lifecycle.terminal(
+                            lease.key,
+                            RecognitionStatus.EXHAUSTED,
+                            "insufficient_quality",
+                        )
+                    item.candidate.evidence.release()
+                    continue
+                top1_label = (
+                    result.top1_label if hasattr(result, "top1_label") else result[0]
+                )
+                top1_score = float(
+                    result.top1_score if hasattr(result, "top1_score") else result[1]
+                )
+                top2_label = (
+                    result.top2_label if hasattr(result, "top2_label") else None
+                )
+                top2_score = float(
+                    result.top2_score if hasattr(result, "top2_score") else 0.0
+                )
+                if not self.recognition_lifecycle.complete_attempt(
+                    lease,
+                    result=top1_label,
+                    confidence=top1_score,
+                ):
+                    self.metrics["stale_lifecycle_result"] += 1
                     item.candidate.evidence.release()
                     continue
                 outcome = FaceRecognitionOutcome(
                     item.candidate,
-                    result[0],
-                    result[1],
-                    len(batch),
+                    top1_label,
+                    top1_score,
+                    top2_label,
+                    top2_score,
+                    len(admitted),
                     max(0.0, (started - item.prepared_monotonic) * 1000),
                     item.alignment_ms,
                     embedding_ms,
                     completed,
+                    lease,
                 )
                 try:
                     self._results.put_nowait(outcome)
@@ -606,22 +834,77 @@ class FaceRecognitionPipeline:
                     self._results.put_nowait(outcome)
                     self.metrics["result_overwritten"] += 1
             self.metrics["batches"] += 1
-            self.metrics["batch_candidates"] += len(batch)
+            self.metrics["batch_candidates"] += len(admitted)
 
     def _release(self, key: FaceKey) -> None:
         with self._active_lock:
             self._active_keys.discard(key)
+
+    @staticmethod
+    def _candidate_identity(item: FaceCandidate | PreparedFaceCandidate) -> str:
+        candidate = item.candidate if isinstance(item, PreparedFaceCandidate) else item
+        return candidate.evidence.candidate_id
+
+    def _reserve_retry(
+        self, item: FaceCandidate | PreparedFaceCandidate
+    ) -> bool:
+        candidate = item.candidate if isinstance(item, PreparedFaceCandidate) else item
+        limit = candidate.request.top_k
+        if isinstance(item, PreparedFaceCandidate):
+            return self._reserve_prepared_retry(item, limit)
+        return self._reserve_candidate_retry(item, limit)
+
+    def _reserve_prepared_retry(
+        self, item: PreparedFaceCandidate, limit: int
+    ) -> bool:
+        with self._retry_lock:
+            retained = self._retry_prepared.setdefault(item.key, [])
+            identity = self._candidate_identity(item)
+            if any(self._candidate_identity(peer) == identity for peer in retained):
+                return False
+            retained.append(item)
+            retained.sort(key=LatestFaceCandidateStore._quality_rank, reverse=True)
+            dropped = retained[limit:]
+            del retained[limit:]
+        for peer in dropped:
+            peer.candidate.evidence.release()
+        return all(peer is not item for peer in dropped)
+
+    def _reserve_candidate_retry(self, item: FaceCandidate, limit: int) -> bool:
+        with self._retry_lock:
+            retained = self._retry_candidates.setdefault(item.key, [])
+            identity = self._candidate_identity(item)
+            if any(self._candidate_identity(peer) == identity for peer in retained):
+                return False
+            retained.append(item)
+            retained.sort(key=LatestFaceCandidateStore._quality_rank, reverse=True)
+            dropped = retained[limit:]
+            del retained[limit:]
+        for peer in dropped:
+            peer.evidence.release()
+        return all(peer is not item for peer in dropped)
+
+    def _release_retry_key(self, key: FaceKey) -> None:
+        with self._retry_lock:
+            candidates = self._retry_candidates.pop(key, [])
+            prepared = self._retry_prepared.pop(key, [])
+        for item in candidates:
+            item.evidence.release()
+        for item in prepared:
+            item.candidate.evidence.release()
 
     def _drop_request(self, item: FaceCaptureRequest, reason: str) -> None:
         item.evidence_lease.release()
         self.metrics[f"drop_{reason}"] += 1
 
     def _drop_candidate(self, item: FaceCandidate, reason: str) -> None:
-        item.evidence.release()
+        if reason not in {"replaced", "lower_quality"} or not self._reserve_retry(item):
+            item.evidence.release()
         self.metrics[f"drop_{reason}"] += 1
         self._release(item.key)
 
     def _drop_prepared(self, item: PreparedFaceCandidate, reason: str) -> None:
-        item.candidate.evidence.release()
+        if reason not in {"replaced", "lower_quality"} or not self._reserve_retry(item):
+            item.candidate.evidence.release()
         self.metrics[f"drop_{reason}"] += 1
         self._release(item.key)

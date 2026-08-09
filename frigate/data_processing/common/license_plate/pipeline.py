@@ -9,13 +9,18 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from frigate.data_processing.common.evidence import EvidenceCandidate, FrameRef
+from frigate.data_processing.common.recognition import RecognitionAttemptLease
 
 
 @dataclass(frozen=True, slots=True)
 class LprTrackKey:
     camera: str
-    track_id: str
+    passage_id: str
     generation: int
+
+    @property
+    def track_id(self) -> str:
+        return self.passage_id
 
 
 @dataclass(slots=True)
@@ -26,6 +31,8 @@ class LprFrameTask:
     dedicated_lpr: bool
     frame_time: float
     enqueued_at: float = field(default_factory=time.monotonic)
+    collection_deadline: float = 0.0
+    priority: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,12 +54,33 @@ class PlateObservation:
     obj_data: dict[str, Any] | None
     dedicated_lpr: bool
     evidence: EvidenceCandidate
+    attempt: RecognitionAttemptLease | None = None
+    ocr_path: str = "paddle_detected_text"
+    ocr_variant: str | None = None
+    vehicle_track_id: str | None = None
+    plate_track_ids: tuple[str, ...] = ()
 
     @property
     def confidence(self) -> float:
         if not self.char_confidences:
             return 0.0
         return sum(self.char_confidences) / len(self.char_confidences)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPlateCandidate:
+    key: LprTrackKey
+    frame_time: float
+    plate_box: tuple[int, int, int, int]
+    object_box: tuple[int, int, int, int] | None
+    obj_data: dict[str, Any] | None
+    dedicated_lpr: bool
+    evidence: EvidenceCandidate
+    plate_frame: Any
+    detector_score: float | None = None
+    vehicle_track_id: str | None = None
+    plate_track_ids: tuple[str, ...] = ()
+    prepared_monotonic: float = field(default_factory=time.monotonic)
 
 
 @dataclass(slots=True)
@@ -136,14 +164,27 @@ class LatestLprTaskQueue:
             if task.key.generation != current:
                 return False
             if task.key in self._pending:
+                previous = self._pending[task.key]
+                if previous.collection_deadline > 0:
+                    task.collection_deadline = previous.collection_deadline
                 self._pending[task.key] = task
                 self._pending.move_to_end(task.key)
                 self.replaced += 1
                 self._condition.notify()
                 return True
             if len(self._pending) >= self.max_tracks:
-                self.full_drops += 1
-                return False
+                worst_key = min(
+                    self._pending,
+                    key=lambda pending_key: (
+                        self._pending[pending_key].priority,
+                        -self._pending[pending_key].enqueued_at,
+                    ),
+                )
+                if self._pending[worst_key].priority >= task.priority:
+                    self.full_drops += 1
+                    return False
+                self._pending.pop(worst_key)
+                self.replaced += 1
             self._pending[task.key] = task
             self._condition.notify()
             return True
@@ -180,6 +221,18 @@ class LatestLprTaskQueue:
             ),
         )
 
+    def cancel(self, key: LprTrackKey) -> bool:
+        """Cancel queued preparation without consuming an inference attempt."""
+        with self._condition:
+            removed = self._pending.pop(key, None) is not None
+            if removed:
+                self._condition.notify_all()
+            return removed
+
+    def contains(self, key: LprTrackKey) -> bool:
+        with self._condition:
+            return key in self._pending
+
     def get(self, timeout: float = 0.5) -> LprFrameTask | LprExpireTask | None:
         deadline = time.monotonic() + timeout
         with self._condition:
@@ -191,8 +244,38 @@ class LatestLprTaskQueue:
             if self._controls:
                 _, control = self._controls.popitem(last=False)
                 return control
-            _, task = self._pending.popitem(last=False)
-            return task
+            while self._pending:
+                now = time.monotonic()
+                ready_keys = [
+                    key
+                    for key, task in self._pending.items()
+                    if task.collection_deadline <= 0
+                    or now >= task.collection_deadline
+                ]
+                ready_key = (
+                    max(
+                        ready_keys,
+                        key=lambda key: (
+                            self._pending[key].priority,
+                            -self._pending[key].enqueued_at,
+                        ),
+                    )
+                    if ready_keys
+                    else None
+                )
+                if ready_key is not None:
+                    return self._pending.pop(ready_key)
+                nearest = min(
+                    task.collection_deadline for task in self._pending.values()
+                )
+                remaining = min(deadline, nearest) - now
+                if remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+                if self._controls:
+                    _, control = self._controls.popitem(last=False)
+                    return control
+            return None
 
     @property
     def depth(self) -> int:

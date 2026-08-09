@@ -68,6 +68,42 @@ class TestConfig(unittest.TestCase):
         assert frigate_config.detectors["cpu"].type == DetectorTypeEnum.cpu
         assert frigate_config.detectors["cpu"].model.width == 320
 
+    def test_recognition_lifecycle_defaults(self):
+        frigate_config = FrigateConfig(**self.minimal)
+        lifecycle = frigate_config.cameras["back"].recognition_lifecycle
+        assert lifecycle.max_attempts == 3
+        assert lifecycle.min_candidate_interval_seconds == 0.4
+        assert lifecycle.max_candidate_bbox_iou == 0.90
+        assert lifecycle.lpr_min_consensus_votes == 2
+        assert lifecycle.candidate_collection_seconds == 0.4
+        assert lifecycle.lpr_observation_threshold == 0.55
+        assert frigate_config.face_recognition.min_identity_margin == 0.10
+
+    def test_recognition_lifecycle_validates_camera_contracts(self):
+        interval = json.loads(json.dumps(self.minimal))
+        interval["cameras"]["back"]["recognition_lifecycle"] = {
+            "min_candidate_interval_seconds": 3.1
+        }
+        with self.assertRaises(ValidationError):
+            FrigateConfig(**interval)
+
+        top_k = json.loads(json.dumps(self.minimal))
+        top_k["cameras"]["back"]["quality"] = {"enabled": True, "top_k": 2}
+        with self.assertRaises(ValidationError):
+            FrigateConfig(**top_k)
+
+        face_votes = json.loads(json.dumps(self.minimal))
+        face_votes["face_recognition"] = {"enabled": True, "min_faces": 4}
+        face_votes["cameras"]["back"]["face_recognition"] = {"enabled": True}
+        with self.assertRaises(ValidationError):
+            FrigateConfig(**face_votes)
+
+        observation_threshold = json.loads(json.dumps(self.minimal))
+        observation_threshold["lpr"] = {"enabled": True, "recognition_threshold": 0.5}
+        observation_threshold["cameras"]["back"]["lpr"] = {"enabled": True}
+        with self.assertRaises(ValidationError):
+            FrigateConfig(**observation_threshold)
+
     @patch("frigate.detectors.detector_config.load_labels")
     def test_detector_custom_model_path(self, mock_labels):
         mock_labels.return_value = {}

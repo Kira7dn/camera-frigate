@@ -13,12 +13,11 @@ import string
 import threading
 import time
 from collections import OrderedDict, deque
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import cv2
-from rapidfuzz.distance import JaroWinkler, Levenshtein
+from rapidfuzz.distance import Levenshtein
 
 from frigate.comms.event_metadata_updater import EventMetadataPublisher
 from frigate.comms.inter_process import InterProcessRequestor
@@ -26,7 +25,10 @@ from frigate.config import FrigateConfig
 from frigate.const import CLIPS_DIR
 from frigate.data_processing.common.evidence import EvidenceRingBuffer, FrameRef
 from frigate.data_processing.common.license_plate.association import (
-    is_lpr_track_discontinuity,
+    LprPassageAdmission,
+    LprPassageRegistry,
+    LprPassageRejection,
+    associate_lpr_passages,
 )
 from frigate.data_processing.common.license_plate.mixin import (
     LicensePlateProcessingMixin,
@@ -40,8 +42,16 @@ from frigate.data_processing.common.license_plate.pipeline import (
     PlateCommit,
     PlateObservation,
     PlateTrackState,
+    PreparedPlateCandidate,
 )
 from frigate.data_processing.common.quality import QualitySelector
+from frigate.data_processing.common.recognition import (
+    RecognitionKey,
+    RecognitionLifecycle,
+    RecognitionPolicy,
+    RecognitionStatus,
+)
+from frigate.util.passage_trace import passage_trace
 
 from ..types import DataProcessorMetrics
 from .api import RealTimeProcessorApi
@@ -60,6 +70,13 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
     MAX_RESULTS = 64
     TASK_TTL = 1.0
 
+    def _get_recognition_lifecycle(self) -> RecognitionLifecycle:
+        lifecycle = getattr(self, "recognition_lifecycle", None)
+        if lifecycle is None:
+            lifecycle = RecognitionLifecycle()
+            self.recognition_lifecycle = lifecycle
+        return lifecycle
+
     def __init__(
         self,
         config: FrigateConfig,
@@ -70,6 +87,7 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         detected_license_plates: dict[str, dict[str, Any]],
         evidence_ring: EvidenceRingBuffer | None = None,
         quality_selector: QualitySelector | None = None,
+        recognition_lifecycle: RecognitionLifecycle | None = None,
     ):
         self.requestor = requestor
         # This compatibility view is updated by EmbeddingMaintainer after commit.
@@ -81,10 +99,18 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         self.camera_current_cars: dict[str, list[str]] = {}
         self.evidence_ring = evidence_ring
         self.quality_selector = quality_selector
+        self.recognition_lifecycle = recognition_lifecycle or RecognitionLifecycle()
+        self._passage_registry = LprPassageRegistry()
         super().__init__(config, metrics)
 
         self._tasks = LatestLprTaskQueue(self.MAX_TRACKS)
         self._states: OrderedDict[LprTrackKey, PlateTrackState] = OrderedDict()
+        self._prepared: dict[LprTrackKey, list[PreparedPlateCandidate]] = {}
+        self._collection_started: dict[LprTrackKey, float] = {}
+        self._last_prepared_monotonic: dict[LprTrackKey, float] = {}
+        self._last_seen_monotonic: dict[LprTrackKey, float] = {}
+        self._terminal_keys: set[LprTrackKey] = set()
+        self._active_detection_ids: dict[str, set[str]] = {}
         self._results: deque[PlateCommit | PlateActivity] = deque()
         self._results_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -127,17 +153,54 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
 
         logger.debug("LPR config updated dynamically")
 
+    def associate_frame_objects(
+        self, camera: str, objects: list[dict[str, Any]]
+    ) -> tuple[list[LprPassageAdmission], list[LprPassageRejection]]:
+        frame_time = max(
+            (float(obj.get("frame_time") or 0.0) for obj in objects), default=0.0
+        )
+        admissions, rejections = associate_lpr_passages(
+            objects,
+            registry=self._passage_registry,
+            camera=camera,
+            frame_time=frame_time,
+        )
+        for rejection in rejections:
+            self._get_recognition_lifecycle().record_skip("lpr", rejection.reason)
+            passage_trace(
+                "recognition_candidate",
+                task="lpr",
+                camera=camera,
+                passage_id=None,
+                plate_track_id=rejection.plate_track_id,
+                raw_track_lineage=[rejection.plate_track_id],
+                decision_reason=rejection.reason,
+                candidate_vehicle_track_ids=list(
+                    rejection.candidate_vehicle_track_ids
+                ),
+                admitted=False,
+            )
+        return admissions, rejections
+
     def _is_eligible(
         self, obj_data: dict[str, Any] | str, dedicated_lpr: bool
     ) -> tuple[str, str, float] | None:
-        camera = str(obj_data) if dedicated_lpr else str(obj_data.get("camera"))
+        if dedicated_lpr:
+            camera = str(obj_data)
+            if (
+                camera not in self.config.cameras
+                or not self.config.cameras[camera].lpr.enabled
+            ):
+                return None
+            return camera, "dedicated-lpr", datetime.datetime.now().timestamp()
+        if not isinstance(obj_data, dict):
+            return None
+        camera = str(obj_data.get("camera"))
         if (
             camera not in self.config.cameras
             or not self.config.cameras[camera].lpr.enabled
         ):
             return None
-        if dedicated_lpr:
-            return camera, "dedicated-lpr", datetime.datetime.now().timestamp()
 
         label = obj_data.get("label")
         if label not in self.lp_objects and label != "license_plate":
@@ -155,7 +218,7 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
                 return None
         elif label != "license_plate" and not obj_data.get("current_attributes"):
             return None
-        track_id = str(obj_data.get("id"))
+        track_id = str(obj_data.get("_recognition_passage_id") or obj_data.get("id"))
         frame_time = float(
             obj_data.get("frame_time") or datetime.datetime.now().timestamp()
         )
@@ -166,28 +229,87 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         obj_data: dict[str, Any] | str,
         frame_ref: FrameRef,
         dedicated_lpr: bool = False,
+        *args: Any,
+        **kwargs: Any,
     ) -> None:
         """Gate, take one owning frame copy, and enqueue latest work per track."""
         eligible = self._is_eligible(obj_data, dedicated_lpr)
         if eligible is None:
             return
         camera, track_id, frame_time = eligible
+        object_data: dict[str, Any] = (
+            {} if dedicated_lpr else obj_data if isinstance(obj_data, dict) else {}
+        )
+        passage_trace(
+            "lpr_eligible",
+            camera=camera,
+            frame_time=frame_time,
+            passage_id=track_id,
+            recognition_passage_id=track_id,
+            track_id=str(object_data.get("id")) if not dedicated_lpr else track_id,
+            raw_track_lineage=[]
+            if dedicated_lpr
+            else [
+                value
+                for value in (
+                    object_data.get("_recognition_vehicle_track_id"),
+                    *object_data.get("_recognition_plate_track_ids", ()),
+                )
+                if value
+            ],
+            object_box=None if dedicated_lpr else object_data.get("box"),
+        )
         generation = self._tasks.generation(camera, track_id)
         key = LprTrackKey(camera, track_id, generation)
+        lifecycle_key = RecognitionKey("lpr", camera, track_id, generation)
+        if self._get_recognition_lifecycle().is_terminal(lifecycle_key):
+            self._increment_metric("lpr_terminal_skips")
+            return
+        if not hasattr(self, "_last_seen_monotonic"):
+            self._last_seen_monotonic = {}
+        if not hasattr(self, "_last_prepared_monotonic"):
+            self._last_prepared_monotonic = {}
+        now = time.monotonic()
+        self._last_seen_monotonic[key] = now
+        prepare_interval = getattr(
+            self.config.cameras[camera].recognition_lifecycle,
+            "min_candidate_interval_seconds",
+            0.4,
+        )
+        deadline = max(
+            now,
+            self._last_prepared_monotonic.get(key, now - prepare_interval)
+            + prepare_interval,
+        )
+        object_box = None if dedicated_lpr else object_data.get("box")
+        priority = (
+            float(max(0, object_box[2] - object_box[0]))
+            * float(max(0, object_box[3] - object_box[1]))
+            * max(0.1, float(object_data.get("score", 1.0)))
+            if object_box
+            else 0.0
+        )
         task = LprFrameTask(
             key=key,
-            obj_data=str(obj_data) if dedicated_lpr else dict(obj_data),
+            obj_data=str(obj_data) if dedicated_lpr else dict(object_data),
             frame_ref=frame_ref,
             dedicated_lpr=dedicated_lpr,
             frame_time=frame_time,
+            # Plate quality is only known after plate detection in lpr_process.
+            # Keep this raw-frame queue conflated but ready immediately; the
+            # shared selector/lifecycle performs admission before OCR.
+            collection_deadline=deadline,
+            priority=priority,
         )
         self._tasks.submit(task)
         self._update_queue_metrics()
 
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
-            task = self._tasks.get(timeout=0.5)
+            task = self._tasks.get(timeout=0.1)
             if task is None:
+                self._run_ready_candidate()
+                self._expire_idle_passages()
                 continue
             self._update_queue_metrics()
             if isinstance(task, LprExpireTask):
@@ -202,55 +324,358 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
             if not self._tasks.is_current(task.key):
                 self._increment_metric("lpr_stale_generation_drops")
                 continue
+            if self._get_recognition_lifecycle().is_terminal(
+                RecognitionKey(
+                    "lpr", task.key.camera, task.key.track_id, task.key.generation
+                )
+            ):
+                self._increment_metric("lpr_terminal_skips")
+                self._get_recognition_lifecycle().record_skip("lpr", "terminal")
+                continue
 
             started = time.monotonic()
-            lease = None
+            frame_lease = None
             try:
                 if self.evidence_ring is None or self.quality_selector is None:
                     continue
-                lease = self.evidence_ring.acquire(task.frame_ref)
-                if lease is None:
+                self._last_prepared_monotonic[task.key] = time.monotonic()
+                frame_lease = self.evidence_ring.acquire(task.frame_ref)
+                if frame_lease is None:
                     self.quality_selector.record_reject("lpr", "frame_expired")
                     continue
-                observation = self.lpr_process(
+                prepared = self.lpr_process(
                     task.obj_data,
-                    lease.frame,
+                    frame_lease.frame,
                     task.dedicated_lpr,
                     task.key,
                     task.frame_ref,
                 )
-                if observation is None:
+                if not isinstance(prepared, PreparedPlateCandidate):
                     continue
-                if not self._tasks.is_current(observation.key):
+                if not self._tasks.is_current(prepared.key):
                     self._increment_metric("lpr_stale_generation_drops")
-                    observation.evidence.release()
+                    prepared.evidence.release()
                     continue
-                commit = self._reduce(observation)
-                if commit is not None and self._tasks.is_current(commit.key):
-                    self._emit_commit(commit)
-                elif commit is not None:
-                    self._increment_metric("lpr_stale_generation_drops")
+                self._store_prepared(prepared)
+                self._run_ready_candidate()
+                self._expire_idle_passages()
             except Exception:
                 logger.exception("Error processing realtime LPR task")
             finally:
-                if lease is not None:
-                    lease.release()
+                if frame_lease is not None:
+                    frame_lease.release()
                 self._set_metric("lpr_worker_latency", time.monotonic() - started)
 
+    def _store_prepared(self, candidate: PreparedPlateCandidate) -> None:
+        key = candidate.key
+        selector = self.quality_selector
+        if selector is None:
+            candidate.evidence.release()
+            return
+        active_ids = selector.active_candidate_ids(
+            "lpr", key.camera, key.passage_id, key.generation
+        )
+        retained: list[PreparedPlateCandidate] = []
+        for previous in self._prepared.get(key, []):
+            if previous.evidence.candidate_id in active_ids:
+                retained.append(previous)
+            else:
+                previous.evidence.release()
+        if candidate.evidence.candidate_id not in {
+            item.evidence.candidate_id for item in retained
+        }:
+            retained.append(candidate)
+        else:
+            candidate.evidence.release()
+        retained.sort(
+            key=lambda item: (
+                item.evidence.quality_score,
+                item.detector_score if item.detector_score is not None else -1.0,
+                item.evidence.candidate_id,
+            ),
+            reverse=True,
+        )
+        self._prepared[key] = retained
+        self._collection_started.setdefault(key, time.monotonic())
+        passage_trace(
+            "recognition_candidate",
+            task="lpr",
+            camera=key.camera,
+            passage_id=key.passage_id,
+            recognition_passage_id=key.passage_id,
+            track_id=key.passage_id,
+            generation=key.generation,
+            vehicle_track_id=candidate.vehicle_track_id,
+            plate_track_ids=list(candidate.plate_track_ids),
+            raw_track_lineage=[
+                value
+                for value in (candidate.vehicle_track_id, *candidate.plate_track_ids)
+                if value
+            ],
+            candidate_id=candidate.evidence.candidate_id,
+            evidence_id=candidate.evidence.frame_ref.identity,
+            frame_id=candidate.evidence.frame_ref.frame_id,
+            frame_time=candidate.frame_time,
+            bbox=list(candidate.plate_box),
+            object_box=list(candidate.object_box) if candidate.object_box else None,
+            quality_score=candidate.evidence.quality_score,
+            quality_components=candidate.evidence.quality_components,
+            admitted=True,
+        )
+
+    def _run_ready_candidate(self) -> None:
+        now = time.monotonic()
+        eligible: list[PreparedPlateCandidate] = []
+        for key, candidates in self._prepared.items():
+            if not candidates:
+                continue
+            lifecycle_config = self.config.cameras[key.camera].recognition_lifecycle
+            if (
+                now - self._collection_started.get(key, now) + 1e-9
+                < lifecycle_config.candidate_collection_seconds
+            ):
+                continue
+            eligible.append(
+                max(
+                    candidates,
+                    key=lambda item: (
+                        item.evidence.quality_score,
+                        item.evidence.candidate_id,
+                    ),
+                )
+            )
+        if not eligible:
+            return
+        candidate = max(
+            eligible,
+            key=lambda item: (
+                item.evidence.quality_score,
+                -item.prepared_monotonic,
+                item.evidence.candidate_id,
+            ),
+        )
+        self._prepared[candidate.key].remove(candidate)
+        self._recognize_prepared(candidate)
+
+    def _recognize_prepared(self, candidate: PreparedPlateCandidate) -> None:
+        key = candidate.key
+        lifecycle_config = self.config.cameras[key.camera].recognition_lifecycle
+        lifecycle_key = RecognitionKey("lpr", key.camera, key.passage_id, key.generation)
+        attempt, skip_reason = self._get_recognition_lifecycle().begin_attempt(
+            lifecycle_key,
+            candidate_id=candidate.evidence.candidate_id,
+            frame_time=candidate.frame_time,
+            detail_bbox=candidate.plate_box,
+            quality_score=candidate.evidence.quality_score,
+            policy=RecognitionPolicy(
+                max_attempts=lifecycle_config.max_attempts,
+                min_candidate_interval_seconds=(
+                    lifecycle_config.min_candidate_interval_seconds
+                ),
+                max_candidate_bbox_iou=lifecycle_config.max_candidate_bbox_iou,
+            ),
+        )
+        if attempt is None:
+            candidate.evidence.release()
+            passage_trace(
+                "recognition_attempt",
+                task="lpr",
+                camera=key.camera,
+                passage_id=key.passage_id,
+                recognition_passage_id=key.passage_id,
+                track_id=key.passage_id,
+                generation=key.generation,
+                candidate_id=candidate.evidence.candidate_id,
+                evidence_id=candidate.evidence.frame_ref.identity,
+                frame_id=candidate.evidence.frame_ref.frame_id,
+                frame_time=candidate.frame_time,
+                bbox=list(candidate.plate_box),
+                object_box=list(candidate.object_box) if candidate.object_box else None,
+                vehicle_track_id=candidate.vehicle_track_id,
+                plate_track_ids=list(candidate.plate_track_ids),
+                quality_score=candidate.evidence.quality_score,
+                decision_reason=skip_reason,
+                inference_started=False,
+            )
+            if skip_reason == "attempt_budget_exhausted":
+                self._finish_passage(key, "insufficient_quality", boundary=False)
+            return
+
+        started = time.monotonic()
+        plates, confidences, areas = self._process_license_plate(
+            key.camera,
+            key.passage_id,
+            candidate.plate_frame,
+            int(candidate.frame_time * 1000),
+        )
+        self.plates_rec_second.update()
+        self.plate_rec_speed.update(time.monotonic() - started)
+        plate = plates[0] if plates else None
+        char_confidences = confidences[0] if confidences else []
+        confidence = (
+            sum(char_confidences) / len(char_confidences)
+            if char_confidences
+            else 0.0
+        )
+        if plate:
+            passage_trace(
+                "ocr_result",
+                task="lpr",
+                camera=key.camera,
+                passage_id=key.passage_id,
+                recognition_passage_id=key.passage_id,
+                track_id=key.passage_id,
+                generation=key.generation,
+                vehicle_track_id=candidate.vehicle_track_id,
+                plate_track_ids=list(candidate.plate_track_ids),
+                candidate_id=candidate.evidence.candidate_id,
+                evidence_id=candidate.evidence.frame_ref.identity,
+                frame_id=candidate.evidence.frame_ref.frame_id,
+                frame_time=candidate.frame_time,
+                plate=plate,
+                score=confidence,
+                score_type="raw_mean_character_score",
+                plate_box=list(candidate.plate_box),
+                object_box=list(candidate.object_box)
+                if candidate.object_box
+                else None,
+            )
+        completed = self._get_recognition_lifecycle().complete_attempt(
+            attempt,
+            result=plate,
+            confidence=confidence,
+            confidence_type="raw_mean_character_score",
+            reason="inference_completed" if plate else "no_ocr_result",
+        )
+        passage_trace(
+            "recognition_attempt",
+            task="lpr",
+            camera=key.camera,
+            passage_id=key.passage_id,
+            recognition_passage_id=key.passage_id,
+            track_id=key.passage_id,
+            generation=key.generation,
+            vehicle_track_id=candidate.vehicle_track_id,
+            plate_track_ids=list(candidate.plate_track_ids),
+            raw_track_lineage=[
+                value
+                for value in (candidate.vehicle_track_id, *candidate.plate_track_ids)
+                if value
+            ],
+            attempt_index=attempt.attempt_index,
+            candidate_id=candidate.evidence.candidate_id,
+            evidence_id=candidate.evidence.frame_ref.identity,
+            frame_id=candidate.evidence.frame_ref.frame_id,
+            frame_time=candidate.frame_time,
+            bbox=list(candidate.plate_box),
+            object_box=list(candidate.object_box) if candidate.object_box else None,
+            quality_score=candidate.evidence.quality_score,
+            ocr=plate,
+            confidence=confidence,
+            latency_ms=(time.monotonic() - attempt.started_monotonic) * 1000,
+            decision_reason="consensus_pending" if plate else "no_ocr_result",
+            inference_started=True,
+        )
+        if not completed:
+            candidate.evidence.release()
+            self._increment_metric("lpr_stale_generation_drops")
+            return
+        if not plate:
+            candidate.evidence.release()
+            if attempt.attempt_index >= lifecycle_config.max_attempts:
+                self._finish_passage(key, "insufficient_quality", boundary=False)
+            return
+        observation = PlateObservation(
+            key=key,
+            frame_time=candidate.frame_time,
+            plate=plate,
+            char_confidences=tuple(float(value) for value in char_confidences),
+            text_area=int(areas[0]) if areas else 0,
+            plate_box=candidate.plate_box,
+            object_box=candidate.object_box,
+            obj_data=candidate.obj_data,
+            dedicated_lpr=candidate.dedicated_lpr,
+            evidence=candidate.evidence,
+            attempt=attempt,
+            vehicle_track_id=candidate.vehicle_track_id,
+            plate_track_ids=candidate.plate_track_ids,
+        )
+        commit = self._reduce(observation)
+        if commit is not None and self._tasks.is_current(commit.key):
+            self._emit_commit(commit)
+        elif commit is not None:
+            self._increment_metric("lpr_stale_generation_drops")
+
+    def _release_prepared(self, key: LprTrackKey) -> None:
+        for candidate in self._prepared.pop(key, []):
+            candidate.evidence.release()
+        self._collection_started.pop(key, None)
+
+    def _expire_idle_passages(self) -> None:
+        now = time.monotonic()
+        for key, last_seen in list(
+            getattr(self, "_last_seen_monotonic", {}).items()
+        ):
+            idle_seconds = getattr(
+                self.config.cameras[key.camera].recognition_lifecycle,
+                "passage_idle_seconds",
+                1.0,
+            )
+            if now - last_seen >= idle_seconds:
+                if self._tasks.contains(key) or self._prepared.get(key):
+                    continue
+                self._finish_passage(key, "insufficient_quality", boundary=False)
+
+    def _finish_passage(
+        self, key: LprTrackKey, reason: str, *, boundary: bool
+    ) -> None:
+        lifecycle_key = RecognitionKey("lpr", key.camera, key.passage_id, key.generation)
+        lifecycle = self._get_recognition_lifecycle()
+        searching = lifecycle.status(lifecycle_key) == RecognitionStatus.SEARCHING
+        if searching:
+            lifecycle.terminal(lifecycle_key, RecognitionStatus.EXHAUSTED, reason)
+            passage_trace(
+                "recognition_terminal",
+                task="lpr",
+                camera=key.camera,
+                passage_id=key.passage_id,
+                recognition_passage_id=key.passage_id,
+                track_id=key.passage_id,
+                generation=key.generation,
+                status=RecognitionStatus.EXHAUSTED.value,
+                reason=reason,
+                winner=None,
+                best_effort=False,
+            )
+        state = self._states.pop(key, None)
+        if state is not None:
+            self._release_state(state)
+        self._release_prepared(key)
+        if hasattr(self._tasks, "cancel"):
+            self._tasks.cancel(key)
+        getattr(self, "_last_prepared_monotonic", {}).pop(key, None)
+        getattr(self, "_last_seen_monotonic", {}).pop(key, None)
+        if self.quality_selector is not None:
+            self.quality_selector.expire(
+                "lpr", key.camera, key.passage_id, key.generation
+            )
+        if boundary:
+            self._terminal_keys.discard(key)
+            lifecycle.expire(lifecycle_key, reason)
+        else:
+            self._terminal_keys.add(key)
+
     def _expire_state(self, task: LprExpireTask) -> None:
-        for key in list(self._states):
+        keys = set(self._states) | set(self._prepared) | self._terminal_keys
+        for key in list(keys):
             sweep = task.generation < 0 and not self._tasks.is_current(key)
             targeted = (
                 key.camera == task.camera
-                and key.track_id == task.track_id
+                and key.passage_id == task.track_id
                 and key.generation < task.generation
             )
             if sweep or targeted:
-                self._release_state(self._states.pop(key))
-                if self.quality_selector is not None:
-                    self.quality_selector.expire(
-                        "lpr", key.camera, key.track_id, key.generation
-                    )
+                self._finish_passage(key, "insufficient_quality", boundary=True)
 
     @staticmethod
     def _normalized_plate(plate: str) -> str:
@@ -258,8 +683,10 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
 
     def _new_state(self, key: LprTrackKey) -> PlateTrackState:
         while len(self._states) >= self.MAX_STATES:
-            _, expired = self._states.popitem(last=False)
-            self._release_state(expired)
+            expired_key = next(iter(self._states))
+            self._finish_passage(
+                expired_key, "insufficient_quality", boundary=False
+            )
         state = PlateTrackState(key=key)
         self._states[key] = state
         return state
@@ -270,93 +697,41 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
             state = self._new_state(observation.key)
         else:
             self._states.move_to_end(observation.key)
-
-        if (
-            observation.dedicated_lpr
-            and state.last_seen is not None
-            and observation.frame_time - state.last_seen
-            > self.config.cameras[observation.key.camera].lpr.expire_time
-        ):
-            observation = self._tasks.rekey(observation)
-            if self.quality_selector is not None:
-                observation = replace(
-                    observation,
-                    evidence=self.quality_selector.rekey(
-                        observation.evidence, observation.key.generation
-                    ),
-                )
-            state = self._new_state(observation.key)
-
         if observation.frame_time in state.seen_frames:
             observation.evidence.release()
             return None
-
-        if (
-            not observation.dedicated_lpr
-            and state.representative_plate
-            and is_lpr_track_discontinuity(
-                state.representative_plate,
-                observation.plate,
-                state.object_box,
-                observation.object_box,
-                self.cluster_threshold,
-            )
-        ):
-            if (
-                state.switch_candidate
-                and JaroWinkler.similarity(state.switch_candidate, observation.plate)
-                >= self.cluster_threshold
-            ):
-                state.switch_count += 1
-            else:
-                state.switch_candidate = observation.plate
-                state.switch_count = 1
-            if state.switch_count < 2:
-                observation.evidence.release()
-                return None
-            observation = self._tasks.rekey(observation)
-            if self.quality_selector is not None:
-                observation = replace(
-                    observation,
-                    evidence=self.quality_selector.rekey(
-                        observation.evidence, observation.key.generation
-                    ),
-                )
-            state = self._new_state(observation.key)
-        else:
-            state.switch_candidate = None
-            state.switch_count = 0
-
         state.seen_frames.add(observation.frame_time)
         state.seen_frame_order.append(observation.frame_time)
-        max_variants = max(
-            1, int(self.config.cameras[observation.key.camera].detect.fps * 5)
+        attempt_index = (
+            observation.attempt.attempt_index
+            if observation.attempt
+            else len(state.seen_frames)
         )
-        while len(state.seen_frame_order) > max_variants:
-            state.seen_frames.discard(state.seen_frame_order.popleft())
-
-        if (
-            self.quality_selector is not None
-            and self.config.cameras[observation.key.camera].quality.enabled
-        ):
-            active_ids = self.quality_selector.active_candidate_ids(
-                "lpr",
-                observation.key.camera,
-                observation.key.track_id,
-                observation.key.generation,
-            )
-            retained_variants = []
-            for variant in state.variants:
-                prior = variant.get("observation")
-                if prior is None or prior.evidence.candidate_id in active_ids:
-                    retained_variants.append(variant)
-                else:
-                    prior.evidence.release()
-            state.variants = retained_variants
+        lifecycle_config = self.config.cameras[
+            observation.key.camera
+        ].recognition_lifecycle
+        normalized = self._normalized_plate(observation.plate)
+        valid = (
+            observation.confidence >= self.lpr_config.recognition_threshold
+            and len(normalized) >= self.lpr_config.min_plate_length
+        )
+        if valid and self.lpr_config.format:
+            try:
+                valid = re.fullmatch(self.lpr_config.format, normalized) is not None
+            except re.error:
+                logger.error("Invalid regex in LPR format configuration")
+                valid = False
+        if not valid:
+            observation.evidence.release()
+            if attempt_index >= lifecycle_config.max_attempts:
+                self._finish_passage(
+                    observation.key, "insufficient_quality", boundary=False
+                )
+            return None
 
         state.variants.append(
             {
-                "plate": observation.plate,
+                "plate": normalized,
                 "conf": observation.confidence,
                 "char_confidences": list(observation.char_confidences),
                 "area": observation.text_area,
@@ -366,73 +741,48 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
                 "observation": observation,
             }
         )
-        if len(state.variants) > max_variants:
-            removed = state.variants[:-max_variants]
-            state.variants = state.variants[-max_variants:]
-            for variant in removed:
-                prior = variant.get("observation")
-                if prior is not None:
-                    prior.evidence.release()
-
-        rep_plate, rep_conf, _, rep_area = self._get_cluster_rep(state.variants)
-        representative = max(
-            (
-                variant
-                for variant in state.variants
-                if JaroWinkler.similarity(variant["plate"], rep_plate)
-                >= self.cluster_threshold
-            ),
+        winner = max(
+            state.variants,
             key=lambda variant: (
-                variant["plate"] == rep_plate,
+                sum(
+                    peer["plate"] == variant["plate"]
+                    for peer in state.variants
+                ),
                 float(variant["conf"]),
                 int(variant["area"]),
-                float(variant.get("quality", 0.0)),
-                str(variant.get("candidate_id", "")),
+                float(variant["quality"]),
+                str(variant["candidate_id"]),
             ),
-        )["observation"]
+        )
+        cluster = [
+            variant
+            for variant in state.variants
+            if variant["plate"] == winner["plate"]
+        ]
+        support = len(cluster)
+        representative_variant = max(
+            cluster,
+            key=lambda variant: (
+                float(variant["conf"]),
+                int(variant["area"]),
+                float(variant["quality"]),
+                str(variant["candidate_id"]),
+            ),
+        )
+        representative = representative_variant["observation"]
+        rep_plate = str(representative_variant["plate"])
+        rep_conf = float(representative_variant["conf"])
+        rep_area = int(representative_variant["area"])
         state.representative_plate = rep_plate
         state.object_box = observation.object_box
         state.last_seen = observation.frame_time
-
-        # Raw observations enter consensus before commit filters are applied.
-        if rep_conf < self.lpr_config.recognition_threshold:
-            return None
-        if len(rep_plate) < self.lpr_config.min_plate_length:
-            return None
-        if self.lpr_config.format:
-            try:
-                if not re.fullmatch(self.lpr_config.format, rep_plate):
-                    return None
-            except re.error:
-                logger.error("Invalid regex in LPR format configuration")
-
-        normalized = self._normalized_plate(rep_plate)
-        if not normalized:
-            return None
-        if normalized in state.committed_plates:
-            if observation.dedicated_lpr and state.event_id is not None:
-                self._emit_activity(
-                    PlateActivity(
-                        event_id=state.event_id,
-                        camera=observation.key.camera,
-                        frame_time=observation.frame_time,
-                        key=observation.key,
-                    )
+        if support < lifecycle_config.lpr_min_consensus_votes:
+            if attempt_index >= lifecycle_config.max_attempts:
+                self._finish_passage(
+                    observation.key, "insufficient_quality", boundary=False
                 )
             return None
-        support = sum(
-            1
-            for variant in state.variants
-            if JaroWinkler.similarity(variant["plate"], rep_plate)
-            >= self.cluster_threshold
-        )
         strength = (support, float(rep_conf), int(rep_area))
-        if (
-            state.committed_strength is not None
-            and strength <= state.committed_strength
-        ):
-            return None
-
         if state.event_id is None:
             if observation.dedicated_lpr:
                 suffix = "".join(
@@ -440,25 +790,83 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
                 )
                 state.event_id = f"{datetime.datetime.now().timestamp()}-{suffix}"
             else:
-                state.event_id = observation.key.track_id
+                # Lifecycle ownership is canonical, while the external Event
+                # update targets the raw vehicle Event that owns the winning
+                # representative evidence.
+                state.event_id = (
+                    representative.vehicle_track_id
+                    or observation.key.passage_id
+                )
 
         sub_label = self._known_plate_label(rep_plate)
         commit = self._materialize_commit(
-            representative, state.event_id, normalized, rep_plate, rep_conf, sub_label
+            representative, state.event_id, rep_plate, rep_plate, rep_conf, sub_label
         )
         if commit is None:
+            if attempt_index >= lifecycle_config.max_attempts:
+                self._finish_passage(
+                    observation.key, "insufficient_quality", boundary=False
+                )
             return None
-        state.committed_plates.add(normalized)
-        state.committed_plate = normalized
+        state.committed_plates.add(rep_plate)
+        state.committed_plate = rep_plate
         state.committed_strength = strength
+        self._get_recognition_lifecycle().terminal(
+            RecognitionKey(
+                "lpr",
+                observation.key.camera,
+                observation.key.passage_id,
+                observation.key.generation,
+            ),
+            RecognitionStatus.ACCEPTED,
+            "consensus_accepted",
+        )
+        passage_trace(
+            "recognition_terminal",
+            camera=observation.key.camera,
+            frame_time=representative.frame_time,
+            passage_id=observation.key.passage_id,
+            recognition_passage_id=observation.key.passage_id,
+            track_id=observation.key.passage_id,
+            generation=observation.key.generation,
+            task="lpr",
+            status=RecognitionStatus.ACCEPTED.value,
+            reason="consensus_accepted",
+            winner=rep_plate,
+            candidate_id=representative.evidence.candidate_id,
+            evidence_id=representative.evidence.frame_ref.identity,
+            frame_id=representative.evidence.frame_ref.frame_id,
+            bbox=list(representative.plate_box),
+            vehicle_track_id=representative.vehicle_track_id,
+            plate_track_ids=list(representative.plate_track_ids),
+            best_effort=False,
+            consensus_tier="independent_candidates",
+            consensus_support=support,
+        )
+        if self.quality_selector is not None:
+            self.quality_selector.expire(
+                "lpr",
+                observation.key.camera,
+                observation.key.passage_id,
+                observation.key.generation,
+            )
+        self._states.pop(observation.key, None)
+        self._release_state(state)
+        self._release_prepared(observation.key)
+        if hasattr(self._tasks, "cancel"):
+            self._tasks.cancel(observation.key)
+        getattr(self, "_last_prepared_monotonic", {}).pop(observation.key, None)
+        getattr(self, "_last_seen_monotonic", {}).pop(observation.key, None)
+        self._terminal_keys.add(observation.key)
         return commit
 
     def _known_plate_label(self, plate: str) -> str | None:
+        known_plates = self.lpr_config.known_plates or {}
         try:
             return next(
                 (
                     label
-                    for label, plates in self.lpr_config.known_plates.items()
+                    for label, plates in known_plates.items()
                     if any(
                         re.match(f"^{candidate}$", plate)
                         or Levenshtein.distance(candidate, plate)
@@ -567,8 +975,28 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
 
     def expire_object(self, object_id: str, camera: str) -> None:
         """Priority reset invalidates pending and in-flight results immediately."""
-        self._tasks.advance_generation(camera, str(object_id))
+        active = getattr(self, "_active_detection_ids", None)
+        if active is None:
+            active = {}
+            self._active_detection_ids = active
+        active.setdefault(camera, set()).discard(str(object_id))
+        registry = getattr(self, "_passage_registry", None)
+        boundaries = (
+            registry.retire_raw(camera, str(object_id))
+            if registry is not None
+            else None
+        )
+        for passage_id in ([str(object_id)] if boundaries is None else boundaries):
+            self._tasks.advance_generation(camera, passage_id)
         self._update_queue_metrics()
+
+    def expire_missing_objects(self, camera: str, active_ids: set[str]) -> None:
+        """Reconcile LPR work with the authoritative active detection set."""
+        active_ids = {str(object_id) for object_id in active_ids}
+        previous = self._active_detection_ids.get(camera, set())
+        for object_id in previous - active_ids:
+            self.expire_object(object_id, camera)
+        self._active_detection_ids[camera] = active_ids
 
     @staticmethod
     def _release_state(state: PlateTrackState) -> None:
@@ -582,9 +1010,19 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         self._stop_event.set()
         self._tasks.wake()
         self._worker.join(timeout=5.0)
-        for state in self._states.values():
-            self._release_state(state)
-        self._states.clear()
+        keys = (
+            set(self._states)
+            | set(self._prepared)
+            | self._terminal_keys
+            | set(getattr(self, "_last_seen_monotonic", {}))
+        )
+        for key in keys:
+            # Shutdown is cancellation only. _finish_passage never emits.
+            self._finish_passage(key, "shutdown", boundary=True)
+        self._terminal_keys.clear()
+        registry = getattr(self, "_passage_registry", None)
+        if registry is not None:
+            registry.clear()
 
     @property
     def pending_count(self) -> int:
@@ -593,3 +1031,7 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
     @property
     def state_count(self) -> int:
         return len(self._states)
+
+    @property
+    def prepared_count(self) -> int:
+        return sum(len(candidates) for candidates in self._prepared.values())

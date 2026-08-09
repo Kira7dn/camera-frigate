@@ -7,6 +7,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -30,6 +31,8 @@ from frigate.data_processing.common.quality import QualitySelector, QualityThres
 from frigate.detectors.detection_runners import CudaGraphRunner
 from frigate.embeddings.onnx.face_embedding import ArcfaceEmbedding
 from frigate.embeddings.types import EnrichmentModelTypeEnum
+from frigate.data_processing.real_time.face import FaceRealTimeProcessor
+from frigate.util.face_snapshot import FaceTrackState
 
 
 def request(
@@ -89,6 +92,66 @@ def evidence(item: FaceCaptureRequest) -> EvidenceCandidate:
 
 
 class FaceRecognitionPipelineTest(unittest.TestCase):
+    def test_retry_uses_best_retained_top_k_candidate(self) -> None:
+        ring = EvidenceRingBuffer(
+            {"cam": EvidenceBufferPolicy(3.0, 8 * 1024 * 1024, 100.0)}
+        )
+        first_request = request("cam", "track", 1.0, ring=ring)
+        second_request = request("cam", "track", 2.0, ring=ring)
+        first = FaceCandidate(
+            first_request,
+            (0, 0, 4, 4),
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            0.0,
+            0.5,
+            replace(evidence(first_request), candidate_id="first"),
+        )
+        second = FaceCandidate(
+            second_request,
+            (0, 0, 4, 4),
+            np.zeros((4, 4, 3), dtype=np.uint8),
+            0.0,
+            0.9,
+            replace(evidence(second_request), candidate_id="second"),
+        )
+        pipeline = object.__new__(FaceRecognitionPipeline)
+        pipeline._retry_lock = threading.Lock()
+        pipeline._retry_candidates = {}
+        pipeline._retry_prepared = {}
+        pipeline.candidate_store = LatestFaceCandidateStore[FaceCandidate]()
+        pipeline.prepared_store = LatestFaceCandidateStore[PreparedFaceCandidate]()
+        try:
+            self.assertTrue(pipeline._reserve_retry(first))
+            self.assertTrue(pipeline._reserve_retry(second))
+            self.assertTrue(pipeline.retry(first.key))
+            selected = pipeline.candidate_store.take_fair(1, 0.0)
+            self.assertEqual(selected[0].evidence.candidate_id, "second")
+            selected[0].evidence.release()
+            pipeline._release_retry_key(first.key)
+        finally:
+            first_request.evidence_lease.release()
+            second_request.evidence_lease.release()
+            ring.close()
+
+    def test_face_top_two_margin_and_terminal_reason_contract(self) -> None:
+        processor = object.__new__(FaceRealTimeProcessor)
+        processor.face_config = SimpleNamespace(
+            recognition_threshold=0.9, min_identity_margin=0.10
+        )
+        self.assertEqual(processor._face_vote_decision(0.95, 0.70), "vote_valid")
+        self.assertEqual(
+            processor._face_vote_decision(0.95, 0.90), "ambiguous_identity"
+        )
+        self.assertEqual(processor._face_vote_decision(0.85, 0.20), "unknown")
+
+        state = FaceTrackState(0.0, (0, 0, 1, 1), 0.0, [])
+        self.assertEqual(processor._face_exhausted_reason(state), "insufficient_quality")
+        state.unknown_seen = True
+        self.assertEqual(processor._face_exhausted_reason(state), "unknown")
+        state.ambiguous_identity_seen = True
+        self.assertEqual(
+            processor._face_exhausted_reason(state), "ambiguous_identity"
+        )
     def test_keyed_store_is_latest_only_bounded_and_releases_drops(self) -> None:
         dropped = []
         store = LatestFaceCandidateStore[FaceCaptureRequest](
@@ -141,8 +204,10 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
         )
         self.assertTrue(all(item.vote_count == 0 for item in first + second))
 
-    def test_prepared_candidate_flushes_once_after_100ms(self) -> None:
-        item = request("cam", "track")
+    def test_prepared_candidate_waits_for_collection_window(self) -> None:
+        item = replace(
+            request("cam", "track"), candidate_collection_seconds=0.1
+        )
         candidate = FaceCandidate(
             item,
             (0, 0, 4, 4),
@@ -161,11 +226,55 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
         store = LatestFaceCandidateStore[PreparedFaceCandidate]()
         store.submit(prepared)
         started = time.monotonic()
-        selected = store.take_fair(4, 0.1, flush_seconds=0.1)
+        selected = store.take_fair(
+            4, 0.15, flush_seconds=0.1, per_item_flush=True
+        )
         elapsed = time.monotonic() - started
         self.assertEqual(selected, [prepared])
         self.assertGreaterEqual(elapsed, 0.09)
         self.assertLess(elapsed, 0.16)
+
+    def test_prepared_store_keeps_best_quality_before_inference(self) -> None:
+        dropped = []
+        item = replace(
+            request("cam", "track"), candidate_collection_seconds=0.0
+        )
+
+        def prepared(quality: float, frame_time: float) -> PreparedFaceCandidate:
+            candidate_request = replace(
+                item,
+                frame_time=frame_time,
+                created_monotonic=time.monotonic(),
+            )
+            candidate = FaceCandidate(
+                candidate_request,
+                (0, 0, 4, 4),
+                np.zeros((4, 4, 3), dtype=np.uint8),
+                1.0,
+                quality,
+                evidence(candidate_request),
+            )
+            return PreparedFaceCandidate(
+                candidate,
+                np.zeros((112, 112, 3), dtype=np.float32),
+                0.0,
+                1.0,
+                time.monotonic(),
+            )
+
+        store = LatestFaceCandidateStore[PreparedFaceCandidate](
+            prefer_quality=True,
+            on_drop=lambda candidate, reason: dropped.append(
+                (candidate.quality, reason)
+            ),
+        )
+        best = prepared(0.9, 1.0)
+        lower = prepared(0.7, 2.0)
+        store.submit(best)
+        self.assertFalse(store.submit(lower))
+
+        assert store.take_fair(1, 0, per_item_flush=True) == [best]
+        assert dropped == [(0.7, "lower_quality")]
 
     def test_yuv_person_crop_maps_back_to_full_frame(self) -> None:
         bgr = np.zeros((16, 20, 3), dtype=np.uint8)
@@ -290,6 +399,59 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
             self.assertEqual(pipeline.pending_count(), 0)
             for outcome in outcomes:
                 outcome.candidate.evidence.release()
+        finally:
+            pipeline.stop()
+            selector.shutdown()
+            ring.close()
+
+    def test_short_classifier_batch_completes_every_attempt_lease(self) -> None:
+        class Detector:
+            def setInputSize(self, size) -> None:
+                self.size = size
+
+            def detect(self, image):
+                height, width = image.shape[:2]
+                return None, np.asarray(
+                    [[0, 0, width, height, 0, 0, 0, 0, 0, 0, 0, 0, 0.99]],
+                    dtype=np.float32,
+                )
+
+        class ShortRecognizer:
+            def create_landmark_detector(self):
+                return object()
+
+            def prepare_face(self, face, detector):
+                return face, 0.0
+
+            def classify_prepared_batch(self, prepared):
+                return []
+
+        ring = EvidenceRingBuffer(
+            {"cam": EvidenceBufferPolicy(3.0, 8 * 1024 * 1024, 100.0)}
+        )
+        selector = QualitySelector(ring)
+        pipeline = FaceRecognitionPipeline(
+            ShortRecognizer(), detector_factory=Detector, quality_selector=selector
+        )
+        try:
+            bgr = np.full((16, 16, 3), 127, dtype=np.uint8)
+            yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
+            item = replace(
+                request("cam", "track", ring=ring, yuv_frame=yuv),
+                person_box=(0, 0, 16, 16),
+                min_area=1,
+                candidate_collection_seconds=0.0,
+            )
+            assert pipeline.submit(item)
+            deadline = time.monotonic() + 1
+            completed = False
+            while time.monotonic() < deadline:
+                stats = pipeline.recognition_lifecycle.stats()
+                if stats.get("attempts_started", 0) >= 1 and stats["in_flight"] == 0:
+                    completed = True
+                    break
+                time.sleep(0.01)
+            assert completed
         finally:
             pipeline.stop()
             selector.shutdown()

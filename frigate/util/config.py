@@ -192,7 +192,7 @@ def migrate_frigate_config(config_file: str):
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
     with open(config_file, encoding="utf-8") as f:
-        config: dict[str, dict[str, Any]] = yaml.load(f)
+        config: dict[str, Any] = yaml.load(f)
 
     if config is None:
         logger.error(f"Failed to load config at {config_file}")
@@ -274,7 +274,7 @@ def migrate_frigate_config(config_file: str):
     logger.info("Finished frigate config migration...")
 
 
-def migrate_014(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def migrate_014(config: dict[str, Any]) -> dict[str, Any]:
     """Handle migrating frigate config to 0.14"""
     # migrate record.events.required_zones to review.alerts.required_zones
     new_config = config.copy()
@@ -322,7 +322,7 @@ def migrate_014(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
         del new_config["rtmp"]
 
     for name, camera in config.get("cameras", {}).items():
-        camera_config: dict[str, dict[str, Any]] = camera.copy()
+        camera_config: dict[str, Any] = camera.copy()
         required_zones = (
             camera_config.get("record", {}).get("events", {}).get("required_zones", [])
         )
@@ -361,7 +361,7 @@ def migrate_014(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return new_config
 
 
-def migrate_015_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def migrate_015_0(config: dict[str, Any]) -> dict[str, Any]:
     """Handle migrating frigate config to 0.15-0"""
     new_config = config.copy()
 
@@ -412,9 +412,11 @@ def migrate_015_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
         del new_config["record"]["events"]
 
     for name, camera in config.get("cameras", {}).items():
-        camera_config: dict[str, dict[str, Any]] = camera.copy()
+        camera_config: dict[str, Any] = camera.copy()
 
-        record_events: dict[str, Any] = camera_config.get("record", {}).get("events")
+        record_events: dict[str, Any] | None = camera_config.get("record", {}).get(
+            "events"
+        )
 
         if record_events:
             alerts_retention = {"retain": {}}
@@ -461,7 +463,7 @@ def migrate_015_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
     return new_config
 
 
-def migrate_015_1(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def migrate_015_1(config: dict[str, Any]) -> dict[str, Any]:
     """Handle migrating frigate config to 0.15-1"""
     new_config = config.copy()
 
@@ -476,7 +478,7 @@ def migrate_015_1(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
     return new_config
 
 
-def migrate_016_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def migrate_016_0(config: dict[str, Any]) -> dict[str, Any]:
     """Handle migrating frigate config to 0.16-0"""
     new_config = config.copy()
 
@@ -487,7 +489,7 @@ def migrate_016_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
         new_config["detect"] = detect_config
 
     for name, camera in config.get("cameras", {}).items():
-        camera_config: dict[str, dict[str, Any]] = camera.copy()
+        camera_config: dict[str, Any] = camera.copy()
 
         live_config = camera_config.get("live", {})
         if "stream_name" in live_config:
@@ -520,7 +522,7 @@ def migrate_016_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
     return new_config
 
 
-def migrate_017_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def migrate_017_0(config: dict[str, Any]) -> dict[str, Any]:
     """Handle migrating frigate config to 0.17-0"""
     new_config = config.copy()
 
@@ -566,7 +568,7 @@ def migrate_017_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
         new_config["objects"] = new_object_config
 
     for name, camera in config.get("cameras", {}).items():
-        camera_config: dict[str, dict[str, Any]] = camera.copy()
+        camera_config: dict[str, Any] = camera.copy()
         camera_record_retain = camera_config.get("record", {}).get("retain")
 
         if camera_record_retain:
@@ -649,7 +651,7 @@ def _convert_legacy_mask_to_dict(
     return result
 
 
-def migrate_018_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def migrate_018_0(config: dict[str, Any]) -> dict[str, Any]:
     """Handle migrating frigate config to 0.18-0"""
     new_config = config.copy()
 
@@ -704,7 +706,7 @@ def migrate_018_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
 
     # Remove deprecated sync_recordings and migrate masks for camera-specific configs
     for name, camera in config.get("cameras", {}).items():
-        camera_config: dict[str, dict[str, Any]] = camera.copy()
+        camera_config: dict[str, Any] = camera.copy()
 
         if camera_config.get("record", {}).get("sync_recordings") is not None:
             del camera_config["record"]["sync_recordings"]
@@ -759,7 +761,7 @@ def migrate_018_0(config: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]
 
     # Remove deprecated clean_copy from camera snapshots configs
     for name, camera in new_config.get("cameras", {}).items():
-        camera_config: dict[str, dict[str, Any]] = camera.copy()
+        camera_config: dict[str, Any] = camera.copy()
 
         if camera_config.get("snapshots", {}).get("clean_copy") is not None:
             del camera_config["snapshots"]["clean_copy"]
@@ -786,7 +788,7 @@ def get_relative_coordinates(
     mask: str | list | None,
     frame_shape: tuple[int, int],
     camera_name: str = "",
-) -> str | list:
+) -> str | list | None:
     # masks and zones are saved as relative coordinates
     # we know if any points are > 1 then it is using the
     # old native resolution coordinates
@@ -875,9 +877,11 @@ def convert_area_to_pixels(
 
 class StreamInfoRetriever:
     def __init__(self) -> None:
-        self.stream_cache: dict[str, tuple[int, int]] = {}
+        self.stream_cache: dict[str, dict[str, Any]] = {}
 
-    def get_stream_info(self, ffmpeg, path: str) -> str:
+    def get_stream_info(
+        self, ffmpeg, path: str
+    ) -> dict[str, int | str | None]:
         if path in self.stream_cache:
             return self.stream_cache[path]
 
