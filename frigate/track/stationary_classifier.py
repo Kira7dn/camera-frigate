@@ -63,9 +63,6 @@ NON_STATIONARY_OBJECT_THRESHOLDS = StationaryThresholds(
     max_stationary_history=4,
 )
 
-# Default thresholds for any other object label
-DEFAULT_OBJECT_THRESHOLDS = StationaryThresholds()
-
 
 def get_stationary_threshold(label: str) -> StationaryThresholds:
     """Get the stationary thresholds for a given object label."""
@@ -79,7 +76,7 @@ def get_stationary_threshold(label: str) -> StationaryThresholds:
     if label in NON_STATIONARY_OBJECT_THRESHOLDS.objects:
         return NON_STATIONARY_OBJECT_THRESHOLDS
 
-    return DEFAULT_OBJECT_THRESHOLDS
+    return StationaryThresholds()
 
 
 class StationaryMotionClassifier:

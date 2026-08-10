@@ -437,6 +437,10 @@ class FrigateApp:
                 self.stop_event,
             )
 
+        for name, detector in self.detectors.items():
+            if not detector.ready_event.wait(timeout=60):
+                raise RuntimeError(f"Detector {name} did not become ready before cameras")
+
     def start_ptz_autotracker(self) -> None:
         self.ptz_autotracker_thread = PtzAutoTrackerThread(
             self.config,

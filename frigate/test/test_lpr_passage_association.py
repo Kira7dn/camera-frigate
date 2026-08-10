@@ -96,3 +96,48 @@ def test_registry_does_not_merge_two_simultaneous_vehicles() -> None:
         frame_time=1.0,
     )
     assert {item.passage_id for item in admissions} == {"car-a", "car-b"}
+
+
+def test_same_raw_track_keeps_passage_during_continuous_motion() -> None:
+    registry = LprPassageRegistry()
+    passages = []
+    for frame_time, box in (
+        (1.0, (800, 0, 1100, 250)),
+        (1.2, (700, 100, 1050, 400)),
+        (1.4, (550, 250, 950, 600)),
+    ):
+        passages.append(
+            registry.resolve(
+                camera="cam",
+                kind="vehicle",
+                raw_id="raw-car",
+                bbox=box,
+                frame_time=frame_time,
+                claimed=set(),
+            )
+        )
+
+    assert passages == ["raw-car", "raw-car", "raw-car"]
+
+
+def test_same_raw_track_starts_new_passage_on_impossible_reversal() -> None:
+    registry = LprPassageRegistry()
+    passages = []
+    for frame_time, box in (
+        (1.0, (800, 0, 1100, 250)),
+        (1.2, (400, 500, 950, 1000)),
+        (1.4, (1350, 0, 1700, 260)),
+    ):
+        passages.append(
+            registry.resolve(
+                camera="cam",
+                kind="vehicle",
+                raw_id="raw-car",
+                bbox=box,
+                frame_time=frame_time,
+                claimed=set(),
+            )
+        )
+
+    assert passages == ["raw-car", "raw-car", "raw-car-p2"]
+

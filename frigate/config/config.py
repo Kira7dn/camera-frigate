@@ -255,6 +255,12 @@ class RuntimeReplayConfig(FrigateBaseModel):
     sources: dict[str, str] = Field(default_factory=dict)
 
 
+class RuntimeDirectConfig(FrigateBaseModel):
+    """Host MP4 sources mounted directly into Frigate by the launcher."""
+
+    sources: dict[str, str] = Field(default_factory=dict)
+
+
 class RuntimeIntegrationsConfig(FrigateBaseModel):
     """Optional deployment integrations managed outside the Frigate process."""
 
@@ -274,6 +280,7 @@ class RuntimeDeploymentConfig(FrigateBaseModel):
     data_dir: str = "runtime/data"
     rtsp_transport: str = Field(default="tcp", pattern="^(tcp|udp)$")
     replay: RuntimeReplayConfig = Field(default_factory=RuntimeReplayConfig)
+    direct: RuntimeDirectConfig = Field(default_factory=RuntimeDirectConfig)
     integrations: RuntimeIntegrationsConfig = Field(
         default_factory=RuntimeIntegrationsConfig
     )
@@ -940,15 +947,6 @@ class FrigateConfig(FrigateBaseModel):
             max_disappeared = camera_config.detect.fps * 5
             if camera_config.detect.max_disappeared is None:
                 camera_config.detect.max_disappeared = max_disappeared
-            if (
-                camera_config.detect.min_initialized
-                >= camera_config.detect.max_disappeared
-            ):
-                raise ValueError(
-                    f"{camera_config.name}.detect.max_disappeared must be greater "
-                    "than detect.min_initialized"
-                )
-
             # Default stationary_threshold configuration
             stationary_threshold = camera_config.detect.fps * 10
             if camera_config.detect.stationary.threshold is None:

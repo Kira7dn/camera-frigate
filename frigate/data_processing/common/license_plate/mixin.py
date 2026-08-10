@@ -1368,9 +1368,11 @@ class LicensePlateProcessingMixin:
         quality_candidate = None
         attempt = None
         runtime_track_id = None if dedicated_lpr else str(object_data.get("id"))
+        # Frigate's tracker owns runtime identity. Physical-passage comparison
+        # must never replace a live raw track id inside the async LPR pipeline.
         runtime_passage_id = str(
-            object_data.get("_recognition_passage_id")
-            or runtime_track_id
+            runtime_track_id
+            or object_data.get("_recognition_passage_id")
             or "dedicated-lpr"
         )
         runtime_trace_id = canonical_trace_id("lpr", camera, runtime_passage_id)
@@ -1907,7 +1909,7 @@ class LicensePlateProcessingMixin:
         ):
             quality_config = self.config.cameras[camera].quality
             task_quality = quality_config.lpr
-            observation_key = key or LprTrackKey(camera, str(id), 0)
+            observation_key = key or LprTrackKey(camera, runtime_passage_id, 0)
             selector = self.quality_selector
             if selector is None:
                 return None
@@ -2342,7 +2344,7 @@ class LicensePlateProcessingMixin:
                 )
             return None
 
-        observation_key = key or LprTrackKey(camera, str(id), 0)
+        observation_key = key or LprTrackKey(camera, runtime_passage_id, 0)
         if attempt is None or not self.recognition_lifecycle.complete_attempt(
             attempt,
             result=top_plate,

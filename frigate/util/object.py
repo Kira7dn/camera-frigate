@@ -487,7 +487,7 @@ def get_clipped_object_recovery_region(frame_shape, min_region, detection):
 
 
 def recovery_detection_supersedes(original, recovered, frame_shape):
-    """Return whether a recovery result should replace an initial detection."""
+    """Return whether a complete recovery should replace a clipped detection."""
     if (
         original[0] != recovered[0]
         or recovered[1] <= original[1]

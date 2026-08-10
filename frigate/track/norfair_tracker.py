@@ -1,8 +1,7 @@
 import logging
 import random
 import string
-from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 import cv2
 import numpy as np
@@ -32,6 +31,11 @@ from frigate.util.object import average_boxes, median_of_boxes
 
 logger = logging.getLogger(__name__)
 
+STATIC_TRACK_EDGE_MARGIN_RATIO = 0.025
+STATIC_TRACK_MIN_PRIOR_AXIS_MOTION_RATIO = 0.15
+STATIC_TRACK_MIN_REVERSE_AXIS_JUMP_RATIO = 0.5
+STATIC_TRACK_MIN_REVERSE_ACCELERATION = 1.5
+
 
 # Normalizes distance from estimate relative to object size
 # Other ideas:
@@ -46,7 +50,6 @@ def distance(detection: np.ndarray, estimate: np.ndarray) -> float:
     estimate_dim = np.diff(estimate, axis=0).flatten()
     detection_dim = np.diff(detection, axis=0).flatten()
 
-    # Guard against degenerate or non-finite boxes
     if (
         not np.all(np.isfinite(estimate_dim))
         or not np.all(np.isfinite(detection_dim))
@@ -83,7 +86,115 @@ def distance(detection: np.ndarray, estimate: np.ndarray) -> float:
     return float(np.linalg.norm(change))
 
 
+def is_opposite_frame_edge_transition(
+    detection: Detection, tracked_object: TrackedObject
+) -> bool:
+    """Reject a static-camera track that wraps across opposite frame edges.
+
+    Kalman predictions may survive after an object exits the frame. Matching a new
+    object entering at the opposite edge to that prediction merges two physical
+    passages into one raw track id. Compare the new detection with the last real
+    detection, not the prediction, before Norfair scores the candidate.
+    """
+    current_data = detection.data or {}
+    last_detection = getattr(tracked_object, "last_detection", None)
+    previous_data = getattr(last_detection, "data", None) or {}
+
+    if not current_data.get("enforce_static_continuity", False):
+        return False
+
+    frame_width = current_data.get("frame_width")
+    frame_height = current_data.get("frame_height")
+    previous_box = previous_data.get("box")
+    current_box = current_data.get("box")
+    if not frame_width or not frame_height or not previous_box or not current_box:
+        return False
+
+    x_margin = frame_width * STATIC_TRACK_EDGE_MARGIN_RATIO
+    y_margin = frame_height * STATIC_TRACK_EDGE_MARGIN_RATIO
+
+    previous_left = previous_box[0] <= x_margin
+    previous_top = previous_box[1] <= y_margin
+    previous_right = previous_box[2] >= frame_width - x_margin
+    previous_bottom = previous_box[3] >= frame_height - y_margin
+    current_left = current_box[0] <= x_margin
+    current_top = current_box[1] <= y_margin
+    current_right = current_box[2] >= frame_width - x_margin
+    current_bottom = current_box[3] >= frame_height - y_margin
+
+    return (
+        (previous_left and current_right)
+        or (previous_right and current_left)
+        or (previous_top and current_bottom)
+        or (previous_bottom and current_top)
+    )
+
+
+def is_abrupt_motion_reversal(
+    detection: Detection, tracked_object: TrackedObject
+) -> bool:
+    """Reject a large candidate jump against an established static-camera path."""
+    current_data = detection.data or {}
+    if not current_data.get("enforce_static_continuity", False):
+        return False
+
+    last_detection = getattr(tracked_object, "last_detection", None)
+    last_data = getattr(last_detection, "data", None) or {}
+    current_box = current_data.get("box")
+    last_box = last_data.get("box")
+    last_frame_time = last_data.get("frame_time")
+    if not current_box or not last_box or last_frame_time is None:
+        return False
+
+    earlier_detections = [
+        item
+        for item in getattr(tracked_object, "past_detections", ())
+        if (getattr(item, "data", None) or {}).get("frame_time", last_frame_time)
+        < last_frame_time
+    ]
+    if not earlier_detections:
+        return False
+
+    previous_detection = max(
+        earlier_detections,
+        key=lambda item: (item.data or {}).get("frame_time", float("-inf")),
+    )
+    previous_box = (previous_detection.data or {}).get("box")
+    if not previous_box:
+        return False
+
+    def bottom_center(box: Sequence[float]) -> np.ndarray:
+        return np.array([(box[0] + box[2]) / 2.0, box[3]], dtype=float)
+
+    prior_motion = bottom_center(last_box) - bottom_center(previous_box)
+    candidate_motion = bottom_center(current_box) - bottom_center(last_box)
+    last_size = np.array(
+        [last_box[2] - last_box[0], last_box[3] - last_box[1]], dtype=float
+    )
+    if np.any(last_size <= 0):
+        return False
+
+    for axis in range(2):
+        prior = prior_motion[axis]
+        candidate = candidate_motion[axis]
+        if (
+            abs(prior) >= last_size[axis] * STATIC_TRACK_MIN_PRIOR_AXIS_MOTION_RATIO
+            and abs(candidate)
+            >= last_size[axis] * STATIC_TRACK_MIN_REVERSE_AXIS_JUMP_RATIO
+            and abs(candidate) >= abs(prior) * STATIC_TRACK_MIN_REVERSE_ACCELERATION
+            and prior * candidate < 0
+        ):
+            return True
+
+    return False
+
+
 def frigate_distance(detection: Detection, tracked_object: TrackedObject) -> float:
+    if is_opposite_frame_edge_transition(
+        detection, tracked_object
+    ) or is_abrupt_motion_reversal(detection, tracked_object):
+        return float("inf")
+
     return distance(detection.points, tracked_object.estimate)
 
 
@@ -555,6 +666,9 @@ class NorfairTracker(ObjectTracker):
                     "region": obj[5],
                     "frame_time": frame_time,
                     "centroid": (centroid_x, centroid_y),
+                    "frame_width": self.detect_config.width,
+                    "frame_height": self.detect_config.height,
+                    "enforce_static_continuity": not self.camera_config.onvif.autotracking.enabled_in_config,
                 },
             )
             detections_by_type[label].append(detection)

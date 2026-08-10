@@ -12,6 +12,13 @@ from frigate.embeddings.maintainer import EmbeddingMaintainer
 from frigate.events.types import EventStateEnum, EventTypeEnum
 
 
+def test_realtime_processor_does_not_own_passage_identity() -> None:
+    processor = object.__new__(LicensePlateRealTimeProcessor)
+
+    assert not hasattr(processor, "_with_passage_identity")
+    assert not hasattr(processor, "_passage_registry")
+
+
 def test_realtime_processor_delegates_frame_to_upstream_lpr_process() -> None:
     processor = object.__new__(LicensePlateRealTimeProcessor)
     calls = []
@@ -401,7 +408,9 @@ def test_pre_gate_lpr_invocation_persists_runtime_evidence(
 
     records = [
         json.loads(line)
-        for line in (tmp_path / "evidence.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (tmp_path / "lpr" / "evidence.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
     ]
     assert {record["stage"] for record in records} == {
         "invocation",

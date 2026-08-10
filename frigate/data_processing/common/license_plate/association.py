@@ -52,6 +52,7 @@ class _PassageEntry:
     bbox: tuple[int, int, int, int]
     last_seen: float
     raw_ids: set[str]
+    previous_bbox: tuple[int, int, int, int] | None = None
 
 
 class LprPassageRegistry:
@@ -69,7 +70,45 @@ class LprPassageRegistry:
         self.max_entries_per_camera = max_entries_per_camera
         self._entries: dict[tuple[str, str, str], _PassageEntry] = {}
         self._aliases: dict[tuple[str, str, str], str] = {}
+        self._generations: dict[tuple[str, str, str], int] = {}
         self._lock = threading.RLock()
+
+    @staticmethod
+    def _bottom_center(box: Sequence[int]) -> tuple[float, float]:
+        return ((box[0] + box[2]) / 2.0, float(box[3]))
+
+    @classmethod
+    def _has_impossible_reversal(
+        cls, entry: _PassageEntry, current: Sequence[int]
+    ) -> bool:
+        """Reject a raw lineage jump to a new object moving the other way."""
+        if entry.previous_bbox is None:
+            return False
+
+        older = cls._bottom_center(entry.previous_bbox)
+        previous = cls._bottom_center(entry.bbox)
+        candidate = cls._bottom_center(current)
+        previous_delta = (previous[0] - older[0], previous[1] - older[1])
+        candidate_delta = (candidate[0] - previous[0], candidate[1] - previous[1])
+        previous_length = (previous_delta[0] ** 2 + previous_delta[1] ** 2) ** 0.5
+        candidate_length = (candidate_delta[0] ** 2 + candidate_delta[1] ** 2) ** 0.5
+        previous_height = max(1, entry.bbox[3] - entry.bbox[1])
+        direction_dot = (
+            previous_delta[0] * candidate_delta[0]
+            + previous_delta[1] * candidate_delta[1]
+        )
+        return (
+            previous_length >= previous_height * 0.10
+            and candidate_length >= previous_height * 0.75
+            and direction_dot < 0
+        )
+
+    def _new_passage_id(
+        self, alias_key: tuple[str, str, str], raw_id: str
+    ) -> str:
+        generation = self._generations.get(alias_key, 0) + 1
+        self._generations[alias_key] = generation
+        return raw_id if generation == 1 else f"{raw_id}-p{generation}"
 
     def resolve(
         self,
@@ -91,11 +130,17 @@ class LprPassageRegistry:
             if existing is not None:
                 entry = self._entries.get((camera, kind, existing))
                 if entry is not None:
-                    entry.bbox = box
-                    entry.last_seen = frame_time
-                    entry.raw_ids.add(raw_id)
-                    claimed.add(existing)
-                    return existing
+                    if not self._has_impossible_reversal(entry, box):
+                        entry.previous_bbox = entry.bbox
+                        entry.bbox = box
+                        entry.last_seen = frame_time
+                        entry.raw_ids.add(raw_id)
+                        claimed.add(existing)
+                        return existing
+                    entry.raw_ids.discard(raw_id)
+                    if not entry.raw_ids:
+                        self._entries.pop((camera, kind, existing), None)
+                    self._aliases.pop(alias_key, None)
 
             matches: list[tuple[float, _PassageEntry]] = []
             for (entry_camera, entry_kind, _), entry in self._entries.items():
@@ -116,10 +161,11 @@ class LprPassageRegistry:
             ):
                 entry = matches[0][1]
             else:
-                passage_id = raw_id
+                passage_id = self._new_passage_id(alias_key, raw_id)
                 entry = _PassageEntry(passage_id, box, frame_time, set())
                 self._entries[(camera, kind, passage_id)] = entry
 
+            entry.previous_bbox = entry.bbox
             entry.bbox = box
             entry.last_seen = frame_time
             entry.raw_ids.add(raw_id)
@@ -187,6 +233,7 @@ class LprPassageRegistry:
         with self._lock:
             self._entries.clear()
             self._aliases.clear()
+            self._generations.clear()
 
 
 def associate_lpr_passages(

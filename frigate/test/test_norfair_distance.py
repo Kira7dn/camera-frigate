@@ -1,14 +1,21 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
+from norfair import Detection
 from norfair.camera_motion import (
     HomographyTransformation,
     TranslationTransformation,
 )
 
 from frigate.ptz.autotrack import transform_is_finite
-from frigate.track.norfair_tracker import distance
+from frigate.track.norfair_tracker import (
+    distance,
+    frigate_distance,
+    is_abrupt_motion_reversal,
+    is_opposite_frame_edge_transition,
+)
 
 
 class TestNorfairDistance(unittest.TestCase):
@@ -61,6 +68,113 @@ class TestNorfairDistance(unittest.TestCase):
         d = distance(self.detection, estimate)
         self.assertFalse(math.isnan(d))
         self.assertEqual(d, float("inf"))
+
+    def tracker_candidate(
+        self,
+        previous_box: list[int],
+        current_box: list[int],
+        *,
+        enforce_static_continuity: bool = True,
+        history_box: list[int] | None = None,
+    ) -> tuple[Detection, SimpleNamespace]:
+        data = {
+            "box": current_box,
+            "frame_width": 1820,
+            "frame_height": 1024,
+            "enforce_static_continuity": enforce_static_continuity,
+            "frame_time": 3.0,
+        }
+        detection = Detection(
+            points=np.array(
+                [[current_box[0], current_box[1]], [current_box[2], current_box[3]]],
+                dtype=float,
+            ),
+            label="car",
+            data=data,
+        )
+        previous_detection = Detection(
+            points=np.array(
+                [
+                    [previous_box[0], previous_box[1]],
+                    [previous_box[2], previous_box[3]],
+                ],
+                dtype=float,
+            ),
+            label="car",
+            data={"box": previous_box, "frame_time": 2.0},
+        )
+        past_detections = []
+        if history_box is not None:
+            past_detections.append(
+                Detection(
+                    points=np.array(
+                        [
+                            [history_box[0], history_box[1]],
+                            [history_box[2], history_box[3]],
+                        ],
+                        dtype=float,
+                    ),
+                    label="car",
+                    data={"box": history_box, "frame_time": 1.0},
+                )
+            )
+        tracked_object = SimpleNamespace(
+            last_detection=previous_detection,
+            estimate=detection.points.copy(),
+            past_detections=past_detections,
+        )
+        return detection, tracked_object
+
+    def test_bottom_exit_cannot_match_new_top_entry(self) -> None:
+        detection, tracked_object = self.tracker_candidate(
+            [465, 555, 1199, 1007], [1291, 0, 1693, 332]
+        )
+
+        self.assertTrue(
+            is_opposite_frame_edge_transition(detection, tracked_object)
+        )
+        self.assertEqual(frigate_distance(detection, tracked_object), float("inf"))
+
+    def test_continuous_motion_inside_frame_is_not_rejected(self) -> None:
+        detection, tracked_object = self.tracker_candidate(
+            [1291, 0, 1693, 332], [1218, 55, 1659, 453]
+        )
+
+        self.assertFalse(
+            is_opposite_frame_edge_transition(detection, tracked_object)
+        )
+        self.assertTrue(math.isfinite(frigate_distance(detection, tracked_object)))
+
+    def test_ptz_candidate_does_not_apply_static_edge_guard(self) -> None:
+        detection, tracked_object = self.tracker_candidate(
+            [465, 555, 1199, 1007],
+            [1291, 0, 1693, 332],
+            enforce_static_continuity=False,
+        )
+
+        self.assertFalse(
+            is_opposite_frame_edge_transition(detection, tracked_object)
+        )
+        self.assertTrue(math.isfinite(frigate_distance(detection, tracked_object)))
+
+    def test_large_reverse_jump_cannot_switch_parallel_cars(self) -> None:
+        detection, tracked_object = self.tracker_candidate(
+            [2, 188, 625, 922],
+            [459, 554, 1198, 1008],
+            history_box=[225, 89, 774, 733],
+        )
+
+        self.assertTrue(is_abrupt_motion_reversal(detection, tracked_object))
+        self.assertEqual(frigate_distance(detection, tracked_object), float("inf"))
+
+    def test_large_jump_continuing_established_motion_is_allowed(self) -> None:
+        detection, tracked_object = self.tracker_candidate(
+            [1016, 57, 1458, 820],
+            [459, 554, 1198, 1008],
+            history_box=[1221, 0, 1645, 499],
+        )
+
+        self.assertFalse(is_abrupt_motion_reversal(detection, tracked_object))
 
 
 class TestTransformIsFinite(unittest.TestCase):

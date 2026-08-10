@@ -5,7 +5,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from multiprocessing import Queue, Value
+from multiprocessing import Event, Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
@@ -121,6 +121,7 @@ class DetectorRunner(FrigateProcess):
         config: FrigateConfig,
         detector_config: BaseDetectorConfig,
         stop_event: MpEvent,
+        ready_event: MpEvent,
     ) -> None:
         super().__init__(stop_event, PROCESS_PRIORITY_HIGH, name=name, daemon=True)
         self.detection_queue = detection_queue
@@ -129,6 +130,7 @@ class DetectorRunner(FrigateProcess):
         self.start_time = start_time
         self.config = config
         self.detector_config = detector_config
+        self.ready_event = ready_event
         self.outputs: dict[str, Any] = {}
 
     def create_output_shm(self, name: str) -> None:
@@ -145,6 +147,7 @@ class DetectorRunner(FrigateProcess):
 
         for name in self.cameras:
             self.create_output_shm(name)
+        self.ready_event.set()
 
         while not self.stop_event.is_set():
             try:
@@ -196,6 +199,7 @@ class AsyncDetectorRunner(FrigateProcess):
         config: FrigateConfig,
         detector_config: BaseDetectorConfig,
         stop_event: MpEvent,
+        ready_event: MpEvent,
     ) -> None:
         super().__init__(stop_event, PROCESS_PRIORITY_HIGH, name=name, daemon=True)
         self.detection_queue = detection_queue
@@ -204,6 +208,7 @@ class AsyncDetectorRunner(FrigateProcess):
         self.start_time = start_time
         self.config = config
         self.detector_config = detector_config
+        self.ready_event = ready_event
         self.outputs: dict[str, Any] = {}
         self._frame_manager: SharedMemoryFrameManager | None = None
         self._publisher: ObjectDetectorPublisher | None = None
@@ -287,6 +292,7 @@ class AsyncDetectorRunner(FrigateProcess):
 
         for name in self.cameras:
             self.create_output_shm(name)
+        self.ready_event.set()
 
         t_detect = threading.Thread(target=self._detect_worker, daemon=False)
         t_result = threading.Thread(target=self._result_worker, daemon=False)
@@ -334,6 +340,7 @@ class ObjectDetectProcess:
         self.config = config
         self.detector_config = detector_config
         self.stop_event = stop_event
+        self.ready_event = Event()
         self.start_or_restart()
 
     def stop(self) -> None:
@@ -368,6 +375,7 @@ class ObjectDetectProcess:
                 self.config,
                 self.detector_config,
                 self.stop_event,
+                self.ready_event,
             )
         else:
             self.detect_process = DetectorRunner(
@@ -379,6 +387,7 @@ class ObjectDetectProcess:
                 self.config,
                 self.detector_config,
                 self.stop_event,
+                self.ready_event,
             )
         self.detect_process.start()
 

@@ -39,6 +39,7 @@ class ImprovedMotionDetector(MotionDetector):
         self.update_mask()
         self.save_images = False
         self.calibrating = True
+        self.initialized = False
         self.blur_radius = blur_radius
         self.interpolation = interpolation
         self.contrast_values = np.zeros((contrast_frame_history, 2), np.uint8)
@@ -115,6 +116,17 @@ class ImprovedMotionDetector(MotionDetector):
         resized_frame[self.mask] = [0]
 
         resized_frame = gaussian_filter(resized_frame, sigma=1, radius=self.blur_radius)
+
+        # Seed the background from the first real camera frame. Starting from
+        # an all-zero image turns a finite source's opening scene into a
+        # full-frame motion event and can consume most of a short MP4 while
+        # recalibrating. The first frame is a baseline; motion starts on the
+        # following frame exactly as it does for an established live scene.
+        if not self.initialized:
+            self.avg_frame = resized_frame.astype(np.float32)
+            self.initialized = True
+            self.calibrating = False
+            return []
 
         if self.save_images:
             blurred_saved = resized_frame.copy()
@@ -265,6 +277,7 @@ class ImprovedMotionDetector(MotionDetector):
         # so motion detection can quickly recalibrate with the new mask
         self.avg_frame = np.zeros(self.motion_frame_size, np.float32)
         self.calibrating = True
+        self.initialized = False
         self.motion_frame_count = 0
 
     def stop(self) -> None:

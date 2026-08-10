@@ -1,6 +1,7 @@
 """Manages ffmpeg processes for camera frame capture."""
 
 import logging
+import os
 import queue
 import subprocess as sp
 import threading
@@ -39,12 +40,7 @@ def put_latest_frame(
     frame_time: float,
     skipped_eps: EventsPerSecond,
 ) -> None:
-    """Enqueue the newest frame without blocking capture.
-
-    The queue is deliberately latest-only: an old queued frame is safe to
-    drop because it has not been handed to the detector yet.  A drop is
-    still counted so runtime reports expose overload instead of hiding it.
-    """
+    """Keep capture latest-only when detector backpressure fills the queue."""
     try:
         frame_queue.put((frame_name, frame_time), False)
         frame_manager.close(frame_name)
@@ -54,9 +50,6 @@ def put_latest_frame(
 
     try:
         old_frame_name, _ = frame_queue.get(False)
-        # Capture reuses a fixed ring of SHM names.  Close the dropped
-        # handle, but do not unlink the segment; otherwise the next wrap
-        # cannot reopen that slot and capture stalls with "frameN not found".
         frame_manager.close(old_frame_name)
     except queue.Empty:
         pass
@@ -65,8 +58,6 @@ def put_latest_frame(
         frame_queue.put((frame_name, frame_time), False)
         frame_manager.close(frame_name)
     except queue.Full:
-        # A consumer won the race and the queue filled again.  Keep the SHM
-        # slot alive for the capture ring and only release this handle.
         frame_manager.close(frame_name)
 from frigate.util.process import FrigateProcess
 
@@ -95,6 +86,8 @@ def capture_frames(
     config_subscriber = CameraConfigUpdateSubscriber(
         None, {config.name: config}, [CameraConfigUpdateEnum.enabled]
     )
+    source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
+    source_start_written = False
 
     def get_enabled_state():
         """Fetch the latest enabled state from ZMQ."""
@@ -109,11 +102,13 @@ def capture_frames(
 
             fps.value = frame_rate.eps()
             skipped_fps.value = skipped_eps.eps()
-            current_frame.value = datetime.now().timestamp()
             frame_name = f"{config.name}_frame{frame_index}"
             frame_buffer = frame_manager.write(frame_name)
             try:
-                frame_buffer[:] = ffmpeg_process.stdout.read(frame_size)
+                frame_bytes = ffmpeg_process.stdout.read(frame_size)
+                if len(frame_bytes) != frame_size:
+                    break
+                frame_buffer[:] = frame_bytes
             except Exception:
                 # shutdown has been initiated
                 if stop_event.is_set():
@@ -131,9 +126,21 @@ def capture_frames(
 
                 continue
 
+            current_frame.value = datetime.now().timestamp()
             frame_rate.update()
+            if source_start_dir and not source_start_written:
+                os.makedirs(source_start_dir, exist_ok=True)
+                start_path = os.path.join(source_start_dir, f"{config.name}.start")
+                try:
+                    descriptor = os.open(
+                        start_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+                    )
+                    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                        stream.write(f"{current_frame.value:.9f}\n")
+                except FileExistsError:
+                    pass
+                source_start_written = True
 
-            # don't lock the queue to check, just try since it should rarely be full
             put_latest_frame(
                 frame_queue,
                 frame_manager,
@@ -593,6 +600,23 @@ class CameraWatchdog(threading.Thread):
         """Start all ffmpeg processes (detection and others)."""
         logger.debug(f"Starting all ffmpeg processes for {self.config.name}")
         self.start_ffmpeg_detect()
+        # A finite direct-MP4 source must not be consumed by the record process
+        # while the detect pipe is still starting.  Live cameras do not use
+        # PASSAGE_SOURCE_START_DIR and retain the normal parallel startup.
+        if os.environ.get("PASSAGE_SOURCE_START_DIR"):
+            deadline = time.monotonic() + 30.0
+            while (
+                self.capture_thread.current_frame.value <= 0
+                and self.capture_thread.is_alive()
+                and not self.stop_event.is_set()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            if self.capture_thread.current_frame.value <= 0:
+                raise RuntimeError(
+                    f"{self.config.name}: direct source produced no detect frame; "
+                    "recording was not started"
+                )
         for c in self.config.ffmpeg_cmds:
             if "detect" in c["roles"]:
                 continue

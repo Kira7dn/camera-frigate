@@ -439,9 +439,6 @@ def process_frames(
                     if recovery_region is not None and recovery_region != region:
                         recovery_regions.add(recovery_region)
 
-            # A fast object can move beyond its predicted 1.35x region between
-            # detect frames. Retry an internally clipped detection once using a
-            # larger region so downstream processors receive the complete box.
             recovery_detections = []
             for region in recovery_regions:
                 recovery_detections.extend(
