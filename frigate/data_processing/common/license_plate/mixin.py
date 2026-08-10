@@ -1348,6 +1348,11 @@ class LicensePlateProcessingMixin:
         elif isinstance(obj_data, dict):
             camera = str(obj_data["camera"])
             object_data = obj_data
+
+        # This shared mixin is available to the face camera, but LPR is a car
+        # pipeline. Do not create LPR lineage/evidence for face detections.
+        if camera == "face_camera":
+            return None
         else:
             return None
         current_time = (

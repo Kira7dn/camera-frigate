@@ -91,13 +91,23 @@ def passage_trace(
     path = os.environ.get("PASSAGE_TRACE_PATH")
     if not path or _past_capture_cutoff(frame_time):
         return
+    pipeline = str(
+        fields.get("task")
+        or ("detector" if stage == "detector_hit" else "face" if stage in {"first_qualified_face", "candidate_submitted", "recognition_candidate", "first_attempt", "confirmed_result"} else "lpr")
+    )
+    # The shared LPR mixin can observe every enabled camera.  Camera ownership
+    # is authoritative for runtime artifact placement; face-camera records
+    # must never become LPR traces merely because the shared stage defaulted to
+    # lpr.
+    if camera == "face_camera" and pipeline == "lpr":
+        pipeline = "face"
+    resolved_trace_id = trace_id
+    if pipeline == "face" and resolved_trace_id and resolved_trace_id.startswith("lpr:"):
+        resolved_trace_id = "face:" + resolved_trace_id[len("lpr:"):]
     record = {
         "stage": stage,
-        "pipeline": str(
-            fields.get("task")
-            or ("detector" if stage == "detector_hit" else "face" if stage in {"first_qualified_face", "candidate_submitted", "recognition_candidate", "first_attempt", "confirmed_result"} else "lpr")
-        ),
-        "trace_id": trace_id or _derived_trace_id(stage, camera, frame_time, track_id, generation, fields),
+        "pipeline": pipeline,
+        "trace_id": resolved_trace_id or _derived_trace_id(stage, camera, frame_time, track_id, generation, {**fields, "task": pipeline}),
         "camera": camera,
         "frame_time": frame_time,
         "source_pts": frame_time,
@@ -175,11 +185,16 @@ def passage_evidence(
     with _EVIDENCE_LOCK:
         sequence = _EVIDENCE_SEQUENCE
         _EVIDENCE_SEQUENCE += 1
+        if camera == "face_camera" and pipeline == "lpr":
+            pipeline = "face"
+        resolved_trace_id = trace_id
+        if pipeline == "face" and resolved_trace_id and resolved_trace_id.startswith("lpr:"):
+            resolved_trace_id = "face:" + resolved_trace_id[len("lpr:"):]
         record: dict[str, Any] = {
             "sequence": sequence,
             "stage": stage,
             "pipeline": pipeline,
-            "trace_id": trace_id or canonical_trace_id(pipeline, camera, track_id),
+            "trace_id": resolved_trace_id or canonical_trace_id(pipeline, camera, track_id),
             "evidence_id": evidence_id,
             "camera": camera,
             "frame_time": frame_time,
