@@ -17,6 +17,18 @@ _EVIDENCE_BYTES = 0
 _EVIDENCE_LAST_CAPTURE: dict[tuple[str, str], float] = {}
 
 
+def _capture_started(frame_time: float | None) -> bool:
+    """Return whether the test harness has opened the active capture window."""
+    start_path = os.environ.get("PASSAGE_CAPTURE_START_PATH")
+    if not start_path:
+        return True
+    try:
+        start = float(Path(start_path).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    return frame_time is None or float(frame_time) + 1e-9 >= start
+
+
 def _past_capture_cutoff(frame_time: float | None) -> bool:
     """Stop acceptance capture after a validator-owned frame-time boundary."""
     cutoff_path = os.environ.get("PASSAGE_CAPTURE_CUTOFF_PATH")
@@ -89,7 +101,7 @@ def passage_trace(
     **fields: Any,
 ) -> None:
     path = os.environ.get("PASSAGE_TRACE_PATH")
-    if not path or _past_capture_cutoff(frame_time):
+    if not path or not _capture_started(frame_time) or _past_capture_cutoff(frame_time):
         return
     pipeline = str(
         fields.get("task")
@@ -114,6 +126,7 @@ def passage_trace(
         "trace_time": time.time(),
         "track_id": track_id,
         "generation": generation,
+        "run_id": os.environ.get("PASSAGE_RUN_ID") or None,
         **fields,
     }
     with _LOCK, open(path, "a", encoding="utf-8") as stream:
@@ -131,7 +144,11 @@ def passage_evidence_should_capture(
     frame_time: float,
 ) -> bool:
     """Sample acceptance evidence at the candidate-diversity cadence per track."""
-    if not passage_evidence_enabled() or _past_capture_cutoff(frame_time):
+    if (
+        not passage_evidence_enabled()
+        or not _capture_started(frame_time)
+        or _past_capture_cutoff(frame_time)
+    ):
         return False
     minimum_interval = float(
         os.environ.get("PASSAGE_EVIDENCE_MIN_INTERVAL_SECONDS", "0.4")
@@ -174,7 +191,11 @@ def passage_evidence(
 ) -> dict[str, Any] | None:
     """Persist bounded acceptance-only LPR evidence and its integrity metadata."""
     root_value = os.environ.get("PASSAGE_EVIDENCE_DIR")
-    if not root_value or _past_capture_cutoff(frame_time):
+    if (
+        not root_value
+        or not _capture_started(frame_time)
+        or _past_capture_cutoff(frame_time)
+    ):
         return None
 
     global _EVIDENCE_BYTES, _EVIDENCE_SEQUENCE
@@ -200,6 +221,7 @@ def passage_evidence(
             "frame_time": frame_time,
             "source_pts": frame_time,
             "track_id": track_id,
+            "run_id": os.environ.get("PASSAGE_RUN_ID") or None,
             **fields,
         }
         if image_index is not None:

@@ -45,6 +45,46 @@ def test_capture_cutoff_rejects_later_trace_and_evidence(tmp_path, monkeypatch) 
     assert [record["evidence_id"] for record in evidence_records] == ["before"]
 
 
+def test_capture_start_gate_blocks_warmup_and_tags_active_run(
+    tmp_path, monkeypatch
+) -> None:
+    trace = tmp_path / "trace.jsonl"
+    evidence = tmp_path / "evidence"
+    start = tmp_path / "start"
+    monkeypatch.setenv("PASSAGE_TRACE_PATH", str(trace))
+    monkeypatch.setenv("PASSAGE_EVIDENCE_DIR", str(evidence))
+    monkeypatch.setenv("PASSAGE_CAPTURE_START_PATH", str(start))
+    monkeypatch.setenv("PASSAGE_RUN_ID", "run-1")
+
+    passage_trace("warmup", camera="cam", frame_time=9.0)
+    passage_evidence(
+        "warmup",
+        evidence_id="warmup",
+        camera="cam",
+        frame_time=9.0,
+        track_id="car-0",
+    )
+    assert not trace.exists()
+    assert not evidence.exists()
+
+    start.write_text("10.0\n", encoding="utf-8")
+    passage_trace("too_early", camera="cam", frame_time=9.9)
+    passage_trace("active", camera="cam", frame_time=10.0)
+    record = passage_evidence(
+        "active",
+        evidence_id="active",
+        camera="cam",
+        frame_time=10.0,
+        track_id="car-1",
+    )
+
+    trace_record = json.loads(trace.read_text(encoding="utf-8").splitlines()[0])
+    assert trace_record["stage"] == "active"
+    assert trace_record["run_id"] == "run-1"
+    assert record is not None
+    assert record["run_id"] == "run-1"
+
+
 def test_evidence_sampling_uses_exact_candidate_interval(monkeypatch) -> None:
     passage_trace_module._EVIDENCE_LAST_CAPTURE.clear()
     monkeypatch.setenv("PASSAGE_EVIDENCE_DIR", "enabled")
