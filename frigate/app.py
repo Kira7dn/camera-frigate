@@ -35,7 +35,6 @@ from frigate.const import (
     CACHE_DIR,
     CLIPS_DIR,
     CONFIG_DIR,
-    EXPORT_DIR,
     FACE_DIR,
     MODEL_CACHE_DIR,
     RECORD_DIR,
@@ -137,13 +136,17 @@ class FrigateApp:
     def ensure_dirs(self) -> None:
         dirs = [
             CONFIG_DIR,
-            RECORD_DIR,
             THUMB_DIR,
             f"{CLIPS_DIR}/cache",
             CACHE_DIR,
             MODEL_CACHE_DIR,
-            EXPORT_DIR,
         ]
+
+        # These roots are demand-created by the recording/export writers.
+        # Creating them at boot makes runtimes that explicitly disable those
+        # features produce misleading empty media trees.
+        if any(camera.record.enabled for camera in self.config.cameras.values()):
+            dirs.append(RECORD_DIR)
 
         if self.config.face_recognition.enabled:
             dirs.append(FACE_DIR)
