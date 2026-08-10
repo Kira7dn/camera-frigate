@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 
 FaceTrackKey = tuple[str, str]
 Box = tuple[int, int, int, int]
-FACE_COMMIT_ROOT = "/media/frigate/.face-commits"
+# Transactional face-attempt artifacts are process scratch data, not public
+# media. Keep them under the container cache so the media tree contains only
+# durable identity/evidence assets.
+FACE_COMMIT_ROOT = "/tmp/cache/face-commits"
 FACE_EVENT_STAGING_DIR = os.path.join(FACE_COMMIT_ROOT, "staging")
 FACE_COMMIT_JOURNAL_DIR = os.path.join(FACE_COMMIT_ROOT, "journal")
 # Use the detector cadence (5 FPS in the passage fixture) while keeping the
