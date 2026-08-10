@@ -92,11 +92,10 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ValidationError):
             FrigateConfig(**top_k)
 
-        face_votes = json.loads(json.dumps(self.minimal))
-        face_votes["face_recognition"] = {"enabled": True, "min_faces": 4}
-        face_votes["cameras"]["back"]["face_recognition"] = {"enabled": True}
-        with self.assertRaises(ValidationError):
-            FrigateConfig(**face_votes)
+        deprecated_votes = json.loads(json.dumps(self.minimal))
+        deprecated_votes["face_recognition"] = {"enabled": True, "min_faces": 4}
+        deprecated_votes["cameras"]["back"]["face_recognition"] = {"enabled": True}
+        assert FrigateConfig(**deprecated_votes).face_recognition.min_faces == 4
 
         observation_threshold = json.loads(json.dumps(self.minimal))
         observation_threshold["lpr"] = {"enabled": True, "recognition_threshold": 0.5}

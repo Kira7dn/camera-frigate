@@ -1,8 +1,12 @@
+import logging
 from enum import Enum
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from .base import FrigateBaseModel
+
+logger = logging.getLogger(__name__)
+_MIN_FACES_WARNING_EMITTED = False
 
 __all__ = [
     "CameraFaceRecognitionConfig",
@@ -299,8 +303,9 @@ class FaceRecognitionConfig(FrigateBaseModel):
         default=1,
         gt=0,
         le=6,
+        deprecated=True,
         title="Minimum faces",
-        description="Minimum number of face recognitions required before applying a recognized sub-label to a person.",
+        description="Deprecated compatibility key; best valid face result wins.",
     )
     save_attempts: int = Field(
         default=0,
@@ -308,6 +313,16 @@ class FaceRecognitionConfig(FrigateBaseModel):
         title="Save attempts",
         description="Number of face recognition attempts to retain for recent recognition UI.",
     )
+
+    @model_validator(mode="after")
+    def warn_deprecated_min_faces(self) -> "FaceRecognitionConfig":
+        global _MIN_FACES_WARNING_EMITTED
+        if "min_faces" in self.model_fields_set and not _MIN_FACES_WARNING_EMITTED:
+            logger.warning(
+                "face_recognition.min_faces is deprecated and no longer affects runtime"
+            )
+            _MIN_FACES_WARNING_EMITTED = True
+        return self
     blur_confidence_filter: bool = Field(
         default=True,
         title="Blur confidence filter",

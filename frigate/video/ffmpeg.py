@@ -30,6 +30,44 @@ from frigate.util.image import (
     FrameManager,
     SharedMemoryFrameManager,
 )
+
+
+def put_latest_frame(
+    frame_queue: Queue,
+    frame_manager: FrameManager,
+    frame_name: str,
+    frame_time: float,
+    skipped_eps: EventsPerSecond,
+) -> None:
+    """Enqueue the newest frame without blocking capture.
+
+    The queue is deliberately latest-only: an old queued frame is safe to
+    drop because it has not been handed to the detector yet.  A drop is
+    still counted so runtime reports expose overload instead of hiding it.
+    """
+    try:
+        frame_queue.put((frame_name, frame_time), False)
+        frame_manager.close(frame_name)
+        return
+    except queue.Full:
+        skipped_eps.update()
+
+    try:
+        old_frame_name, _ = frame_queue.get(False)
+        # Capture reuses a fixed ring of SHM names.  Close the dropped
+        # handle, but do not unlink the segment; otherwise the next wrap
+        # cannot reopen that slot and capture stalls with "frameN not found".
+        frame_manager.close(old_frame_name)
+    except queue.Empty:
+        pass
+
+    try:
+        frame_queue.put((frame_name, frame_time), False)
+        frame_manager.close(frame_name)
+    except queue.Full:
+        # A consumer won the race and the queue filled again.  Keep the SHM
+        # slot alive for the capture ring and only release this handle.
+        frame_manager.close(frame_name)
 from frigate.util.process import FrigateProcess
 
 logger = logging.getLogger(__name__)
@@ -96,13 +134,13 @@ def capture_frames(
             frame_rate.update()
 
             # don't lock the queue to check, just try since it should rarely be full
-            try:
-                # add to the queue
-                frame_queue.put((frame_name, current_frame.value), False)
-                frame_manager.close(frame_name)
-            except queue.Full:
-                # if the queue is full, skip this frame
-                skipped_eps.update()
+            put_latest_frame(
+                frame_queue,
+                frame_manager,
+                frame_name,
+                current_frame.value,
+                skipped_eps,
+            )
 
             frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
     finally:

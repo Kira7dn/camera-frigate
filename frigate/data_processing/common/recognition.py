@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+ImageRank = tuple[float, float, float, float, float, int, str]
+
 
 class RecognitionStatus(str, Enum):
     SEARCHING = "SEARCHING"
@@ -71,6 +73,153 @@ class RecognitionState:
     in_flight: set[int] = field(default_factory=set)
     terminal_reason: str | None = None
     terminal_monotonic: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecognitionOutcome:
+    """One candidate result with complete lineage and a deterministic rank."""
+
+    task: str
+    candidate_id: str
+    image_rank: ImageRank
+    payload: Any
+    valid: bool
+    result_rank: tuple[Any, ...]
+    invalid_reason: str | None = None
+    # Kept as explicit metadata so a reducer cannot accidentally publish a
+    # payload from one candidate with the lineage of another.  Adapters that
+    # already carry a richer payload may leave this unset for compatibility.
+    frame_id: str | None = None
+    detail_bbox: tuple[int, int, int, int] | None = None
+
+
+class BestResultReducer:
+    """Keep at most three outcomes and select the highest-ranked valid one."""
+
+    def __init__(self, task: str, max_outcomes: int = 3) -> None:
+        if task not in {"lpr", "face"}:
+            raise ValueError("task must be 'lpr' or 'face'")
+        if not 1 <= max_outcomes <= 3:
+            raise ValueError("max_outcomes must be between one and three")
+        self.task = task
+        self.max_outcomes = max_outcomes
+        self._outcomes: list[RecognitionOutcome] = []
+
+    def add(self, outcome: RecognitionOutcome) -> None:
+        if outcome.task != self.task:
+            raise ValueError("outcome task does not match reducer task")
+        if any(item.candidate_id == outcome.candidate_id for item in self._outcomes):
+            raise ValueError("candidate outcome may only be added once")
+        if len(self._outcomes) >= self.max_outcomes:
+            raise ValueError("outcome budget exhausted")
+        self._outcomes.append(outcome)
+
+    @property
+    def outcomes(self) -> tuple[RecognitionOutcome, ...]:
+        return tuple(self._outcomes)
+
+    def winner(self) -> RecognitionOutcome | None:
+        valid = [outcome for outcome in self._outcomes if outcome.valid]
+        return max(valid, key=lambda outcome: outcome.result_rank, default=None)
+
+    def exhausted_reason(self) -> str:
+        if self.task == "lpr":
+            return "insufficient_quality"
+        reasons = {outcome.invalid_reason for outcome in self._outcomes}
+        if "ambiguous_identity" in reasons:
+            return "ambiguous_identity"
+        if "unknown" in reasons:
+            return "unknown"
+        return "insufficient_quality"
+
+
+def lpr_result_outcome(
+    *,
+    candidate_id: str,
+    image_rank: ImageRank,
+    payload: Any,
+    character_scores: tuple[float, ...],
+    recognition_threshold: float,
+    length_valid: bool,
+    format_valid: bool,
+    recognized_text_area: int,
+    frame_id: str | None = None,
+    detail_bbox: tuple[int, int, int, int] | None = None,
+) -> RecognitionOutcome:
+    mean_score = sum(character_scores) / len(character_scores) if character_scores else 0.0
+    min_score = min(character_scores, default=0.0)
+    valid = (
+        bool(character_scores)
+        and mean_score >= recognition_threshold
+        and length_valid
+        and format_valid
+    )
+    return RecognitionOutcome(
+        task="lpr",
+        candidate_id=candidate_id,
+        image_rank=image_rank,
+        payload=payload,
+        valid=valid,
+        result_rank=(
+            bool(length_valid and format_valid),
+            min_score,
+            mean_score,
+            image_rank,
+            int(recognized_text_area),
+            candidate_id,
+        ),
+        invalid_reason=None if valid else "insufficient_quality",
+        frame_id=frame_id,
+        detail_bbox=detail_bbox,
+    )
+
+
+def face_result_outcome(
+    *,
+    candidate_id: str,
+    image_rank: ImageRank,
+    payload: Any,
+    top1_score: float,
+    top2_score: float,
+    recognition_threshold: float,
+    min_identity_margin: float,
+    image_quality_valid: bool,
+    margin_scale: float | None = None,
+    frame_id: str | None = None,
+    detail_bbox: tuple[int, int, int, int] | None = None,
+) -> RecognitionOutcome:
+    margin = top1_score - top2_score
+    scale = max(float(margin_scale or min_identity_margin), 1e-9)
+    valid = (
+        image_quality_valid
+        and top1_score >= recognition_threshold
+        and margin >= min_identity_margin
+    )
+    if not image_quality_valid:
+        reason = "insufficient_quality"
+    elif margin < min_identity_margin:
+        reason = "ambiguous_identity"
+    elif top1_score < recognition_threshold:
+        reason = "unknown"
+    else:
+        reason = None
+    return RecognitionOutcome(
+        task="face",
+        candidate_id=candidate_id,
+        image_rank=image_rank,
+        payload=payload,
+        valid=valid,
+        result_rank=(
+            bool(valid),
+            max(0.0, min(1.0, margin / scale)),
+            top1_score,
+            image_rank,
+            candidate_id,
+        ),
+        invalid_reason=reason,
+        frame_id=frame_id,
+        detail_bbox=detail_bbox,
+    )
 
 
 class RecognitionLifecycle:
@@ -219,8 +368,6 @@ class RecognitionLifecycle:
             self._counters[
                 f"terminal_passages:{key.task}:{len(state.attempts)}_attempts"
             ] += 1
-            if status == RecognitionStatus.ACCEPTED:
-                self._counters["early_stop"] += 1
             return True
 
     def record_skip(self, task: str, reason: str) -> None:
@@ -271,4 +418,5 @@ class RecognitionLifecycle:
             # Kept for the existing stats consumer; unlike the old value this
             # excludes non-owning terminal tombstones.
             result["active_tracks"] = result["active_lifecycles"]
+            result.setdefault("early_stop", 0)
             return result

@@ -522,11 +522,22 @@ class FaceSnapshotPipelineTest(unittest.TestCase):
             ("face_camera", "ended"): object(),
             ("other_camera", "other"): object(),
         }
+        processor.config = SimpleNamespace(
+            cameras={"face_camera": SimpleNamespace(detect=SimpleNamespace(max_disappeared=2))}
+        )
+        expired = []
+        processor.expire_object = lambda object_id, camera: (
+            expired.append((camera, object_id)),
+            processor.face_tracks.pop((camera, object_id), None),
+        )
+        processor.expire_missing_objects("face_camera", {"active"})
+        self.assertEqual(expired, [])
         processor.expire_missing_objects("face_camera", {"active"})
         self.assertEqual(
             set(processor.face_tracks),
             {("face_camera", "active"), ("other_camera", "other")},
         )
+        self.assertEqual(expired, [("face_camera", "ended")])
 
     def test_active_identity_is_published_only_after_commit_ack(self) -> None:
         processor = TrackedObjectProcessor.__new__(TrackedObjectProcessor)

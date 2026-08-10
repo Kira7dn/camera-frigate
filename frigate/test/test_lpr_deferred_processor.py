@@ -1,292 +1,146 @@
 from __future__ import annotations
 
-import threading
-import time
-from collections import deque
+import json
 from types import MethodType, SimpleNamespace
 
 import numpy as np
 
-from frigate.data_processing.common.evidence import (
-    EvidenceBufferPolicy,
-    EvidenceCandidate,
-    EvidenceRingBuffer,
-)
-from frigate.data_processing.common.license_plate.pipeline import (
-    LatestLprTaskQueue,
-    LprExpireTask,
-    LprFrameTask,
-    LprTrackKey,
-    PlateTrackState,
-    PreparedPlateCandidate,
-)
-from frigate.data_processing.common.quality import QualitySelector
-from frigate.data_processing.common.recognition import RecognitionLifecycle
 from frigate.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
 )
 from frigate.embeddings.maintainer import EmbeddingMaintainer
-
-TASK_RING = EvidenceRingBuffer(
-    {"cam": EvidenceBufferPolicy(10.0, 8 * 1024 * 1024, 100.0)}
-)
+from frigate.events.types import EventStateEnum, EventTypeEnum
 
 
-def frame_ref(track: str, frame_time: float):
-    ref = TASK_RING.ingest(
-        "cam", "detect", f"{track}-{frame_time}", frame_time, np.zeros((6, 4), np.uint8)
-    )
-    assert ref is not None
-    return ref
-
-
-def frame_task(track: str, frame_time: float, priority: float = 0.0) -> LprFrameTask:
-    return LprFrameTask(
-        key=LprTrackKey("cam", track, 0),
-        obj_data={"id": track, "camera": "cam", "frame_time": frame_time},
-        frame_ref=frame_ref(track, frame_time),
-        dedicated_lpr=False,
-        frame_time=frame_time,
-        priority=priority,
-    )
-
-
-def test_same_track_replaces_older_frame_and_queue_is_bounded() -> None:
-    tasks = LatestLprTaskQueue(max_tracks=2)
-    assert tasks.submit(frame_task("one", 1.0))
-    assert tasks.submit(frame_task("one", 2.0))
-    assert tasks.replaced == 1
-    assert tasks.depth == 1
-    assert tasks.submit(frame_task("two", 2.1))
-    assert not tasks.submit(frame_task("three", 2.2))
-    assert tasks.depth == 2
-    assert tasks.full_drops == 1
-    item = tasks.get()
-    assert isinstance(item, LprFrameTask)
-    assert item.frame_time == 2.0
-
-
-def test_higher_quality_roi_replaces_and_runs_before_low_priority_work() -> None:
-    tasks = LatestLprTaskQueue(max_tracks=2)
-    assert tasks.submit(frame_task("low", 1.0, 1.0))
-    assert tasks.submit(frame_task("medium", 1.1, 2.0))
-    assert tasks.submit(frame_task("high", 1.2, 3.0))
-    assert tasks.replaced == 1
-    first = tasks.get()
-    second = tasks.get()
-    assert isinstance(first, LprFrameTask)
-    assert isinstance(second, LprFrameTask)
-    assert [first.key.track_id, second.key.track_id] == ["high", "medium"]
-
-
-def test_scheduler_waits_for_collection_window_then_selects_best_quality() -> None:
+def test_realtime_processor_delegates_frame_to_upstream_lpr_process() -> None:
     processor = object.__new__(LicensePlateRealTimeProcessor)
-    key = LprTrackKey("cam", "passage", 0)
-    low = SimpleNamespace(
-        key=key,
-        prepared_monotonic=1.0,
-        evidence=SimpleNamespace(quality_score=0.4, candidate_id="low"),
-    )
-    high = SimpleNamespace(
-        key=key,
-        prepared_monotonic=2.0,
-        evidence=SimpleNamespace(quality_score=0.9, candidate_id="high"),
-    )
-    processor._prepared = {key: [low, high]}
-    processor._collection_started = {key: time.monotonic()}
-    processor.config = SimpleNamespace(
-        cameras={
-            "cam": SimpleNamespace(
-                recognition_lifecycle=SimpleNamespace(
-                    candidate_collection_seconds=0.4
-                )
-            )
-        }
-    )
-    selected = []
-    processor._recognize_prepared = MethodType(
-        lambda _self, candidate: selected.append(candidate.evidence.candidate_id),
-        processor,
-    )
-
-    processor._run_ready_candidate()
-    assert selected == []
-    processor._collection_started[key] -= 0.4
-    processor._run_ready_candidate()
-    assert selected == ["high"]
-
-
-def test_expire_is_priority_and_invalidates_pending_generation() -> None:
-    tasks = LatestLprTaskQueue(max_tracks=2)
-    old = frame_task("one", 1.0)
-    assert tasks.submit(old)
-    assert tasks.advance_generation("cam", "one") == 1
-    item = tasks.get()
-    assert isinstance(item, LprExpireTask)
-    assert not tasks.is_current(old.key)
-    assert tasks.depth == 0
-
-
-def test_expire_controls_remain_bounded_without_losing_invalidations() -> None:
-    tasks = LatestLprTaskQueue(max_tracks=2)
-    old_keys = []
-    for index in range(10):
-        old_keys.append(LprTrackKey("cam", f"track-{index}", 0))
-        tasks.advance_generation("cam", f"track-{index}")
-    assert tasks.control_depth <= 2
-    assert all(not tasks.is_current(key) for key in old_keys)
-
-
-def make_worker(infer) -> LicensePlateRealTimeProcessor:
-    processor = object.__new__(LicensePlateRealTimeProcessor)
-    processor.metrics = SimpleNamespace()
-    processor.config = SimpleNamespace(
-        cameras={
-            "cam": SimpleNamespace(
-                recognition_lifecycle=SimpleNamespace(
-                    candidate_collection_seconds=0.0
-                )
-            )
-        }
-    )
-    processor._tasks = LatestLprTaskQueue(8)
-    processor._states = {}
-    processor._prepared = {}
-    processor._collection_started = {}
-    processor._terminal_keys = set()
-    processor.recognition_lifecycle = RecognitionLifecycle()
-    processor._results = deque()
-    processor._results_lock = threading.Lock()
-    processor._stop_event = threading.Event()
-    processor.evidence_ring = EvidenceRingBuffer(
-        {"cam": EvidenceBufferPolicy(10.0, 8 * 1024 * 1024, 100.0)}
-    )
-    processor.quality_selector = QualitySelector(processor.evidence_ring)
-    processor._is_eligible = MethodType(
-        lambda _self, obj_data, dedicated: (
-            "cam",
-            str(obj_data["id"]),
-            float(obj_data["frame_time"]),
+    calls = []
+    processor.lpr_process = MethodType(
+        lambda _self, obj, frame, dedicated=False: calls.append(
+            (obj, frame, dedicated)
         ),
         processor,
     )
-    processor.lpr_process = MethodType(infer, processor)
-    processor._reduce = MethodType(lambda _self, value: value, processor)
-    processor._worker = threading.Thread(target=processor._worker_loop, daemon=True)
-    processor._worker.start()
-    return processor
+    frame = np.zeros((6, 4), dtype=np.uint8)
+    obj = {"id": "car-1", "camera": "cam"}
+
+    processor.process_frame(obj, frame)
+
+    assert calls == [(obj, frame, False)]
 
 
-def test_slow_inference_does_not_block_process_frame() -> None:
-    finished = threading.Event()
-
-    def slow_infer(_self, obj_data, frame, dedicated, key, frame_ref):
-        time.sleep(0.2)
-        finished.set()
-
-    processor = make_worker(slow_infer)
-    started = time.monotonic()
-    processor.process_frame(
-        {"id": "one", "camera": "cam", "frame_time": 1.0},
-        processor.evidence_ring.ingest(
-            "cam", "detect", "one", 1.0, np.zeros((6, 4), dtype=np.uint8)
-        ),
+def test_realtime_processor_delegates_expiry_to_upstream_lpr_expire() -> None:
+    processor = object.__new__(LicensePlateRealTimeProcessor)
+    calls = []
+    processor.lpr_expire = MethodType(
+        lambda _self, object_id, camera: calls.append((object_id, camera)),
+        processor,
     )
-    elapsed = time.monotonic() - started
-    assert elapsed < 0.05
-    assert finished.wait(1.0)
-    processor.shutdown()
-    assert processor.pending_count == 0
+
+    processor.expire_object("car-1", "cam")
+
+    assert calls == [("car-1", "cam")]
 
 
-def test_expire_blocks_stale_inflight_result() -> None:
-    started = threading.Event()
-    release = threading.Event()
-
-    def blocked_infer(_self, obj_data, frame, dedicated, key, frame_ref):
-        started.set()
-        assert release.wait(1.0)
-        lease = _self.evidence_ring.acquire(frame_ref)
-        assert lease is not None
-        return PreparedPlateCandidate(
-            key=key,
-            frame_time=1.0,
-            plate_box=(0, 0, 2, 2),
-            object_box=(0, 0, 4, 4),
-            obj_data=obj_data,
-            dedicated_lpr=False,
-            evidence=EvidenceCandidate(
-                "candidate",
-                "lpr",
-                "cam",
-                "one",
-                key.generation,
-                frame_ref,
-                (0, 0, 4, 4),
-                (0, 0, 2, 2),
-                1.0,
-                {"dimensions": 1.0},
-                (),
-                (),
-                frame_ref.source_role,
-                lease,
-            ),
-            plate_frame=np.zeros((10, 20, 3), dtype=np.uint8),
-        )
-
-    processor = make_worker(blocked_infer)
-    processor.process_frame(
-        {"id": "one", "camera": "cam", "frame_time": 1.0},
-        processor.evidence_ring.ingest(
-            "cam", "detect", "one", 1.0, np.zeros((6, 4), dtype=np.uint8)
-        ),
-    )
-    assert started.wait(1.0)
-    processor.expire_object("one", "cam")
-    release.set()
-    time.sleep(0.05)
-    assert processor.drain_results() == []
-    processor.shutdown()
-
-
-def test_shutdown_releases_valid_state_without_best_effort_publish() -> None:
-    processor = make_worker(lambda *_args: None)
-    released = []
-    key = LprTrackKey("cam", "one", 0)
-    state = PlateTrackState(key)
-    state.variants.append(
-        {
-            "plate": "ABC1234",
-            "conf": 0.99,
-            "observation": SimpleNamespace(
-                evidence=SimpleNamespace(release=lambda: released.append(True))
-            ),
-        }
-    )
-    processor._states[key] = state
-    processor.shutdown()
-    assert released == [True]
-    assert processor.drain_results() == []
-
-
-def test_tracked_lpr_uses_conflated_detection_frames() -> None:
+def test_maintainer_passes_canonical_event_yuv_frame_directly_to_lpr() -> None:
     submitted = []
     lpr = object.__new__(LicensePlateRealTimeProcessor)
-    lpr.lp_objects = ["car", "motorcycle"]
-    lpr._active_detection_ids = {}
-    lpr.expire_missing_objects = MethodType(lambda *_args: None, lpr)
-    lpr.associate_frame_objects = MethodType(
-        lambda _self, _camera, objects: (
-            [
-                SimpleNamespace(passage_id=str(obj["id"]), obj_data=obj)
-                for obj in objects
-            ],
-            [],
+    lpr.process_frame = MethodType(
+        lambda _self, obj, frame, dedicated=False: submitted.append(
+            (obj["id"], frame, dedicated)
         ),
         lpr,
     )
+    frame = np.zeros((6, 4), dtype=np.uint8)
+    maintainer = object.__new__(EmbeddingMaintainer)
+    maintainer.config = SimpleNamespace(
+        cameras={
+            "cam": SimpleNamespace(
+                type="generic",
+                objects=SimpleNamespace(track=["car"]),
+                lpr=SimpleNamespace(enabled=True),
+                face_recognition=SimpleNamespace(enabled=False),
+                frame_shape_yuv=(6, 4),
+            )
+        },
+        classification=SimpleNamespace(custom={}),
+        semantic_search=SimpleNamespace(enabled=False),
+    )
+    maintainer.realtime_processors = [lpr]
+    maintainer.post_processors = []
+    maintainer.event_subscriber = SimpleNamespace(
+        check_for_update=lambda: (
+            EventTypeEnum.tracked_object,
+            EventStateEnum.update,
+            "cam",
+            "frame",
+            {"id": "car-1", "camera": "cam", "label": "car"},
+        )
+    )
+    maintainer.frame_manager = SimpleNamespace(
+        get=lambda *_args: frame,
+        close=lambda *_args: None,
+    )
+
+    maintainer._process_updates()
+
+    assert len(submitted) == 1
+    assert submitted[0][0] == "car-1"
+    assert submitted[0][1] is frame
+    assert submitted[0][2] is False
+
+
+def test_maintainer_does_not_run_lpr_on_end_event_with_stale_bbox() -> None:
+    submitted = []
+    lpr = object.__new__(LicensePlateRealTimeProcessor)
     lpr.process_frame = MethodType(
-        lambda _self, obj, frame_ref: submitted.append((obj["id"], frame_ref)),
+        lambda _self, obj, frame, dedicated=False: submitted.append(
+            (obj, frame, dedicated)
+        ),
+        lpr,
+    )
+    frame = np.zeros((6, 4), dtype=np.uint8)
+    maintainer = object.__new__(EmbeddingMaintainer)
+    maintainer.config = SimpleNamespace(
+        cameras={
+            "cam": SimpleNamespace(frame_shape_yuv=(6, 4)),
+        },
+        semantic_search=SimpleNamespace(enabled=False),
+    )
+    maintainer.realtime_processors = [lpr]
+    maintainer.post_processors = []
+    maintainer.event_subscriber = SimpleNamespace(
+        check_for_update=lambda: (
+            EventTypeEnum.tracked_object,
+            EventStateEnum.end,
+            "cam",
+            "newer-frame-after-car-disappeared",
+            {
+                "id": "car-1",
+                "camera": "cam",
+                "label": "car",
+                "frame_time": 1.0,
+                "box": [0, 0, 4, 4],
+            },
+        )
+    )
+    maintainer.frame_manager = SimpleNamespace(
+        get=lambda *_args: frame,
+        close=lambda *_args: None,
+    )
+
+    maintainer._process_updates()
+
+    assert submitted == []
+
+
+def test_maintainer_does_not_feed_tracked_lpr_from_detection_frame() -> None:
+    submitted = []
+    lpr = object.__new__(LicensePlateRealTimeProcessor)
+    lpr.process_frame = MethodType(
+        lambda _self, obj, frame, dedicated=False: submitted.append(
+            (obj, frame, dedicated)
+        ),
         lpr,
     )
     maintainer = object.__new__(EmbeddingMaintainer)
@@ -303,57 +157,267 @@ def test_tracked_lpr_uses_conflated_detection_frames() -> None:
         classification=SimpleNamespace(custom={}),
     )
     maintainer.realtime_processors = [lpr]
-    maintainer.frame_manager = SimpleNamespace(
-        get=lambda *_args: np.zeros((6, 4), dtype=np.uint8),
-        close=lambda *_args: None,
-    )
-    maintainer.evidence_ring = SimpleNamespace(
-        ingest=lambda *_args: "frame-ref",
-        last_reject_reason=lambda *_args: None,
-    )
-    maintainer.quality_selector = SimpleNamespace(record_reject=lambda *_args: None)
 
     maintainer._process_latest_frame(
         (
             "cam",
             "frame",
             1.0,
-            [
-                {"id": "small", "label": "car", "box": [0, 0, 2, 2], "area": 4},
-                {"id": "large", "label": "car", "box": [0, 0, 4, 4], "area": 16},
-                {"id": "person", "label": "person", "box": [0, 0, 4, 4], "area": 16},
-            ],
+            [{"id": "raw-car-1", "label": "car", "box": [0, 0, 4, 4]}],
             [],
             None,
         )
     )
 
-    assert submitted == [("small", "frame-ref"), ("large", "frame-ref")]
+    assert submitted == []
 
 
-def test_empty_event_metadata_poll_does_not_crash_maintainer() -> None:
-    maintainer = object.__new__(EmbeddingMaintainer)
-    maintainer.event_metadata_subscriber = SimpleNamespace(
-        check_for_update=lambda: (None, None)
-    )
-    maintainer.post_processors = []
-
-    maintainer._process_event_metadata()
-
-
-def test_lpr_detection_reconciliation_expires_missing_track_once() -> None:
-    expired = []
+def test_pending_canonical_lpr_retries_only_same_track_with_synchronized_frame() -> None:
+    calls = []
     processor = object.__new__(LicensePlateRealTimeProcessor)
-    processor._active_detection_ids = {}
-    processor._tasks = SimpleNamespace(
-        advance_generation=lambda camera, track_id: expired.append(
-            (camera, track_id)
-        )
+    processor.lp_objects = ["car"]
+    processor.config = SimpleNamespace(
+        cameras={"cam": SimpleNamespace(lpr=SimpleNamespace(enabled=True))}
     )
-    processor._update_queue_metrics = lambda: None
+    processor.lpr_process = MethodType(
+        lambda _self, obj, frame, dedicated=False: calls.append(
+            (dict(obj), frame, dedicated)
+        ),
+        processor,
+    )
+    canonical_frame = np.zeros((6, 4), dtype=np.uint8)
+    retry_frame = np.ones((6, 4), dtype=np.uint8)
+    canonical = {
+        "id": "car-1",
+        "camera": "cam",
+        "frame_time": 1.0,
+        "label": "car",
+        "box": [0, 0, 2, 4],
+        "position_changes": 0,
+        "stationary": False,
+    }
 
-    processor.expire_missing_objects("cam", {"one", "two"})
-    processor.expire_missing_objects("cam", {"two"})
-    processor.expire_missing_objects("cam", {"two"})
+    processor.process_frame(canonical, canonical_frame)
+    assert processor.has_pending_retry("cam") is True
 
-    assert expired == [("cam", "one")]
+    assert (
+        processor.retry_pending_frame(
+            "cam",
+            [
+                {
+                    "id": "other-car",
+                    "label": "car",
+                    "box": [2, 0, 4, 4],
+                    "position_changes": 2,
+                    "stationary": False,
+                }
+            ],
+            retry_frame,
+            1.2,
+        )
+        == 0
+    )
+    assert len(calls) == 1
+
+    retry_obj = {
+        "id": "car-1",
+        "label": "car",
+        "box": [1, 0, 4, 4],
+        "position_changes": 1,
+        "stationary": False,
+    }
+    assert (
+        processor.retry_pending_frame("cam", [retry_obj], retry_frame, 1.4) == 1
+    )
+    assert len(calls) == 2
+    submitted, submitted_frame, dedicated = calls[-1]
+    assert submitted["id"] == "car-1"
+    assert submitted["camera"] == "cam"
+    assert submitted["frame_time"] == 1.4
+    assert submitted["box"] == retry_obj["box"]
+    assert submitted_frame is retry_frame
+    assert dedicated is False
+    assert processor.has_pending_retry("cam") is False
+
+    # Neither the same detection frame nor a stale canonical update can revive
+    # or duplicate a resolved retry lifecycle.
+    assert (
+        processor.retry_pending_frame("cam", [retry_obj], retry_frame, 1.4) == 0
+    )
+    processor.process_frame(canonical, canonical_frame)
+    assert processor.has_pending_retry("cam") is False
+    assert len(calls) == 3
+
+
+def test_pending_lpr_retry_is_cancelled_on_end_and_shutdown() -> None:
+    processor = object.__new__(LicensePlateRealTimeProcessor)
+    processor.lp_objects = ["car"]
+    processor.config = SimpleNamespace(
+        cameras={"cam": SimpleNamespace(lpr=SimpleNamespace(enabled=True))}
+    )
+    processor.lpr_process = MethodType(lambda *_args: None, processor)
+    expired = []
+    processor.lpr_expire = MethodType(
+        lambda _self, object_id, camera: expired.append((object_id, camera)), processor
+    )
+    frame = np.zeros((6, 4), dtype=np.uint8)
+
+    for object_id in ("car-1", "car-2"):
+        processor.process_frame(
+            {
+                "id": object_id,
+                "camera": "cam",
+                "frame_time": 1.0,
+                "label": "car",
+                "box": [0, 0, 4, 4],
+                "position_changes": 0,
+                "stationary": False,
+            },
+            frame,
+        )
+
+    processor.expire_object("car-1", "cam")
+    assert expired == [("car-1", "cam")]
+    assert ("cam", "car-1") not in processor._pending()
+    assert ("cam", "car-2") in processor._pending()
+
+    processor.shutdown()
+    assert processor._pending() == {}
+    assert processor._closed_retries() == set()
+
+
+def test_pending_lpr_retry_is_cancelled_on_stream_epoch_reset() -> None:
+    processor = object.__new__(LicensePlateRealTimeProcessor)
+    processor.lp_objects = ["car"]
+    processor.config = SimpleNamespace(
+        cameras={"cam": SimpleNamespace(lpr=SimpleNamespace(enabled=True))}
+    )
+    processor.lpr_process = MethodType(lambda *_args: None, processor)
+    frame = np.zeros((6, 4), dtype=np.uint8)
+    processor.process_frame(
+        {
+            "id": "car-1",
+            "camera": "cam",
+            "frame_time": 10.0,
+            "label": "car",
+            "box": [0, 0, 4, 4],
+            "position_changes": 0,
+            "stationary": False,
+        },
+        frame,
+    )
+
+    assert processor.retry_pending_frame("cam", [], frame, 1.0) == 0
+    assert processor.has_pending_retry("cam") is False
+    assert processor._closed_retries() == set()
+
+
+def test_maintainer_feeds_detection_frame_only_to_pending_canonical_lpr() -> None:
+    retries = []
+    lpr = object.__new__(LicensePlateRealTimeProcessor)
+    lpr.has_pending_retry = MethodType(lambda _self, camera: camera == "cam", lpr)
+    lpr.retry_pending_frame = MethodType(
+        lambda _self, camera, objects, frame, frame_time: retries.append(
+            (camera, objects, frame, frame_time)
+        )
+        or 1,
+        lpr,
+    )
+    frame = np.zeros((6, 4), dtype=np.uint8)
+    maintainer = object.__new__(EmbeddingMaintainer)
+    maintainer.config = SimpleNamespace(
+        cameras={
+            "cam": SimpleNamespace(
+                type="generic",
+                objects=SimpleNamespace(track=["car"]),
+                lpr=SimpleNamespace(enabled=True),
+                face_recognition=SimpleNamespace(enabled=False),
+                frame_shape_yuv=(6, 4),
+            )
+        },
+        classification=SimpleNamespace(custom={}),
+    )
+    maintainer.realtime_processors = [lpr]
+    maintainer.frame_manager = SimpleNamespace(
+        get=lambda *_args: frame,
+        close=lambda *_args: None,
+    )
+    objects = [
+        {
+            "id": "car-1",
+            "label": "car",
+            "box": [0, 0, 4, 4],
+            "position_changes": 1,
+        }
+    ]
+
+    maintainer._process_latest_frame(("cam", "frame", 1.2, objects, [], None))
+
+    assert retries == [("cam", objects, frame, 1.2)]
+
+
+def test_synchronous_lpr_has_no_deferred_results() -> None:
+    processor = object.__new__(LicensePlateRealTimeProcessor)
+    assert processor.drain_results() == []
+
+
+def test_pre_gate_lpr_invocation_persists_runtime_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PASSAGE_EVIDENCE_DIR", str(tmp_path))
+    processor = object.__new__(LicensePlateRealTimeProcessor)
+    processor.metrics = SimpleNamespace(
+        alpr_pps=SimpleNamespace(value=0.0),
+        yolov9_lpr_pps=SimpleNamespace(value=0.0),
+    )
+    processor.plates_rec_second = SimpleNamespace(eps=lambda: 0.0)
+    processor.plates_det_second = SimpleNamespace(eps=lambda: 0.0)
+    processor.lp_objects = ["car"]
+    processor.config = SimpleNamespace(
+        cameras={
+            "cam": SimpleNamespace(
+                lpr=SimpleNamespace(enabled=True),
+                detect=SimpleNamespace(min_initialized=1),
+            )
+        }
+    )
+    frame = np.zeros((6, 4), dtype=np.uint8)
+
+    processor.lpr_process(
+        {
+            "id": "car-1",
+            "camera": "cam",
+            "frame_time": 1.25,
+            "label": "car",
+            "score": 0.8,
+            "box": [0, 0, 4, 4],
+            "area": 16,
+            "position_changes": 0,
+            "stationary": False,
+            "motionless_count": 0,
+        },
+        frame,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "evidence.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert {record["stage"] for record in records} == {
+        "invocation",
+        "runtime_frame",
+        "runtime_frame_object_box",
+        "eligibility_decision",
+    }
+    decision = next(
+        record for record in records if record["stage"] == "eligibility_decision"
+    )
+    assert decision["accepted"] is False
+    assert decision["reason"] == "no_position_changes"
+    raw_record = next(record for record in records if record["stage"] == "runtime_frame")
+    assert "artifact_path" not in raw_record
+    annotated_record = next(
+        record for record in records if record["stage"] == "runtime_frame_object_box"
+    )
+    assert (tmp_path / annotated_record["artifact_path"]).is_file()
+    assert annotated_record["artifact_sha256"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 from collections import Counter
 from dataclasses import dataclass
@@ -27,7 +28,8 @@ class QualityThresholds:
 
 
 def _box_iou(
-    first: tuple[int, int, int, int], second: tuple[int, int, int, int]
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
 ) -> float:
     left, top = max(first[0], second[0]), max(first[1], second[1])
     right, bottom = min(first[2], second[2]), min(first[3], second[3])
@@ -40,6 +42,25 @@ def _box_iou(
     return intersection / union if union else 0.0
 
 
+def _stability_bbox(
+    detail_bbox: tuple[int, int, int, int],
+    object_bbox: tuple[int, int, int, int] | None,
+) -> tuple[float, float, float, float]:
+    """Express detail geometry relative to its moving parent when available."""
+    if object_bbox is None:
+        return tuple(float(value) for value in detail_bbox)
+    object_width = object_bbox[2] - object_bbox[0]
+    object_height = object_bbox[3] - object_bbox[1]
+    if object_width <= 0 or object_height <= 0:
+        return tuple(float(value) for value in detail_bbox)
+    return (
+        (detail_bbox[0] - object_bbox[0]) / object_width,
+        (detail_bbox[1] - object_bbox[1]) / object_height,
+        (detail_bbox[2] - object_bbox[0]) / object_width,
+        (detail_bbox[3] - object_bbox[1]) / object_height,
+    )
+
+
 class QualitySelector:
     """Own deterministic top-K candidates per task/camera/track generation."""
 
@@ -47,10 +68,11 @@ class QualitySelector:
         self.ring = ring
         self._selected: dict[tuple[str, str, str, int], list[EvidenceCandidate]] = {}
         self._previous_bbox: dict[
-            tuple[str, str, str, int], tuple[int, int, int, int]
+            tuple[str, str, str, int], tuple[float, float, float, float]
         ] = {}
         self._counters: Counter[str] = Counter()
         self._reason_counts: Counter[tuple[str, str]] = Counter()
+        self._frozen: set[tuple[str, str, str, int]] = set()
         self._lock = threading.RLock()
 
     @staticmethod
@@ -92,6 +114,8 @@ class QualitySelector:
         pose_score: float | None = None,
         occlusion_score: float | None = None,
     ) -> EvidenceCandidate | None:
+        with self._lock:
+            self._counters["observed"] += 1
         key = (task, camera, track_id, generation)
         candidate_id = self.candidate_id(
             task, camera, track_id, generation, frame_ref, detail_bbox
@@ -142,27 +166,38 @@ class QualitySelector:
             unavailable.append("detector_score")
         else:
             components["detector_score"] = min(1.0, max(0.0, detector_score))
-        if pose_score is None:
-            unavailable.append("pose")
-        else:
+        if pose_score is not None:
             components["pose"] = min(1.0, max(0.0, pose_score))
-        if occlusion_score is None:
-            unavailable.append("occlusion")
-        else:
+        if occlusion_score is not None:
             components["occlusion"] = min(1.0, max(0.0, occlusion_score))
 
         with self._lock:
             self._reset_other_generations(task, camera, track_id, generation)
+            if key in self._frozen:
+                self._reject(task, ["passage_frozen"])
+                return None
+            stability_bbox = _stability_bbox(detail_bbox, object_bbox)
             previous = self._previous_bbox.get(key)
             if previous is None:
                 unavailable.append("temporal_stability")
             else:
-                components["temporal_stability"] = _box_iou(previous, detail_bbox)
-            self._previous_bbox[key] = detail_bbox
+                components["temporal_stability"] = _box_iou(
+                    previous, stability_bbox
+                )
+            self._previous_bbox[key] = stability_bbox
 
             selected = self._selected.setdefault(key, [])
             if any(item.candidate_id == candidate_id for item in selected):
                 self._counters["deduped"] += 1
+                self._reason_counts[(task, "duplicate_candidate")] += 1
+                return None
+            if any(
+                abs(item.frame_ref.frame_time - frame_ref.frame_time) + 1e-9 < 0.4
+                and _box_iou(item.detail_bbox, detail_bbox) > 0.90 + 1e-9
+                for item in selected
+            ):
+                self._counters["diversity_skipped"] += 1
+                self._reason_counts[(task, "insufficient_diversity")] += 1
                 return None
 
             reasons: list[str] = []
@@ -188,7 +223,27 @@ class QualitySelector:
                 self._reject(task, reasons)
                 return None
 
-            score = float(sum(components.values()) / len(components))
+            configured_count = len(components) + len(unavailable)
+            coverage = len(components) / max(1, configured_count)
+            normalized = [min(1.0, max(0.0, value)) for value in components.values()]
+            weakest = min(normalized, default=0.0)
+            balance = (
+                math.prod(max(value, 1e-12) for value in normalized)
+                ** (1.0 / len(normalized))
+                if normalized
+                else 0.0
+            )
+            score = coverage * math.sqrt(weakest * balance)
+            components.update(
+                coverage=coverage,
+                weakest=weakest,
+                balance=balance,
+            )
+            # Keep the hard gate explicit in the rank contract.  All admitted
+            # candidates pass this gate; rejected candidates never enter the
+            # rolling pool.  It is intentionally not part of the composite
+            # quality score or presented as a probability.
+            components["hard_quality_pass"] = 1.0
             lease = self.ring.acquire(frame_ref)
             if lease is None:
                 self._reject(task, ["frame_expired"])
@@ -225,12 +280,25 @@ class QualitySelector:
             selected.append(owner)
             selected.sort(key=self._rank, reverse=True)
             self._counters["accepted"] += 1
+            self._counters["selected"] += 1
             return owner.fork()
 
     @staticmethod
-    def _rank(candidate: EvidenceCandidate) -> tuple[float, float, str]:
-        detector = candidate.quality_components.get("detector_score", -1.0)
-        return (candidate.quality_score, detector, candidate.candidate_id)
+    def _rank(
+        candidate: EvidenceCandidate,
+    ) -> tuple[float, float, float, float, float, int, str]:
+        return candidate.image_rank
+
+    def freeze(
+        self, task: str, camera: str, track_id: str, generation: int
+    ) -> tuple[EvidenceCandidate, ...]:
+        """Close admission and return the current best-first top-K snapshot."""
+        key = (task, camera, track_id, generation)
+        with self._lock:
+            self._frozen.add(key)
+            selected = self._selected.get(key, [])
+            selected.sort(key=self._rank, reverse=True)
+            return tuple(candidate.fork() for candidate in selected)
 
     def _reject(self, task: str, reasons: list[str]) -> None:
         self._counters["rejected"] += 1
@@ -342,6 +410,7 @@ class QualitySelector:
         for candidate in self._selected.pop(key, []):
             candidate.release()
         self._previous_bbox.pop(key, None)
+        self._frozen.discard(key)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

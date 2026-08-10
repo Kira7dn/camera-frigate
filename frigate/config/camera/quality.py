@@ -1,10 +1,14 @@
 """Per-camera evidence and recognition-input quality configuration."""
 
+import logging
 from enum import Enum
 
 from pydantic import Field, model_validator
 
 from ..base import FrigateBaseModel
+
+logger = logging.getLogger(__name__)
+_WARNED_DEPRECATED_LIFECYCLE_KEYS: set[str] = set()
 
 
 class QualitySourceRoleEnum(str, Enum):
@@ -58,7 +62,7 @@ class CameraQualityConfig(FrigateBaseModel):
     enabled: bool = False
     source_role: QualitySourceRoleEnum = QualitySourceRoleEnum.detect
     buffer: EvidenceBufferConfig = Field(default_factory=EvidenceBufferConfig)
-    top_k: int = Field(default=3, ge=1, le=5)
+    top_k: int = Field(default=3, ge=1, le=3)
     face: TaskQualityConfig = Field(default_factory=_default_face_quality)
     lpr: TaskQualityConfig = Field(default_factory=_default_lpr_quality)
 
@@ -75,19 +79,34 @@ class CameraQualityConfig(FrigateBaseModel):
 class RecognitionLifecycleConfig(FrigateBaseModel):
     """Bounded per-track Face/LPR recognition policy."""
 
-    max_attempts: int = Field(default=3, ge=1, le=5)
-    candidate_collection_seconds: float = Field(default=0.4, ge=0)
+    max_attempts: int = Field(default=3, ge=1, le=3)
+    candidate_collection_seconds: float = Field(
+        default=0.4,
+        ge=0,
+        deprecated=True,
+        description="Deprecated compatibility key; passage end controls dispatch.",
+    )
     min_candidate_interval_seconds: float = Field(default=0.4, ge=0)
     max_candidate_bbox_iou: float = Field(default=0.90, ge=0, le=1)
     passage_idle_seconds: float = Field(default=1.0, gt=0, le=10.0)
-    lpr_min_consensus_votes: int = Field(default=2, ge=1)
+    lpr_min_consensus_votes: int = Field(
+        default=2,
+        ge=1,
+        deprecated=True,
+        description="Deprecated compatibility key; best valid result wins.",
+    )
     lpr_observation_threshold: float = Field(default=0.55, gt=0, le=1)
 
     @model_validator(mode="after")
-    def validate_attempt_contract(self) -> "RecognitionLifecycleConfig":
-        if self.lpr_min_consensus_votes > self.max_attempts:
-            raise ValueError(
-                "recognition_lifecycle.lpr_min_consensus_votes must be less than "
-                "or equal to recognition_lifecycle.max_attempts"
-            )
+    def warn_deprecated_keys(self) -> "RecognitionLifecycleConfig":
+        for key in ("candidate_collection_seconds", "lpr_min_consensus_votes"):
+            if (
+                key in self.model_fields_set
+                and key not in _WARNED_DEPRECATED_LIFECYCLE_KEYS
+            ):
+                logger.warning(
+                    "recognition_lifecycle.%s is deprecated and no longer affects runtime",
+                    key,
+                )
+                _WARNED_DEPRECATED_LIFECYCLE_KEYS.add(key)
         return self

@@ -37,6 +37,7 @@ from frigate.util.image import (
 )
 from frigate.util.object import (
     create_tensor_input,
+    get_clipped_object_recovery_region,
     get_cluster_candidates,
     get_cluster_region,
     get_cluster_region_from_grid,
@@ -45,6 +46,7 @@ from frigate.util.object import (
     inside_any,
     intersects_any,
     is_object_filtered,
+    recovery_detection_supersedes,
     reduce_detections,
 )
 from frigate.util.passage_trace import passage_trace
@@ -416,8 +418,33 @@ def process_frames(
                 if obj["id"] in stationary_object_ids
             ]
 
+            initial_detections = []
+            recovery_regions = set()
             for region in regions:
-                detections.extend(
+                region_detections = detect(
+                    camera_config.detect,
+                    object_detector,
+                    frame,
+                    model_config,
+                    region,
+                    camera_config.objects.track,
+                    camera_config.objects.filters,
+                )
+                initial_detections.extend(region_detections)
+
+                for detection in region_detections:
+                    recovery_region = get_clipped_object_recovery_region(
+                        frame_shape, region_min_size, detection
+                    )
+                    if recovery_region is not None and recovery_region != region:
+                        recovery_regions.add(recovery_region)
+
+            # A fast object can move beyond its predicted 1.35x region between
+            # detect frames. Retry an internally clipped detection once using a
+            # larger region so downstream processors receive the complete box.
+            recovery_detections = []
+            for region in recovery_regions:
+                recovery_detections.extend(
                     detect(
                         camera_config.detect,
                         object_detector,
@@ -429,6 +456,18 @@ def process_frames(
                     )
                 )
 
+            detections.extend(
+                initial
+                for initial in initial_detections
+                if not any(
+                    recovery_detection_supersedes(
+                        initial, recovered, frame_shape
+                    )
+                    for recovered in recovery_detections
+                )
+            )
+            detections.extend(recovery_detections)
+
             consolidated_detections = reduce_detections(frame_shape, detections)
             for detection in consolidated_detections:
                 if detection[0] in {"car", "person"}:
@@ -439,6 +478,7 @@ def process_frames(
                         label=detection[0],
                         score=float(detection[1]),
                         object_box=list(detection[2]),
+                        detection_region=list(detection[5]),
                     )
 
             # if detection was run on this frame, consolidate

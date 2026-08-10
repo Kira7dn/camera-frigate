@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
+import json
 import logging
 import math
 import os
@@ -15,15 +17,11 @@ from typing import TYPE_CHECKING, Any, cast
 import cv2
 import numpy as np
 import pyclipper
-from rapidfuzz.distance import JaroWinkler
-from shapely.geometry import Polygon
-
 from frigate.comms.event_metadata_updater import (
     EventMetadataPublisher,
     EventMetadataTypeEnum,
 )
 from frigate.comms.inter_process import InterProcessRequestor
-from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
 from frigate.data_processing.common.evidence import FrameRef
@@ -32,9 +30,21 @@ from frigate.data_processing.common.recognition import (
     RecognitionLifecycle,
     RecognitionStatus,
 )
+from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.image import area
-from frigate.util.passage_trace import passage_trace
+from frigate.util.passage_trace import (
+    canonical_trace_id,
+    passage_evidence,
+    passage_evidence_enabled,
+    passage_evidence_id,
+    passage_evidence_should_capture,
+    passage_trace,
+)
+from rapidfuzz.distance import JaroWinkler, Levenshtein
+from shapely.geometry import Polygon
+
+from frigate.config import FrigateConfig
 
 from ...types import DataProcessorMetrics
 from .constants import LPR_EMBEDDING_SIZE
@@ -187,7 +197,7 @@ class LicensePlateProcessingMixin:
         self,
         camera: str,
         images: list[np.ndarray],
-        enhancement_override: int | None = None,
+        evidence_context: tuple[str, float, str | None] | None = None,
     ) -> tuple[list[str], list[list[float]]]:
         """
         Recognize the characters on the detected license plates using the recognition model.
@@ -214,8 +224,27 @@ class LicensePlateProcessingMixin:
             # preprocess the images based on the max aspect ratio
             for i in range(index, min(num_images, index + self.batch_size)):
                 norm_image = self._preprocess_recognition_image(
-                    camera, images[i], max_wh_ratio, enhancement_override
+                    camera, images[i], max_wh_ratio
                 )
+                if evidence_context is not None:
+                    evidence_id, frame_time, track_id = evidence_context
+                    normalized_view = np.clip(
+                        (norm_image.transpose((1, 2, 0)) * 0.5 + 0.5) * 255,
+                        0,
+                        255,
+                    ).astype(np.uint8)
+                    passage_evidence(
+                        "ocr_recognition_tensor",
+                        evidence_id=evidence_id,
+                        camera=camera,
+                        frame_time=frame_time,
+                        track_id=track_id,
+                        image=normalized_view,
+                        image_index=i,
+                        source_crop_shape=[int(value) for value in images[i].shape],
+                        tensor_shape=[int(value) for value in norm_image.shape],
+                        max_wh_ratio=float(max_wh_ratio),
+                    )
                 norm_image = norm_image[np.newaxis, :]
                 norm_images.append(norm_image)
 
@@ -228,12 +257,13 @@ class LicensePlateProcessingMixin:
 
         return self.ctc_decoder(outputs)
 
-    def _lpr_observation_threshold(self, camera: str) -> float:
-        lifecycle = self.config.cameras[camera].recognition_lifecycle
-        return float(lifecycle.lpr_observation_threshold)
-
     def _process_license_plate(
-        self, camera: str, id: str, image: np.ndarray, debug_frame_id: int
+        self,
+        camera: str,
+        id: str,
+        image: np.ndarray,
+        debug_frame_id: int,
+        evidence_context: tuple[str, float, str | None] | None = None,
     ) -> tuple[list[str], list[list[float]], list[int]]:
         """
         Complete pipeline for detecting, classifying, and recognizing license plates in the input image.
@@ -250,6 +280,8 @@ class LicensePlateProcessingMixin:
         Returns:
             Tuple[List[str], List[List[float]], List[int]]: Detected license plate texts, character-level confidence scores for each plate (flattened into a single list per plate), and areas of the plates.
         """
+        self._last_ocr_text_box_count = 0
+        self._last_ocr_failure_stage = "model_not_ready"
         if (
             self.model_runner.detection_model.runner is None
             or self.model_runner.classification_model.runner is None
@@ -261,11 +293,14 @@ class LicensePlateProcessingMixin:
 
         self._last_ocr_path = "paddle_detected_text"
         self._last_ocr_variant = None
+        self._last_ocr_failure_stage = "text_detector_empty"
         boxes = self._detect(image, debug_frame_id)
         if len(boxes) == 0:
             logger.debug(f"{camera}: No boxes found by OCR detector model")
             return [], [], []
 
+        self._last_ocr_text_box_count = len(boxes)
+        self._last_ocr_failure_stage = "recognizer_empty"
         if len(boxes) > 0:
             plate_left = np.min([np.min(box[:, 0]) for box in boxes])
             plate_right = np.max([np.max(box[:, 0]) for box in boxes])
@@ -335,7 +370,7 @@ class LicensePlateProcessingMixin:
         all_areas = []
         processed_indices = set()
 
-        recognition_threshold = self._lpr_observation_threshold(camera)
+        recognition_threshold = self.lpr_config.recognition_threshold
 
         for group in initial_groups:
             # Sort group by y-coordinate (top to bottom)
@@ -351,6 +386,22 @@ class LicensePlateProcessingMixin:
             group_plate_images = [
                 self._crop_license_plate(image, box) for box in group_boxes
             ]
+
+            if evidence_context is not None:
+                evidence_id, frame_time, track_id = evidence_context
+                for crop_index, (crop, box) in enumerate(
+                    zip(group_plate_images, group_boxes)
+                ):
+                    passage_evidence(
+                        "ocr_text_crop",
+                        evidence_id=evidence_id,
+                        camera=camera,
+                        frame_time=frame_time,
+                        track_id=track_id,
+                        image=crop,
+                        image_index=crop_index,
+                        text_box=np.asarray(box).astype(int).tolist(),
+                    )
 
             if WRITE_DEBUG_IMAGES:
                 for i, img in enumerate(group_plate_images):
@@ -374,10 +425,14 @@ class LicensePlateProcessingMixin:
                     )
 
             # Recognize text in each cropped image
-            results, confidences = self._recognize(camera, group_plate_images)
+            results, confidences = self._recognize(
+                camera, group_plate_images, evidence_context
+            )
 
             if not results:
                 continue
+
+            self._last_ocr_failure_stage = "below_observation_threshold"
 
             if not confidences:
                 confidences = [[0.0] for _ in results]
@@ -387,6 +442,25 @@ class LicensePlateProcessingMixin:
             for conf_list in confidences:
                 avg_conf = sum(conf_list) / len(conf_list) if conf_list else 0.0
                 avg_confidences.append(avg_conf)
+
+            if evidence_context is not None:
+                evidence_id, frame_time, track_id = evidence_context
+                for result_index, (result, conf_list, avg_conf) in enumerate(
+                    zip(results, confidences, avg_confidences)
+                ):
+                    passage_evidence(
+                        "ocr_candidate_result",
+                        evidence_id=evidence_id,
+                        camera=camera,
+                        frame_time=frame_time,
+                        track_id=track_id,
+                        image_index=result_index,
+                        text=result,
+                        character_scores=[float(value) for value in conf_list],
+                        mean_character_score=float(avg_conf),
+                        recognition_threshold=float(recognition_threshold),
+                        accepted=bool(avg_conf >= recognition_threshold),
+                    )
 
             # Filter boxes based on the recognition threshold
             qualifying_indices = []
@@ -460,6 +534,7 @@ class LicensePlateProcessingMixin:
 
             if sorted_data:
                 plates, confs, areas_list = zip(*sorted_data)
+                self._last_ocr_failure_stage = None
                 return list(plates), list(confs), list(areas_list)
 
         return [], [], []
@@ -476,8 +551,11 @@ class LicensePlateProcessingMixin:
         """
         h, w = image.shape[:2]
         ratio = min(self.max_size / max(h, w), 1.0)
-        resize_h = max(int(round(int(h * ratio) / 32) * 32), 32)
-        resize_w = max(int(round(int(w * ratio) / 32) * 32), 32)
+        # Text detector inputs must be aligned to 32 pixels. Always round up so
+        # small plate crops retain their character detail instead of crossing a
+        # model resolution cliff (for example, 110x198 -> 128x224, not 96x192).
+        resize_h = max(int(math.ceil((h * ratio) / 32) * 32), 32)
+        resize_w = max(int(math.ceil((w * ratio) / 32) * 32), 32)
         return cv2.resize(image, (resize_w, resize_h))
 
     def _normalize_image(self, image: np.ndarray) -> np.ndarray:
@@ -914,7 +992,6 @@ class LicensePlateProcessingMixin:
         camera: str,
         image: np.ndarray,
         max_wh_ratio: float,
-        enhancement_override: int | None = None,
     ) -> np.ndarray:
         """
         Preprocess an image for recognition by dynamically adjusting its width.
@@ -942,11 +1019,7 @@ class LicensePlateProcessingMixin:
         else:
             gray = image
 
-        enhancement = (
-            self.config.cameras[camera].lpr.enhancement
-            if enhancement_override is None
-            else enhancement_override
-        )
+        enhancement = self.config.cameras[camera].lpr.enhancement
 
         if enhancement > 3:
             # denoise using a configurable pixel neighborhood value
@@ -1072,6 +1145,7 @@ class LicensePlateProcessingMixin:
 
         Return the dimensions of the detected plate as [x1, y1, x2, y2].
         """
+        self._last_plate_detector_score = None
         try:
             predictions = cast(Any, self.model_runner.yolov9_detection_model)(input)
         except Exception as e:
@@ -1118,6 +1192,7 @@ class LicensePlateProcessingMixin:
 
         # Return the top scoring bounding box if found
         if top_box is not None:
+            self._last_plate_detector_score = float(top_score)
             # expand box by 5% to help with OCR
             expansion = (top_box[2:] - top_box[:2]) * 0.05
 
@@ -1287,14 +1362,92 @@ class LicensePlateProcessingMixin:
         detector_score: float | None = None
         quality_candidate = None
         attempt = None
+        runtime_track_id = None if dedicated_lpr else str(object_data.get("id"))
+        runtime_passage_id = str(
+            object_data.get("_recognition_passage_id")
+            or runtime_track_id
+            or "dedicated-lpr"
+        )
+        runtime_trace_id = canonical_trace_id("lpr", camera, runtime_passage_id)
+        runtime_evidence_id = passage_evidence_id(
+            camera, runtime_track_id, current_time, debug_frame_id
+        )
+        runtime_rgb: np.ndarray | None = None
+        evidence_eligible = dedicated_lpr or (
+            object_data.get("label") in self.lp_objects
+            or object_data.get("label") == "license_plate"
+        )
+        capture_runtime_evidence = passage_evidence_enabled() and evidence_eligible
+        if capture_runtime_evidence:
+            capture_runtime_evidence = passage_evidence_should_capture(
+                camera,
+                runtime_track_id,
+                current_time,
+            )
+        eligibility_retry = getattr(self, "_active_eligibility_retry", None)
+
+        def save_evidence(
+            stage: str,
+            image: np.ndarray | None = None,
+            image_index: int | None = None,
+            **fields: Any,
+        ) -> None:
+            if not capture_runtime_evidence:
+                return
+            passage_evidence(
+                stage,
+                evidence_id=runtime_evidence_id,
+                camera=camera,
+                frame_time=current_time,
+                track_id=runtime_track_id,
+                trace_id=runtime_trace_id,
+                pipeline="lpr",
+                image=image,
+                image_index=image_index,
+                **fields,
+            )
 
         if not self.config.cameras[camera].lpr.enabled:
+            save_evidence("eligibility_decision", accepted=False, reason="lpr_disabled")
             return
+
+        if capture_runtime_evidence:
+            runtime_rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            save_evidence(
+                "invocation",
+                label=object_data.get("label"),
+                object_score=object_data.get("score"),
+                computed_score=object_data.get("computed_score"),
+                object_box=object_data.get("box"),
+                object_area=object_data.get("area"),
+                position_changes=object_data.get("position_changes"),
+                stationary=object_data.get("stationary"),
+                motionless_count=object_data.get("motionless_count"),
+                dedicated_lpr=dedicated_lpr,
+                eligibility_retry=bool(eligibility_retry),
+            )
+            if eligibility_retry:
+                save_evidence("eligibility_retry_attempted", **eligibility_retry)
+            # Keep the raw-frame stage for invocation completeness, but persist
+            # only the annotated full frame below. Encoding both full-size
+            # images doubled acceptance I/O without adding review evidence.
+            save_evidence("runtime_frame")
+            annotated = runtime_rgb.copy()
+            object_box = object_data.get("box")
+            if object_box:
+                x1, y1, x2, y2 = (int(value) for value in object_box)
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            save_evidence(
+                "runtime_frame_object_box",
+                annotated,
+                object_box=object_box,
+            )
 
         passage_trace(
             "track_seen",
             camera=camera,
             frame_time=current_time,
+            trace_id=runtime_trace_id,
             track_id=None if dedicated_lpr else str(object_data.get("id")),
             object_box=None if dedicated_lpr else object_data.get("box"),
         )
@@ -1302,8 +1455,17 @@ class LicensePlateProcessingMixin:
         # dedicated LPR cam without frigate+
         if dedicated_lpr:
             id = "dedicated-lpr"
+            save_evidence(
+                "eligibility_decision",
+                accepted=True,
+                reason="dedicated_lpr",
+            )
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            rgb = (
+                runtime_rgb
+                if runtime_rgb is not None
+                else cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            )
 
             # apply motion mask
             motion_mask = getattr(
@@ -1319,6 +1481,12 @@ class LicensePlateProcessingMixin:
                 )
 
             yolov9_start = datetime.datetime.now().timestamp()
+            save_evidence(
+                "plate_detector_input",
+                rgb,
+                detection_threshold=self.lpr_config.detection_threshold,
+                dedicated_lpr=True,
+            )
             license_plate = self._detect_license_plate(camera, rgb)
 
             logger.debug(
@@ -1331,6 +1499,12 @@ class LicensePlateProcessingMixin:
 
             if not license_plate:
                 logger.debug(f"{camera}: Detected no license plates in full frame.")
+                save_evidence(
+                    "plate_detector_result",
+                    accepted=False,
+                    reason="no_detection_above_threshold",
+                    detection_threshold=self.lpr_config.detection_threshold,
+                )
                 return
 
             license_plate_area = (license_plate[2] - license_plate[0]) * (
@@ -1338,6 +1512,15 @@ class LicensePlateProcessingMixin:
             )
             if license_plate_area < self.config.cameras[camera].lpr.min_area:
                 logger.debug(f"{camera}: License plate area below minimum threshold.")
+                save_evidence(
+                    "plate_detector_result",
+                    accepted=False,
+                    reason="below_min_area",
+                    detector_box=list(license_plate),
+                    detector_score=getattr(self, "_last_plate_detector_score", None),
+                    detector_area=license_plate_area,
+                    minimum_detector_area=self.config.cameras[camera].lpr.min_area,
+                )
                 return
 
             plate_box = license_plate
@@ -1345,6 +1528,7 @@ class LicensePlateProcessingMixin:
                 "plate_detected",
                 camera=camera,
                 frame_time=current_time,
+                trace_id=runtime_trace_id,
                 track_id=str(id),
                 plate_box=plate_box,
                 object_box=None if dedicated_lpr else object_data.get("box"),
@@ -1354,6 +1538,23 @@ class LicensePlateProcessingMixin:
                 license_plate[1] : license_plate[3],
                 license_plate[0] : license_plate[2],
             ]
+            save_evidence(
+                "plate_detector_result",
+                accepted=True,
+                reason="plate_detected",
+                detector_box=list(license_plate),
+                frame_plate_box=list(plate_box),
+                detector_score=getattr(self, "_last_plate_detector_score", None),
+                detector_area=license_plate_area,
+                minimum_detector_area=self.config.cameras[camera].lpr.min_area,
+            )
+            save_evidence(
+                "plate_crop",
+                license_plate_frame,
+                detector_box=list(license_plate),
+                frame_plate_box=list(plate_box),
+                detector_score=getattr(self, "_last_plate_detector_score", None),
+            )
 
         else:
             id = object_data["id"]
@@ -1366,16 +1567,47 @@ class LicensePlateProcessingMixin:
                 logger.debug(
                     f"{camera}: Not a processing license plate for non car/motorcycle object."
                 )
+                save_evidence(
+                    "eligibility_decision",
+                    accepted=False,
+                    reason="unsupported_object_label",
+                    label=object_data.get("label"),
+                )
                 return
 
-            # A newly initialized track is already a valid passage candidate.
-            # Waiting for position_changes discarded slow/near-stationary vehicles
-            # before the first plate detector call. Stationary timeout below still
-            # bounds repeated scans.
+            if object_data.get("position_changes", 0) == 0 and not object_data.get(
+                "stationary", False
+            ):
+                logger.debug(
+                    f"{camera}: Skipping LPR for non-stationary {object_data['label']} object {id} with no position changes.  (Detected in {self.config.cameras[camera].detect.min_initialized + 1} concurrent frames, threshold to run is {self.config.cameras[camera].detect.min_initialized + 2} frames)"
+                )
+                save_evidence(
+                    "eligibility_decision",
+                    accepted=False,
+                    reason="no_position_changes",
+                    position_changes=object_data.get("position_changes", 0),
+                    stationary=bool(object_data.get("stationary", False)),
+                    min_initialized=self.config.cameras[
+                        camera
+                    ].detect.min_initialized,
+                )
+                return
+
+            save_evidence(
+                "eligibility_decision",
+                accepted=True,
+                reason="eligible",
+                position_changes=object_data.get("position_changes", 0),
+                stationary=bool(object_data.get("stationary", False)),
+            )
+            if eligibility_retry:
+                save_evidence("eligibility_retry_resolved", **eligibility_retry)
+
             passage_trace(
                 "lpr_eligible",
                 camera=camera,
                 frame_time=current_time,
+                trace_id=runtime_trace_id,
                 track_id=str(id),
                 object_box=object_data.get("box"),
             )
@@ -1401,6 +1633,12 @@ class LicensePlateProcessingMixin:
                         )
 
                     if time_since_stationary > self.stationary_scan_duration:
+                        save_evidence(
+                            "eligibility_decision",
+                            accepted=False,
+                            reason="stationary_scan_expired",
+                            time_since_stationary=time_since_stationary,
+                        )
                         return
 
             license_plate = None
@@ -1413,7 +1651,11 @@ class LicensePlateProcessingMixin:
                 if not car_box:
                     return
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                rgb = (
+                    runtime_rgb
+                    if runtime_rgb is not None
+                    else cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                )
 
                 # apply motion mask
                 motion_mask = getattr(
@@ -1423,16 +1665,24 @@ class LicensePlateProcessingMixin:
                     rgb[motion_mask == 0] = [0, 0, 0]
 
                 left, top, right, bottom = car_box
-                width = right - left
-                height = bottom - top
-                left = max(0, int(left - width * 0.05))
-                top = max(0, int(top - height * 0.05))
-                right = min(rgb.shape[1], int(right + width * 0.05))
-                bottom = min(rgb.shape[0], int(bottom + height * 0.10))
                 car = rgb[top:bottom, left:right]
+                save_evidence(
+                    "car_crop",
+                    car,
+                    object_box=car_box,
+                    crop_width=int(car.shape[1]),
+                    crop_height=int(car.shape[0]),
+                )
 
                 # double the size of the car for better box detection
                 car = cv2.resize(car, (int(2 * car.shape[1]), int(2 * car.shape[0])))
+                save_evidence(
+                    "plate_detector_input",
+                    car,
+                    object_box=car_box,
+                    scale=2,
+                    detection_threshold=self.lpr_config.detection_threshold,
+                )
 
                 if WRITE_DEBUG_IMAGES:
                     cv2.imwrite(
@@ -1454,6 +1704,12 @@ class LicensePlateProcessingMixin:
                     logger.debug(
                         f"{camera}: Detected no license plates for car/motorcycle object."
                     )
+                    save_evidence(
+                        "plate_detector_result",
+                        accepted=False,
+                        reason="no_detection_above_threshold",
+                        detection_threshold=self.lpr_config.detection_threshold,
+                    )
                     return
 
                 license_plate_area = max(
@@ -1466,6 +1722,20 @@ class LicensePlateProcessingMixin:
                 # quadruple the value because we've doubled both dimensions of the car
                 if license_plate_area < self.config.cameras[camera].lpr.min_area * 4:
                     logger.debug(f"{camera}: License plate is less than min_area")
+                    save_evidence(
+                        "plate_detector_result",
+                        accepted=False,
+                        reason="below_min_area",
+                        detector_box=list(license_plate),
+                        detector_score=getattr(
+                            self, "_last_plate_detector_score", None
+                        ),
+                        detector_area=license_plate_area,
+                        minimum_detector_area=self.config.cameras[
+                            camera
+                        ].lpr.min_area
+                        * 4,
+                    )
                     return
 
                 # Scale back to original car coordinates and then to frame
@@ -1481,10 +1751,22 @@ class LicensePlateProcessingMixin:
                     left + plate_box_in_car[2],
                     top + plate_box_in_car[3],
                 )
+                save_evidence(
+                    "plate_detector_result",
+                    accepted=True,
+                    reason="plate_detected",
+                    detector_box=list(license_plate),
+                    frame_plate_box=list(plate_box),
+                    detector_score=getattr(self, "_last_plate_detector_score", None),
+                    detector_area=license_plate_area,
+                    minimum_detector_area=self.config.cameras[camera].lpr.min_area
+                    * 4,
+                )
                 passage_trace(
                     "plate_detected",
                     camera=camera,
                     frame_time=current_time,
+                    trace_id=runtime_trace_id,
                     track_id=str(id),
                     plate_box=plate_box,
                     object_box=object_data.get("box"),
@@ -1494,16 +1776,13 @@ class LicensePlateProcessingMixin:
                     license_plate[1] : license_plate[3],
                     license_plate[0] : license_plate[2],
                 ]
-                if license_plate_frame.size:
-                    ph, pw = license_plate_frame.shape[:2]
-                    license_plate_frame = cv2.copyMakeBorder(
-                        license_plate_frame,
-                        int(ph * 0.05),
-                        int(ph * 0.05),
-                        int(pw * 0.10),
-                        int(pw * 0.10),
-                        cv2.BORDER_REPLICATE,
-                    )
+                save_evidence(
+                    "plate_crop",
+                    license_plate_frame,
+                    detector_box=list(license_plate),
+                    frame_plate_box=list(plate_box),
+                    detector_score=getattr(self, "_last_plate_detector_score", None),
+                )
             else:
                 # don't run for object without attributes if this isn't dedicated lpr with frigate+
                 if (
@@ -1511,6 +1790,11 @@ class LicensePlateProcessingMixin:
                     and object_data.get("label") != "license_plate"
                 ):
                     logger.debug(f"{camera}: No attributes to parse.")
+                    save_evidence(
+                        "plate_detector_result",
+                        accepted=False,
+                        reason="no_plate_attributes",
+                    )
                     return
 
                 if object_data.get("label") in self.lp_objects:
@@ -1528,6 +1812,11 @@ class LicensePlateProcessingMixin:
 
                     # no license plates detected in this frame
                     if not license_plate:
+                        save_evidence(
+                            "plate_detector_result",
+                            accepted=False,
+                            reason="no_plate_attributes",
+                        )
                         return
                     detector_score = float(license_plate.get("score", 0.0))
 
@@ -1537,6 +1826,11 @@ class LicensePlateProcessingMixin:
                     detector_score = float(object_data.get("score", 0.0))
 
                 if not isinstance(license_plate, dict):
+                    save_evidence(
+                        "plate_detector_result",
+                        accepted=False,
+                        reason="invalid_plate_attribute",
+                    )
                     return
 
                 license_plate_box = license_plate.get("box")
@@ -1549,6 +1843,15 @@ class LicensePlateProcessingMixin:
                 ):
                     logger.debug(
                         f"{camera}: Area for license plate box {area(license_plate_box)} is less than min_area {self.config.cameras[camera].lpr.min_area}"
+                    )
+                    save_evidence(
+                        "plate_detector_result",
+                        accepted=False,
+                        reason="below_min_area",
+                        detector_box=license_plate_box,
+                        detector_score=detector_score,
+                        detector_area=area(license_plate_box),
+                        minimum_detector_area=self.config.cameras[camera].lpr.min_area,
                     )
                     return
 
@@ -1575,6 +1878,23 @@ class LicensePlateProcessingMixin:
                     int(expanded_box[1]) : int(expanded_box[3]),
                     int(expanded_box[0]) : int(expanded_box[2]),
                 ]
+                save_evidence(
+                    "plate_detector_result",
+                    accepted=True,
+                    reason="plate_attribute",
+                    detector_box=license_plate_box,
+                    frame_plate_box=list(plate_box),
+                    detector_score=detector_score,
+                    detector_area=area(license_plate_box),
+                    minimum_detector_area=self.config.cameras[camera].lpr.min_area,
+                )
+                save_evidence(
+                    "plate_crop",
+                    license_plate_frame,
+                    detector_box=license_plate_box,
+                    frame_plate_box=list(plate_box),
+                    detector_score=detector_score,
+                )
 
         if (
             frame_ref is not None
@@ -1655,6 +1975,13 @@ class LicensePlateProcessingMixin:
                 int(2 * license_plate_frame.shape[0]),
             ),
         )
+        save_evidence(
+            "ocr_plate_input",
+            license_plate_frame,
+            plate_box=list(plate_box),
+            scale=2,
+            recognition_threshold=self.lpr_config.recognition_threshold,
+        )
 
         if WRITE_DEBUG_IMAGES:
             cv2.imwrite(
@@ -1668,7 +1995,15 @@ class LicensePlateProcessingMixin:
         # run detection, returns results sorted by confidence, best first
         start = datetime.datetime.now().timestamp()
         license_plates, confidences, areas = self._process_license_plate(
-            camera, id, license_plate_frame, debug_frame_id
+            camera,
+            id,
+            license_plate_frame,
+            debug_frame_id,
+            (
+                (runtime_evidence_id, current_time, runtime_track_id)
+                if capture_runtime_evidence
+                else None
+            ),
         )
         self.plates_rec_second.update()
         self.plate_rec_speed.update(datetime.datetime.now().timestamp() - start)
@@ -1684,6 +2019,13 @@ class LicensePlateProcessingMixin:
                 )
         else:
             logger.debug(f"{camera}: No text detected")
+            save_evidence(
+                "ocr_result",
+                accepted=False,
+                reason=getattr(self, "_last_ocr_failure_stage", "no_ocr_result"),
+                text_box_count=int(getattr(self, "_last_ocr_text_box_count", 0)),
+                recognition_threshold=self.lpr_config.recognition_threshold,
+            )
             if attempt is not None:
                 self.recognition_lifecycle.complete_attempt(
                     attempt, reason="no_ocr_result"
@@ -1692,6 +2034,7 @@ class LicensePlateProcessingMixin:
                     "recognition_attempt",
                     camera=camera,
                     frame_time=current_time,
+                    trace_id=runtime_trace_id,
                     track_id=str(id),
                     generation=attempt.key.generation,
                     task="lpr",
@@ -1721,6 +2064,7 @@ class LicensePlateProcessingMixin:
                         "recognition_terminal",
                         camera=camera,
                         frame_time=current_time,
+                        trace_id=runtime_trace_id,
                         track_id=str(id),
                         generation=attempt.key.generation,
                         task="lpr",
@@ -1743,10 +2087,27 @@ class LicensePlateProcessingMixin:
             if top_char_confidences
             else 0
         )
+        save_evidence(
+            "ocr_result",
+            accepted=bool(avg_confidence >= self.lpr_config.recognition_threshold),
+            reason=(
+                "accepted"
+                if avg_confidence >= self.lpr_config.recognition_threshold
+                else "below_recognition_threshold"
+            ),
+            plate=top_plate,
+            character_scores=[float(value) for value in top_char_confidences],
+            mean_character_score=float(avg_confidence),
+            text_area=int(top_area),
+            text_box_count=int(getattr(self, "_last_ocr_text_box_count", 0)),
+            recognition_threshold=self.lpr_config.recognition_threshold,
+            plate_box=list(plate_box),
+        )
         passage_trace(
             "ocr_result",
             camera=camera,
             frame_time=current_time,
+            trace_id=runtime_trace_id,
             track_id=str(id),
             plate=top_plate,
             score=avg_confidence,
@@ -1755,9 +2116,228 @@ class LicensePlateProcessingMixin:
             ocr_path=getattr(self, "_last_ocr_path", "paddle_detected_text"),
             ocr_variant=getattr(self, "_last_ocr_variant", None),
         )
-        observation_key = key or LprTrackKey(camera, str(id), 0)
+        # The synchronous realtime processor follows Frigate's upstream LPR
+        # decision and publication logic verbatim. The evidence-aware return
+        # path below is retained only for non-realtime adapters.
         if quality_candidate is None:
+            if avg_confidence < self.lpr_config.recognition_threshold:
+                logger.debug(
+                    f"{camera}: Average character confidence {avg_confidence} is less than recognition_threshold ({self.lpr_config.recognition_threshold})"
+                )
+                return None
+
+            if (
+                dedicated_lpr
+                and "license_plate" not in self.config.cameras[camera].objects.track
+            ):
+                plate_id = None
+
+                for existing_id, data in self.detected_license_plates.items():
+                    if (
+                        data["camera"] == camera
+                        and data["last_seen"] is not None
+                        and current_time - data["last_seen"]
+                        <= self.config.cameras[camera].lpr.expire_time
+                    ):
+                        similarity = JaroWinkler.similarity(data["plate"], top_plate)
+                        if similarity >= self.similarity_threshold:
+                            plate_id = existing_id
+                            logger.debug(
+                                f"{camera}: Matched plate {top_plate} to {data['plate']} (similarity: {similarity:.3f})"
+                            )
+                            break
+                if plate_id is None:
+                    plate_id = self._generate_plate_event(
+                        camera, top_plate, avg_confidence
+                    )
+                    logger.debug(
+                        f"{camera}: New plate event for dedicated LPR camera {plate_id}: {top_plate}"
+                    )
+                else:
+                    logger.debug(
+                        f"{camera}: Matched existing plate event for dedicated LPR camera {plate_id}: {top_plate}"
+                    )
+                    self.detected_license_plates[plate_id]["last_seen"] = current_time
+
+                id = plate_id
+
+            is_new = id not in self.detected_license_plates
+            variant = {
+                "plate": top_plate,
+                "conf": avg_confidence,
+                "char_confidences": top_char_confidences,
+                "area": top_area,
+                "timestamp": current_time,
+            }
+            self.detected_license_plates.setdefault(
+                id, {"plates": [], "camera": camera}
+            )
+            self.detected_license_plates[id]["plates"].append(variant)
+
+            num_variants = self.config.cameras[camera].detect.fps * 5
+            if len(self.detected_license_plates[id]["plates"]) > num_variants:
+                self.detected_license_plates[id]["plates"] = (
+                    self.detected_license_plates[id]["plates"][-num_variants:]
+                )
+
+            plates = self.detected_license_plates[id]["plates"]
+            rep_plate, rep_conf, rep_char_confs, rep_area = self._get_cluster_rep(
+                plates
+            )
+
+            if rep_plate != top_plate:
+                logger.debug(
+                    f"{camera}: Clustering changed top plate '{top_plate}' (conf: {avg_confidence:.3f}) to rep '{rep_plate}' (conf: {rep_conf:.3f})"
+                )
+
+            if len(rep_plate) < self.lpr_config.min_plate_length:
+                logger.debug(
+                    f"{camera}: Filtered out clustered plate '{rep_plate}' due to length ({len(rep_plate)} < {self.lpr_config.min_plate_length})"
+                )
+                return None
+
+            if self.lpr_config.format:
+                try:
+                    if not re.fullmatch(self.lpr_config.format, rep_plate):
+                        logger.debug(
+                            f"{camera}: Filtered out clustered plate '{rep_plate}' due to format mismatch"
+                        )
+                        return None
+                except re.error:
+                    logger.error(
+                        f"{camera}: Invalid regex in LPR format configuration: {self.lpr_config.format}"
+                    )
+
+            self.detected_license_plates[id].update(
+                {
+                    "plate": rep_plate,
+                    "char_confidences": rep_char_confs,
+                    "area": rep_area,
+                    "last_seen": current_time if dedicated_lpr else None,
+                }
+            )
+
+            if not dedicated_lpr:
+                self.detected_license_plates[id]["obj_data"] = obj_data
+
+            if is_new:
+                if camera not in self.camera_current_cars:
+                    self.camera_current_cars[camera] = []
+                self.camera_current_cars[camera].append(id)
+
+            upstream_candidate_id = (
+                f"upstream:{camera}:{id}:{current_time:.6f}:{plate_box}"
+            )
+            published_candidates = getattr(
+                self, "_upstream_published_candidates", None
+            )
+            if published_candidates is None:
+                published_candidates = set()
+                self._upstream_published_candidates = published_candidates
+            if upstream_candidate_id in published_candidates:
+                logger.debug(
+                    "%s: suppressing duplicate upstream LPR candidate %s",
+                    camera,
+                    upstream_candidate_id,
+                )
+                return None
+            published_candidates.add(upstream_candidate_id)
+            if len(published_candidates) > 4096:
+                self._upstream_published_candidates = set(
+                    list(published_candidates)[-2048:]
+                )
+
+            sub_label = None
+            try:
+                sub_label = next(
+                    (
+                        label
+                        for label, plates_list in self.lpr_config.known_plates.items()
+                        if any(
+                            re.match(f"^{plate}$", rep_plate)
+                            or Levenshtein.distance(plate, rep_plate)
+                            <= self.lpr_config.match_distance
+                            for plate in plates_list
+                        )
+                    ),
+                    None,
+                )
+            except re.error:
+                logger.error(
+                    f"{camera}: Invalid regex in known plates configuration: {self.lpr_config.known_plates}"
+                )
+
+            if sub_label is not None:
+                self.sub_label_publisher.publish(
+                    (id, sub_label, rep_conf),
+                    EventMetadataTypeEnum.sub_label.value,
+                )
+
+            self.requestor.send_data(
+                "tracked_object_update",
+                json.dumps(
+                    {
+                        "type": TrackedObjectUpdateTypesEnum.lpr,
+                        "name": sub_label,
+                        "plate": rep_plate,
+                        "score": rep_conf,
+                        "id": id,
+                        "camera": camera,
+                        "timestamp": start,
+                        "plate_box": plate_box,
+                    }
+                ),
+            )
+            self.sub_label_publisher.publish(
+                (id, "recognized_license_plate", rep_plate, rep_conf),
+                EventMetadataTypeEnum.attribute.value,
+            )
+            passage_trace(
+                "event_published",
+                camera=camera,
+                frame_time=current_time,
+                trace_id=runtime_trace_id,
+                passage_id=str(id),
+                track_id=str(id),
+                plate=rep_plate,
+                score=rep_conf,
+                plate_box=plate_box,
+                object_box=None
+                if dedicated_lpr
+                else object_data.get("box"),
+                # The upstream realtime branch still publishes synchronously,
+                # but its event must carry the same immutable lineage contract
+                # as the coordinator path.  Keep the source role explicit so
+                # scorer correlation never treats a missing candidate as a
+                # valid commit.
+                candidate_id=upstream_candidate_id,
+                evidence_id=runtime_evidence_id,
+                frame_ref=f"detect:{camera}:{current_time:.6f}",
+                quality_score=0.0,
+                quality_components={"upstream_realtime": 1.0},
+                source_role="detect",
+            )
+
+            if (
+                dedicated_lpr
+                and "license_plate" not in self.config.cameras[camera].objects.track
+            ):
+                logger.debug(
+                    f"{camera}: Writing snapshot for {id}, {rep_plate}, {current_time}"
+                )
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+                _, encoded_img = cv2.imencode(".jpg", frame_bgr)
+                self.sub_label_publisher.publish(
+                    (
+                        base64.b64encode(encoded_img.tobytes()).decode("ASCII"),
+                        id,
+                        camera,
+                    ),
+                    EventMetadataTypeEnum.save_lpr_snapshot.value,
+                )
             return None
+
+        observation_key = key or LprTrackKey(camera, str(id), 0)
         if attempt is None or not self.recognition_lifecycle.complete_attempt(
             attempt,
             result=top_plate,

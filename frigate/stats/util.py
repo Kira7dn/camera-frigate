@@ -506,9 +506,14 @@ def stats_snapshot(
         }
         stats["embeddings"]["quality_selector"] = {
             "accepted": int(embeddings_metrics.quality_accepted.value),
+            "observed": int(embeddings_metrics.quality_observed.value),
+            "selected": int(embeddings_metrics.quality_selected.value),
             "rejected": int(embeddings_metrics.quality_rejected.value),
             "deduped": int(embeddings_metrics.quality_deduped.value),
             "replaced": int(embeddings_metrics.quality_replaced.value),
+            "diversity_skipped": int(
+                embeddings_metrics.quality_diversity_skipped.value
+            ),
             "top_k_depth": int(embeddings_metrics.quality_top_k_depth.value),
             "reject_reasons": {
                 name: int(metric.value)

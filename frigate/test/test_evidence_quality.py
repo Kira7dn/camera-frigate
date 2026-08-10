@@ -230,6 +230,39 @@ class TestQualitySelector(unittest.TestCase):
         self.ring.close()
         self.assertEqual(self.ring.stats()["cameras"]["cam"]["bytes"], 0)
 
+    def test_temporal_stability_uses_geometry_relative_to_moving_object(self) -> None:
+        first = self.selector.select(
+            task="lpr",
+            camera="cam",
+            track_id="moving",
+            generation=1,
+            frame_ref=self._ref(6),
+            object_bbox=(0, 0, 32, 24),
+            detail_bbox=(4, 8, 28, 22),
+            detail_frame=self.sharp,
+            thresholds=self.thresholds,
+        )
+        second = self.selector.select(
+            task="lpr",
+            camera="cam",
+            track_id="moving",
+            generation=1,
+            frame_ref=self._ref(7),
+            object_bbox=(30, 20, 62, 44),
+            detail_bbox=(34, 28, 58, 42),
+            detail_frame=self.sharp,
+            thresholds=self.thresholds,
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIn("temporal_stability", first.unavailable_metrics)
+        self.assertAlmostEqual(
+            second.quality_components["temporal_stability"], 1.0
+        )
+        first.release()
+        second.release()
+
 
 if __name__ == "__main__":
     unittest.main()

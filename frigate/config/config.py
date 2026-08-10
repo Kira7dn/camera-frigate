@@ -911,15 +911,6 @@ class FrigateConfig(FrigateBaseModel):
                     "least quality.top_k raw I420 detect frames"
                 )
             if (
-                camera_config.face_recognition.enabled
-                and self.face_recognition.min_faces
-                > camera_config.recognition_lifecycle.max_attempts
-            ):
-                raise ValueError(
-                    f"{camera_config.name}.recognition_lifecycle.max_attempts must "
-                    "be greater than or equal to face_recognition.min_faces"
-                )
-            if (
                 camera_config.lpr.enabled
                 and camera_config.recognition_lifecycle.lpr_observation_threshold
                 > self.lpr.recognition_threshold

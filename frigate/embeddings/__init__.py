@@ -24,7 +24,6 @@ from frigate.util.builtin import serialize
 from frigate.util.classification import kickoff_model_training
 from frigate.util.process import FrigateProcess
 
-from .maintainer import EmbeddingMaintainer
 from .util import ZScoreNormalization
 
 logger = logging.getLogger(__name__)
@@ -49,6 +48,11 @@ class EmbeddingProcess(FrigateProcess):
         self.face_result_queue = face_result_queue
 
     def run(self) -> None:
+        # Keep the package importable by leaf model modules. Importing the
+        # maintainer at module load time creates a cycle through
+        # license_plate.model -> embeddings.onnx -> embeddings.
+        from .maintainer import EmbeddingMaintainer
+
         self.pre_run_setup(self.config.logger)
         maintainer = EmbeddingMaintainer(
             self.config,

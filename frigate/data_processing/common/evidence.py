@@ -118,6 +118,20 @@ class EvidenceCandidate:
     def frame(self) -> np.ndarray:
         return self.lease.frame
 
+    @property
+    def image_rank(self) -> tuple[float, float, float, float, int, int, str]:
+        """Deterministic non-probabilistic rank used by rolling top-K."""
+        return (
+            float(self.quality_components.get("hard_quality_pass", 0.0)),
+            float(self.quality_components.get("coverage", 0.0)),
+            float(self.quality_components.get("weakest", 0.0)),
+            float(self.quality_components.get("balance", 0.0)),
+            float(self.quality_components.get("detector_score", 0.0)),
+            max(0, self.detail_bbox[2] - self.detail_bbox[0])
+            * max(0, self.detail_bbox[3] - self.detail_bbox[1]),
+            self.candidate_id,
+        )
+
     def fork(self) -> EvidenceCandidate:
         return EvidenceCandidate(
             candidate_id=self.candidate_id,

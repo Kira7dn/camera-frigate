@@ -225,15 +225,7 @@ class CameraConfig(FrigateBaseModel):
                 "recognition_lifecycle.min_candidate_interval_seconds must not "
                 "exceed quality.buffer.window_seconds"
             )
-        if (
-            lifecycle.candidate_collection_seconds
-            > self.quality.buffer.window_seconds
-        ):
-            raise ValueError(
-                "recognition_lifecycle.candidate_collection_seconds must not "
-                "exceed quality.buffer.window_seconds"
-            )
-        if self.quality.enabled and lifecycle.max_attempts > self.quality.top_k:
+        if lifecycle.max_attempts > self.quality.top_k:
             raise ValueError(
                 "recognition_lifecycle.max_attempts must be less than or equal "
                 "to quality.top_k when quality is enabled"

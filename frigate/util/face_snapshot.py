@@ -112,6 +112,9 @@ class FaceTrackState:
     first_match_monotonic: dict[str, float] = field(default_factory=dict)
     unknown_seen: bool = False
     ambiguous_identity_seen: bool = False
+    outcomes: list[Any] = field(default_factory=list)
+    closing: bool = False
+    close_deadline_monotonic: float = 0.0
 
 
 def parse_face_attempt_filename(filename: str) -> tuple[str, str] | None:

@@ -9,7 +9,10 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from frigate.data_processing.common.evidence import EvidenceCandidate, FrameRef
-from frigate.data_processing.common.recognition import RecognitionAttemptLease
+from frigate.data_processing.common.recognition import (
+    RecognitionAttemptLease,
+    RecognitionOutcome,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +89,7 @@ class PreparedPlateCandidate:
 @dataclass(slots=True)
 class PlateTrackState:
     key: LprTrackKey
-    variants: list[dict[str, Any]] = field(default_factory=list)
+    outcomes: list[RecognitionOutcome] = field(default_factory=list)
     seen_frames: set[float] = field(default_factory=set)
     seen_frame_order: deque[float] = field(default_factory=deque)
     committed_plates: set[str] = field(default_factory=set)

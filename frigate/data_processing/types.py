@@ -39,9 +39,12 @@ class DataProcessorMetrics:
     evidence_misses: ValueProxy[float]
     evidence_camera_stats: Any
     quality_accepted: ValueProxy[float]
+    quality_observed: ValueProxy[float]
+    quality_selected: ValueProxy[float]
     quality_rejected: ValueProxy[float]
     quality_deduped: ValueProxy[float]
     quality_replaced: ValueProxy[float]
+    quality_diversity_skipped: ValueProxy[float]
     quality_top_k_depth: ValueProxy[float]
     quality_reject_counts: dict[str, ValueProxy[float]]
     recognition_lifecycle_stats: Any
@@ -79,9 +82,12 @@ class DataProcessorMetrics:
         self.evidence_misses = manager.Value("d", 0.0)
         self.evidence_camera_stats = manager.dict()
         self.quality_accepted = manager.Value("d", 0.0)
+        self.quality_observed = manager.Value("d", 0.0)
+        self.quality_selected = manager.Value("d", 0.0)
         self.quality_rejected = manager.Value("d", 0.0)
         self.quality_deduped = manager.Value("d", 0.0)
         self.quality_replaced = manager.Value("d", 0.0)
+        self.quality_diversity_skipped = manager.Value("d", 0.0)
         self.quality_top_k_depth = manager.Value("d", 0.0)
         quality_reasons = (
             "detail_width_below_minimum",
@@ -92,6 +98,9 @@ class DataProcessorMetrics:
             "frame_expired",
             "buffer_capacity",
             "top_k_not_selected",
+            "duplicate_candidate",
+            "insufficient_diversity",
+            "passage_frozen",
         )
         self.quality_reject_counts = {
             f"{task}:{reason}": manager.Value("d", 0.0)

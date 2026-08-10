@@ -23,7 +23,11 @@ for _, name, _ in _included_modules:
         # on an arm device with 64 KiB page size.
         plugin_modules.append(importlib.import_module(name))
     except ImportError as e:
-        logger.error(f"Error importing detector runtime: {e}")
+        # Detector backends are optional deployment extras. Their absence must
+        # not make importing config/model utilities look like a runtime error;
+        # create_detector still fails explicitly if a configured backend is not
+        # present in api_types.
+        logger.debug("Detector plugin %s is unavailable: %s", name, e)
 
 
 api_types = {det.type_key: det for det in DetectionApi.__subclasses__()}

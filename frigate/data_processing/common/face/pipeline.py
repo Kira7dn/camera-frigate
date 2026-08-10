@@ -433,6 +433,7 @@ class FaceRecognitionPipeline:
         self._retry_lock = threading.Lock()
         self._retry_candidates: dict[FaceKey, list[FaceCandidate]] = {}
         self._retry_prepared: dict[FaceKey, list[PreparedFaceCandidate]] = {}
+        self._finalized_keys: set[FaceKey] = set()
         self.capture_store = LatestFaceCandidateStore[FaceCaptureRequest](
             on_drop=self._drop_request
         )
@@ -478,17 +479,25 @@ class FaceRecognitionPipeline:
         key = RecognitionKey(
             "face", request.camera, request.event_id, request.generation
         )
-        if self.recognition_lifecycle.is_terminal(key):
+        if request.key in self._finalized_keys or self.recognition_lifecycle.is_terminal(key):
             request.evidence_lease.release()
             self.metrics["terminal_skip"] += 1
             return False
         return self.capture_store.submit(request)
+
+    def finalize(self, key: FaceKey) -> None:
+        """Close passage admission and dispatch its best retained candidate."""
+        with self._retry_lock:
+            self._finalized_keys.add(key)
+        self.retry(key)
 
     def expire(self, key: FaceKey) -> None:
         self.capture_store.remove(key, "track_ended")
         self.candidate_store.remove(key, "track_ended")
         self.prepared_store.remove(key, "track_ended")
         self._release_retry_key(key)
+        with self._retry_lock:
+            self._finalized_keys.discard(key)
 
     def expire_missing(self, camera: str, active_ids: set[str]) -> None:
         self.capture_store.remove_camera_missing(camera, active_ids)
@@ -545,6 +554,19 @@ class FaceRecognitionPipeline:
             keys.update(self._retry_candidates)
             keys.update(self._retry_prepared)
         return len(keys)
+
+    def has_pending(self, key: FaceKey) -> bool:
+        """Return whether this passage still owns queued or active compute."""
+        with self._active_lock:
+            if key in self._active_keys:
+                return True
+        if any(
+            key in store.keys()
+            for store in (self.capture_store, self.candidate_store, self.prepared_store)
+        ):
+            return True
+        with self._retry_lock:
+            return key in self._retry_candidates or key in self._retry_prepared
 
     def stop(self) -> None:
         self._stop.set()
@@ -712,6 +734,13 @@ class FaceRecognitionPipeline:
             for item in batch:
                 candidate = item.candidate
                 request = candidate.request
+                with self._retry_lock:
+                    finalized = item.key in self._finalized_keys
+                if not finalized:
+                    if not self._reserve_prepared_retry(item, request.top_k):
+                        candidate.evidence.release()
+                    self._release(item.key)
+                    continue
                 key = RecognitionKey(
                     "face", request.camera, request.event_id, request.generation
                 )

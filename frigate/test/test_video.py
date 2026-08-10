@@ -1,3 +1,4 @@
+import queue
 import unittest
 
 import cv2
@@ -7,12 +8,64 @@ from norfair.drawing.drawer import Drawer
 
 from frigate.util.image import intersection, transliterate_to_latin
 from frigate.util.object import (
+    get_clipped_object_recovery_region,
     get_cluster_boundary,
     get_cluster_candidates,
     get_cluster_region,
     get_region_from_grid,
+    recovery_detection_supersedes,
     reduce_detections,
 )
+from frigate.video.ffmpeg import put_latest_frame
+
+
+class _Queue:
+    def __init__(self, items=None, full=False):
+        self.items = list(items or [])
+        self.full = full
+
+    def put(self, item, block):
+        if self.full:
+            self.full = False
+            raise queue.Full
+        self.items.append(item)
+
+    def get(self, block):
+        if not self.items:
+            raise queue.Empty
+        return self.items.pop(0)
+
+
+class _FrameManager:
+    def __init__(self):
+        self.closed = []
+        self.deleted = []
+
+    def close(self, name):
+        self.closed.append(name)
+
+    def delete(self, name):
+        self.deleted.append(name)
+
+
+class _Skipped:
+    def __init__(self):
+        self.count = 0
+
+    def update(self):
+        self.count += 1
+
+
+def test_capture_queue_replaces_stale_frame_with_latest() -> None:
+    queue = _Queue([("old", 1.0)], full=True)
+    manager = _FrameManager()
+    skipped = _Skipped()
+
+    put_latest_frame(queue, manager, "new", 2.0, skipped)
+
+    assert queue.items == [("new", 2.0)]
+    assert manager.closed == ["old", "new"]
+    assert skipped.count == 1
 
 
 def draw_box(frame, box, color=(255, 0, 0), thickness=2):
@@ -128,6 +181,116 @@ class TestRegion(unittest.TestCase):
 
         # save_clusters_image("regions", boxes, cluster_candidates, regions)
         assert len(regions) == 2
+
+    def test_clipped_fast_vehicle_gets_expanded_recovery_region(self):
+        # Regression for a vehicle that moved below its predicted detection
+        # region between two 5 FPS frames. Its real lower edge is y=457.
+        detection = (
+            "car",
+            0.7098,
+            (442, 163, 659, 360),
+            42749,
+            1.10,
+            (339, 40, 659, 360),
+        )
+
+        recovery_region = get_clipped_object_recovery_region(
+            (720, 1280), 320, detection
+        )
+
+        assert recovery_region is not None
+        assert recovery_region[0] <= 356
+        assert recovery_region[1] <= 164
+        assert recovery_region[2] >= 656
+        assert recovery_region[3] >= 457
+
+    def test_frame_edge_detection_does_not_schedule_recovery(self):
+        detection = (
+            "car",
+            0.71,
+            (947, 0, 1158, 179),
+            37769,
+            1.18,
+            (900, 0, 1220, 320),
+        )
+
+        assert (
+            get_clipped_object_recovery_region((720, 1280), 320, detection) is None
+        )
+
+    def test_recovery_region_is_bounded_to_frame_height(self):
+        detection = (
+            "car",
+            0.71,
+            (300, 100, 700, 500),
+            160000,
+            1.0,
+            (300, 100, 700, 500),
+        )
+
+        recovery_region = get_clipped_object_recovery_region(
+            (720, 1280), 320, detection
+        )
+
+        assert recovery_region is not None
+        assert recovery_region[2] - recovery_region[0] <= 720
+        assert recovery_region[3] - recovery_region[1] <= 720
+
+    def test_non_vehicle_detection_does_not_schedule_recovery(self):
+        detection = (
+            "person",
+            0.9,
+            (442, 163, 659, 360),
+            42749,
+            1.10,
+            (339, 40, 659, 360),
+        )
+
+        assert (
+            get_clipped_object_recovery_region((720, 1280), 320, detection) is None
+        )
+
+    def test_complete_recovery_supersedes_partial_vehicle_detection(self):
+        partial = (
+            "car",
+            0.5079,
+            (389, 77, 687, 376),
+            89102,
+            1.0,
+            (339, 0, 799, 460),
+        )
+        complete = (
+            "car",
+            0.6699,
+            (289, 207, 616, 523),
+            103332,
+            1.0,
+            (201, 57, 753, 609),
+        )
+
+        assert recovery_detection_supersedes(partial, complete, (720, 1280))
+
+    def test_recovery_does_not_suppress_unrelated_vehicle(self):
+        original = (
+            "car",
+            0.71,
+            (932, 2, 1151, 219),
+            47523,
+            1.0,
+            (900, 0, 1220, 320),
+        )
+        recovered = (
+            "car",
+            0.8,
+            (289, 207, 616, 523),
+            103332,
+            1.0,
+            (201, 57, 753, 609),
+        )
+
+        assert not recovery_detection_supersedes(
+            original, recovered, (720, 1280)
+        )
 
     def test_box_too_small_for_cluster(self):
         boxes = [(100, 100, 600, 600), (655, 100, 700, 145)]

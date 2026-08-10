@@ -152,6 +152,7 @@ class FaceRecognitionPipelineTest(unittest.TestCase):
         self.assertEqual(
             processor._face_exhausted_reason(state), "ambiguous_identity"
         )
+
     def test_keyed_store_is_latest_only_bounded_and_releases_drops(self) -> None:
         dropped = []
         store = LatestFaceCandidateStore[FaceCaptureRequest](

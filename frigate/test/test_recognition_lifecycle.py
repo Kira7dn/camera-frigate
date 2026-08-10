@@ -103,14 +103,20 @@ class RecognitionLifecycleTest(unittest.TestCase):
         self.assertEqual(stats["in_flight"], 0)
         self.assertEqual(stats["pending_cancellations"], 2)
 
-    def test_config_defaults_and_cross_field_vote_validation(self) -> None:
+    def test_config_defaults_and_three_attempt_bound(self) -> None:
         config = RecognitionLifecycleConfig()
         self.assertEqual(config.max_attempts, 3)
         self.assertEqual(config.min_candidate_interval_seconds, 0.4)
         self.assertEqual(config.max_candidate_bbox_iou, 0.90)
         self.assertEqual(config.lpr_min_consensus_votes, 2)
         with self.assertRaises(ValidationError):
-            RecognitionLifecycleConfig(max_attempts=1, lpr_min_consensus_votes=2)
+            RecognitionLifecycleConfig(max_attempts=4)
+        self.assertEqual(
+            RecognitionLifecycleConfig(
+                max_attempts=1, lpr_min_consensus_votes=3
+            ).max_attempts,
+            1,
+        )
 
 
 if __name__ == "__main__":

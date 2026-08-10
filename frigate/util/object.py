@@ -33,6 +33,8 @@ from frigate.util.image import (
 logger = logging.getLogger(__name__)
 
 GRID_SIZE = 8
+CLIPPED_OBJECT_RECOVERY_MULTIPLIER = 2.0
+CLIPPED_OBJECT_RECOVERY_LABELS = {"car", "motorcycle"}
 
 
 def get_camera_regions_grid(
@@ -452,6 +454,53 @@ def get_cluster_region(frame_shape, min_region, cluster, boxes):
     return calculate_region(
         frame_shape, min_x, min_y, max_x, max_y, min_region, multiplier=1.35
     )
+
+
+def get_clipped_object_recovery_region(frame_shape, min_region, detection):
+    """Return a bounded larger region for a truncated vehicle detection."""
+    if detection[0] not in CLIPPED_OBJECT_RECOVERY_LABELS or not clipped(
+        detection, frame_shape
+    ):
+        return None
+
+    box = detection[2]
+    current_region = detection[5]
+    max_region_size = min(frame_shape)
+    current_region_size = current_region[2] - current_region[0]
+    if current_region_size >= max_region_size:
+        return None
+
+    object_size = max(box[2] - box[0], box[3] - box[1])
+    recovery_multiplier = min(
+        CLIPPED_OBJECT_RECOVERY_MULTIPLIER,
+        max_region_size / max(1, object_size),
+    )
+    return calculate_region(
+        frame_shape,
+        box[0],
+        box[1],
+        box[2],
+        box[3],
+        min_region,
+        multiplier=recovery_multiplier,
+    )
+
+
+def recovery_detection_supersedes(original, recovered, frame_shape):
+    """Return whether a recovery result should replace an initial detection."""
+    if (
+        original[0] != recovered[0]
+        or recovered[1] <= original[1]
+        or recovered[3] < original[3]
+        or clipped(recovered, frame_shape)
+    ):
+        return False
+
+    overlap = intersection(original[2], recovered[2])
+    if overlap is None:
+        return False
+
+    return area(overlap) / max(1, min(original[3], recovered[3])) >= 0.3
 
 
 def get_startup_regions(
