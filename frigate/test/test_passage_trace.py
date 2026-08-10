@@ -39,7 +39,7 @@ def test_capture_cutoff_rejects_later_trace_and_evidence(tmp_path, monkeypatch) 
     ]
     evidence_records = [
         json.loads(line)
-        for line in (evidence / "evidence.jsonl").read_text(encoding="utf-8").splitlines()
+        for line in (evidence / "lpr" / "evidence.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert [record["stage"] for record in trace_records] == ["before"]
     assert [record["evidence_id"] for record in evidence_records] == ["before"]
@@ -84,6 +84,8 @@ def test_trace_and_evidence_have_producer_owned_trace_id(tmp_path, monkeypatch) 
 
     trace_record = json.loads(trace.read_text(encoding="utf-8").splitlines()[0])
     assert trace_record["trace_id"] == "lpr:car_camera:vehicle-7"
+    assert trace_record["source_pts"] == 12.5
     assert record is not None
     assert record["trace_id"] == "lpr:car_camera:passage-7"
     assert record["pipeline"] == "lpr"
+    assert record["source_pts"] == 12.5

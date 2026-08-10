@@ -100,6 +100,7 @@ def passage_trace(
         "trace_id": trace_id or _derived_trace_id(stage, camera, frame_time, track_id, generation, fields),
         "camera": camera,
         "frame_time": frame_time,
+        "source_pts": frame_time,
         "trace_time": time.time(),
         "track_id": track_id,
         "generation": generation,
@@ -182,6 +183,7 @@ def passage_evidence(
             "evidence_id": evidence_id,
             "camera": camera,
             "frame_time": frame_time,
+            "source_pts": frame_time,
             "track_id": track_id,
             **fields,
         }
@@ -222,7 +224,11 @@ def passage_evidence(
                     }
                 )
 
-        manifest = root / "evidence.jsonl"
+        # Keep the manifest beside the pipeline trace tree.  The runtime
+        # media root is the canonical evidence root, so there is no staging
+        # directory or later move step.
+        manifest = root / pipeline / "evidence.jsonl"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
         with manifest.open("a", encoding="utf-8") as stream:
             stream.write(
                 json.dumps(record, ensure_ascii=False, separators=(",", ":"))
