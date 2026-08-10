@@ -32,9 +32,6 @@ from frigate.util.object import average_boxes, median_of_boxes
 logger = logging.getLogger(__name__)
 
 STATIC_TRACK_EDGE_MARGIN_RATIO = 0.025
-STATIC_TRACK_MIN_PRIOR_AXIS_MOTION_RATIO = 0.15
-STATIC_TRACK_MIN_REVERSE_AXIS_JUMP_RATIO = 0.5
-STATIC_TRACK_MIN_REVERSE_ACCELERATION = 1.5
 
 
 # Normalizes distance from estimate relative to object size
@@ -130,69 +127,8 @@ def is_opposite_frame_edge_transition(
     )
 
 
-def is_abrupt_motion_reversal(
-    detection: Detection, tracked_object: TrackedObject
-) -> bool:
-    """Reject a large candidate jump against an established static-camera path."""
-    current_data = detection.data or {}
-    if not current_data.get("enforce_static_continuity", False):
-        return False
-
-    last_detection = getattr(tracked_object, "last_detection", None)
-    last_data = getattr(last_detection, "data", None) or {}
-    current_box = current_data.get("box")
-    last_box = last_data.get("box")
-    last_frame_time = last_data.get("frame_time")
-    if not current_box or not last_box or last_frame_time is None:
-        return False
-
-    earlier_detections = [
-        item
-        for item in getattr(tracked_object, "past_detections", ())
-        if (getattr(item, "data", None) or {}).get("frame_time", last_frame_time)
-        < last_frame_time
-    ]
-    if not earlier_detections:
-        return False
-
-    previous_detection = max(
-        earlier_detections,
-        key=lambda item: (item.data or {}).get("frame_time", float("-inf")),
-    )
-    previous_box = (previous_detection.data or {}).get("box")
-    if not previous_box:
-        return False
-
-    def bottom_center(box: Sequence[float]) -> np.ndarray:
-        return np.array([(box[0] + box[2]) / 2.0, box[3]], dtype=float)
-
-    prior_motion = bottom_center(last_box) - bottom_center(previous_box)
-    candidate_motion = bottom_center(current_box) - bottom_center(last_box)
-    last_size = np.array(
-        [last_box[2] - last_box[0], last_box[3] - last_box[1]], dtype=float
-    )
-    if np.any(last_size <= 0):
-        return False
-
-    for axis in range(2):
-        prior = prior_motion[axis]
-        candidate = candidate_motion[axis]
-        if (
-            abs(prior) >= last_size[axis] * STATIC_TRACK_MIN_PRIOR_AXIS_MOTION_RATIO
-            and abs(candidate)
-            >= last_size[axis] * STATIC_TRACK_MIN_REVERSE_AXIS_JUMP_RATIO
-            and abs(candidate) >= abs(prior) * STATIC_TRACK_MIN_REVERSE_ACCELERATION
-            and prior * candidate < 0
-        ):
-            return True
-
-    return False
-
-
 def frigate_distance(detection: Detection, tracked_object: TrackedObject) -> float:
-    if is_opposite_frame_edge_transition(
-        detection, tracked_object
-    ) or is_abrupt_motion_reversal(detection, tracked_object):
+    if is_opposite_frame_edge_transition(detection, tracked_object):
         return float("inf")
 
     return distance(detection.points, tracked_object.estimate)
