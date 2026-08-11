@@ -28,7 +28,10 @@ class RecognitionRuntimeConfig(FrigateBaseModel):
         title="Recognition runtime",
     )
     endpoint: str = Field(default="", title="External recognition endpoint")
-    deadline: float = Field(default=5.0, gt=0, le=60, title="Job deadline")
+    deadline: float = Field(default=5.0, gt=0, le=60, title="RPC deadline")
+    job_deadline: float = Field(
+        default=30.0, gt=0, le=300, title="Accepted observation deadline"
+    )
     observation_capacity: int = Field(default=128, gt=0, le=4096)
     control_capacity: int = Field(default=64, gt=0, le=4096)
     outcome_capacity: int = Field(default=128, gt=0, le=4096)

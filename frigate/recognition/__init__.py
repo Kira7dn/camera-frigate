@@ -23,12 +23,12 @@ from .lpr import LprPolicy
 from .ports import ModelRecognition, RawRecognition
 
 __all__ = [
-    "FacePolicy",
     "EvidenceCaptureRequest",
-    "LprPolicy",
+    "FacePolicy",
     "JobReceipt",
-    "RawRecognition",
+    "LprPolicy",
     "ModelRecognition",
+    "RawRecognition",
     "RecognitionArtifact",
     "RecognitionCore",
     "RecognitionJob",

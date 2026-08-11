@@ -13,9 +13,6 @@ from typing import TYPE_CHECKING, Any, cast
 import cv2
 import numpy as np
 import pyclipper
-from shapely.geometry import Polygon
-
-from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
 from frigate.data_processing.common.face_pipeline import render_recognition_boxes
@@ -32,6 +29,9 @@ from frigate.util.passage_trace import (
     passage_evidence_should_capture,
     passage_trace,
 )
+from shapely.geometry import Polygon
+
+from frigate.config import FrigateConfig
 
 from ...types import DataProcessorMetrics
 from .constants import LPR_EMBEDDING_SIZE

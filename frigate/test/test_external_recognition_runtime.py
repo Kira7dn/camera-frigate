@@ -56,6 +56,7 @@ def config() -> FakeConfig:
     recognition = SimpleNamespace(
         endpoint="recognition:50051",
         deadline=5.0,
+        job_deadline=30.0,
         observation_capacity=8,
         control_capacity=4,
         outcome_capacity=8,

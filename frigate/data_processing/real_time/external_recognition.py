@@ -15,12 +15,9 @@ from typing import Any
 
 import cv2
 import numpy as np
-from rapidfuzz.distance import Levenshtein
-
 from frigate.comms.embeddings_updater import EmbeddingsRequestEnum
 from frigate.comms.event_metadata_updater import EventMetadataPublisher
 from frigate.comms.inter_process import InterProcessRequestor
-from frigate.config import FrigateConfig
 from frigate.const import FACE_DIR
 from frigate.data_processing.common.license_plate.mixin import lpr_camera_eligible
 from frigate.recognition.adapters.frigate import FrigateEventAdapter
@@ -54,6 +51,9 @@ from frigate.util.passage_trace import (
     passage_trace,
     persist_passage_evidence_bundle,
 )
+from rapidfuzz.distance import Levenshtein
+
+from frigate.config import FrigateConfig
 
 from ..types import DataProcessorMetrics
 from .api import RealTimeProcessorApi
@@ -202,7 +202,7 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             "uint8",
             "I420",
             copied.nbytes,
-            int((time.time() + self.config.recognition.deadline + 1) * 1000),
+            int((time.time() + self.config.recognition.job_deadline + 1) * 1000),
         )
         attributes = {
             "label": obj_data.get("label"),
@@ -242,7 +242,7 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             sequence,
             RecognitionOperation.OBSERVE,
             observation,
-            time.monotonic() + self.config.recognition.deadline,
+            time.monotonic() + self.config.recognition.job_deadline,
         )
         receipt = self._client.submit_nowait(job)
         if not receipt.accepted:
