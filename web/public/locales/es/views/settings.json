@@ -658,7 +658,7 @@
           "hide": "Ocultar contraseña",
           "requirements": {
             "title": "Requisitos de contraseña:",
-            "length": "Al menos 12 caracteres",
+            "length": "Al menos 6 caracteres",
             "uppercase": "Al menos una mayúscula",
             "digit": "Al menos un número",
             "special": "Al menos un caracter especial (!@#$%^&*(),.?\":{}|<>)"

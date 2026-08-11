@@ -42,6 +42,7 @@ from .base import FrigateBaseModel
 from .camera import CameraConfig, CameraLiveConfig
 from .camera.audio import AudioConfig, AudioFilterConfig
 from .camera.birdseye import BirdseyeConfig
+from .camera.camera import CameraTypeEnum
 from .camera.detect import DetectConfig
 from .camera.ffmpeg import FfmpegConfig
 from .camera.genai import GenAIConfig, GenAIRoleEnum
@@ -701,6 +702,22 @@ class FrigateConfig(FrigateBaseModel):
                     )
                 role_to_name[role] = name
 
+        # Phase 6 recognition requires a caller-owned stable track ID. The
+        # legacy motion-frame-only dedicated LPR path has no such lifecycle.
+        if self.lpr.enabled:
+            unsupported_lpr_cameras = [
+                name
+                for name, camera in self.cameras.items()
+                if camera.type == CameraTypeEnum.lpr
+                and "license_plate" not in camera.objects.track
+            ]
+            if unsupported_lpr_cameras:
+                raise ValueError(
+                    "Phase 6 LPR requires 'license_plate' in objects.track for "
+                    "dedicated LPR cameras: "
+                    + ", ".join(sorted(unsupported_lpr_cameras))
+                )
+
         # validate semantic_search.model when it is a GenAI provider name
         if (
             self.semantic_search.enabled
@@ -886,47 +903,6 @@ class FrigateConfig(FrigateBaseModel):
                         if isinstance(stream_height, int) and stream_height > 0
                         else DEFAULT_DETECT_DIMENSIONS["height"]
                     )
-
-            # Detect dimensions may have been probed after CameraConfig validation.
-            if (
-                camera_config.quality.enabled
-                and camera_config.quality.buffer.sample_fps > camera_config.detect.fps
-            ):
-                raise ValueError(
-                    f"{camera_config.name}.quality.buffer.sample_fps must be less "
-                    "than or equal to detect.fps"
-                )
-            detect_width = camera_config.detect.width
-            detect_height = camera_config.detect.height
-            if detect_width is None or detect_height is None:
-                raise ValueError(
-                    f"{camera_config.name}.detect dimensions were not resolved"
-                )
-            required_evidence_bytes = (
-                detect_width
-                * detect_height
-                * 3
-                // 2
-                * camera_config.quality.top_k
-            )
-            if (
-                camera_config.quality.enabled
-                and camera_config.quality.buffer.max_bytes < required_evidence_bytes
-            ):
-                raise ValueError(
-                    f"{camera_config.name}.quality.buffer.max_bytes must hold at "
-                    "least quality.top_k raw I420 detect frames"
-                )
-            if (
-                camera_config.lpr.enabled
-                and camera_config.recognition_lifecycle.lpr_observation_threshold
-                > self.lpr.recognition_threshold
-            ):
-                raise ValueError(
-                    f"{camera_config.name}.recognition_lifecycle."
-                    "lpr_observation_threshold must be less than or equal to "
-                    "lpr.recognition_threshold"
-                )
 
             # Warn if detect fps > 10
             if camera_config.detect.fps > 10 and camera_config.type != "lpr":

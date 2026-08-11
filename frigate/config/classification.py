@@ -1,21 +1,17 @@
-import logging
 from enum import Enum
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator
 
 from .base import FrigateBaseModel
 
-logger = logging.getLogger(__name__)
-_MIN_FACES_WARNING_EMITTED = False
-
 __all__ = [
+    "CameraAudioTranscriptionConfig",
     "CameraFaceRecognitionConfig",
     "CameraLicensePlateRecognitionConfig",
-    "CameraAudioTranscriptionConfig",
-    "FaceRecognitionConfig",
-    "SemanticSearchConfig",
     "CameraSemanticSearchConfig",
+    "FaceRecognitionConfig",
     "LicensePlateRecognitionConfig",
+    "SemanticSearchConfig",
 ]
 
 
@@ -287,13 +283,6 @@ class FaceRecognitionConfig(FrigateBaseModel):
         gt=0.0,
         le=1.0,
     )
-    min_identity_margin: float = Field(
-        default=0.10,
-        ge=0.0,
-        le=1.0,
-        title="Minimum identity margin",
-        description="Minimum top-1 minus top-2 raw match-score margin.",
-    )
     min_area: int = Field(
         default=750,
         title="Minimum face area",
@@ -303,9 +292,8 @@ class FaceRecognitionConfig(FrigateBaseModel):
         default=1,
         gt=0,
         le=6,
-        deprecated=True,
         title="Minimum faces",
-        description="Deprecated compatibility key; best valid face result wins.",
+        description="Minimum face recognitions required before applying a sub label.",
     )
     save_attempts: int = Field(
         default=0,
@@ -313,16 +301,6 @@ class FaceRecognitionConfig(FrigateBaseModel):
         title="Save attempts",
         description="Number of face recognition attempts to retain for recent recognition UI.",
     )
-
-    @model_validator(mode="after")
-    def warn_deprecated_min_faces(self) -> "FaceRecognitionConfig":
-        global _MIN_FACES_WARNING_EMITTED
-        if "min_faces" in self.model_fields_set and not _MIN_FACES_WARNING_EMITTED:
-            logger.warning(
-                "face_recognition.min_faces is deprecated and no longer affects runtime"
-            )
-            _MIN_FACES_WARNING_EMITTED = True
-        return self
     blur_confidence_filter: bool = Field(
         default=True,
         title="Blur confidence filter",

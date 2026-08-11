@@ -31,6 +31,7 @@ from frigate.util.image import (
     FrameManager,
     SharedMemoryFrameManager,
 )
+from frigate.util.process import FrigateProcess
 
 
 def ordered_source_frame_time(source_epoch: float, frame_number: int, fps: int) -> float:
@@ -84,7 +85,6 @@ def put_ordered_frame(
 
     frame_manager.close(frame_name)
     return False
-from frigate.util.process import FrigateProcess
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +288,30 @@ class CameraWatchdog(threading.Thread):
         self._last_detect_status: str | None = None
         self._last_record_status: str | None = None
         self._last_status_update_time: float = 0.0
+        self._finite_source_exhausted = False
+
+    def _finite_source_end_path(self) -> str | None:
+        """Return the opt-in acceptance EOF marker for this camera."""
+        source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
+        if not source_start_dir:
+            return None
+        return os.path.join(source_start_dir, f"{self.config.name}.end")
+
+    def _finite_source_has_ended(self) -> bool:
+        """Check whether a direct finite source completed its single pass."""
+        end_path = self._finite_source_end_path()
+        return end_path is not None and os.path.isfile(end_path)
+
+    def _mark_finite_source_exhausted(self, now: float) -> None:
+        """Record a clean finite-source EOF without treating it as a crash."""
+        if not self._finite_source_exhausted:
+            self.logger.info(
+                "%s reached direct source EOF; watchdog restarts are disabled",
+                self.config.name,
+            )
+            self._finite_source_exhausted = True
+        self.camera_fps.value = 0
+        self._send_detect_status("offline", now)
 
     def _send_detect_status(self, status: str, now: float) -> None:
         """Send detect status only if changed or retry_interval has elapsed."""
@@ -472,14 +496,17 @@ class CameraWatchdog(threading.Thread):
             can_restart = time_since_last_restart >= self.sleeptime
 
             if not self.capture_thread.is_alive():
-                self._send_detect_status("offline", now)
-                self.camera_fps.value = 0
-                self.logger.error(
-                    f"Ffmpeg process crashed unexpectedly for {self.config.name}."
-                )
-                if can_restart:
-                    self.reset_capture_thread(terminate=False)
-                    last_restart_time = now
+                if self._finite_source_has_ended():
+                    self._mark_finite_source_exhausted(now)
+                else:
+                    self._send_detect_status("offline", now)
+                    self.camera_fps.value = 0
+                    self.logger.error(
+                        f"Ffmpeg process crashed unexpectedly for {self.config.name}."
+                    )
+                    if can_restart:
+                        self.reset_capture_thread(terminate=False)
+                        last_restart_time = now
             elif self.camera_fps.value >= (self.config.detect.fps + 10):
                 self.fps_overflow_count += 1
 
@@ -509,6 +536,23 @@ class CameraWatchdog(threading.Thread):
 
             for p in self.ffmpeg_other_processes:
                 poll = p["process"].poll()
+
+                # Detect writes the camera EOF marker only after every finite
+                # source frame has been queued. Other roles may finish slightly
+                # before or after detect; once they exit, leave them stopped.
+                if poll is not None and self._finite_source_has_ended():
+                    if not p.get("finite_source_exhausted", False):
+                        for role in p["roles"]:
+                            self.requestor.send_data(
+                                f"{self.config.name}/status/{role}", "offline"
+                            )
+                        self.logger.info(
+                            "%s %s source reached EOF; watchdog restart is disabled",
+                            self.config.name,
+                            "/".join(sorted(p["roles"])),
+                        )
+                        p["finite_source_exhausted"] = True
+                    continue
 
                 if self.config.record.enabled and "record" in p["roles"]:
                     now_utc = datetime.now().astimezone(UTC)
@@ -577,7 +621,7 @@ class CameraWatchdog(threading.Thread):
 
                         for role in p["roles"]:
                             self.requestor.send_data(
-                                f"{self.config.name}/status/{role.value}", "offline"
+                                f"{self.config.name}/status/{role}", "offline"
                             )
 
                         continue
@@ -590,7 +634,7 @@ class CameraWatchdog(threading.Thread):
 
                 for role in p["roles"]:
                     self.requestor.send_data(
-                        f"{self.config.name}/status/{role.value}", "offline"
+                        f"{self.config.name}/status/{role}", "offline"
                     )
 
                 p["logpipe"].dump()

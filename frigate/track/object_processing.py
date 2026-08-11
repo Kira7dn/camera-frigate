@@ -6,6 +6,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
@@ -134,18 +135,80 @@ class TrackedObjectProcessor(threading.Thread):
     def create_camera_state(self, camera: str) -> None:
         """Creates a new camera state."""
 
-        def start(camera: str, obj: TrackedObject, frame_name: str) -> None:
+        def recognition_update(
+            camera: str,
+            obj: TrackedObject,
+            frame_name: str,
+            observed_in_frame: bool,
+        ) -> tuple[str, dict[str, Any]]:
+            """Bind recognition input to the exact tracked-object frame.
+
+            Capture frame names are a bounded ring and may be reused before the
+            embeddings process drains its event subscription. An observed
+            recognition candidate therefore receives a one-shot shared-memory
+            handle. The embeddings consumer owns and deletes that handle after
+            its synchronous recognition call.
+            """
+            data = obj.to_dict()
+            data["observed_in_frame"] = observed_in_frame
+            if not observed_in_frame:
+                return frame_name, data
+
+            camera_config = self.config.cameras[camera]
+            is_face = (
+                data.get("label") == "person"
+                and camera_config.face_recognition.enabled
+            )
+            is_lpr = (
+                data.get("label") in ("car", "motorcycle")
+                and camera_config.lpr.enabled
+            )
+            if not (is_face or is_lpr):
+                return frame_name, data
+
+            source = self.frame_manager.get(
+                frame_name, camera_config.frame_shape_yuv
+            )
+            if source is None:
+                data["observed_in_frame"] = False
+                return frame_name, data
+
+            evidence_name = f"recognition_{camera}_{uuid.uuid4().hex}"
+            evidence_buffer = self.frame_manager.create(evidence_name, source.nbytes)
+            np.ndarray(
+                camera_config.frame_shape_yuv,
+                dtype=np.uint8,
+                buffer=evidence_buffer,
+            )[:] = source
+            self.frame_manager.close(evidence_name)
+            data["_recognition_evidence_owned"] = True
+            return evidence_name, data
+
+        def start(
+            camera: str,
+            obj: TrackedObject,
+            frame_name: str,
+            observed_in_frame: bool,
+        ) -> None:
+            evidence_name, data = recognition_update(
+                camera, obj, frame_name, observed_in_frame
+            )
             self._publish_event_update(
                 (
                     EventTypeEnum.tracked_object,
                     EventStateEnum.start,
                     camera,
-                    frame_name,
-                    obj.to_dict(),
+                    evidence_name,
+                    data,
                 )
             )
 
-        def update(camera: str, obj: TrackedObject, frame_name: str) -> None:
+        def update(
+            camera: str,
+            obj: TrackedObject,
+            frame_name: str,
+            observed_in_frame: bool,
+        ) -> None:
             obj.has_snapshot = self.should_save_snapshot(camera, obj) or (
                 obj.face_snapshot is not None
             )
@@ -158,20 +221,33 @@ class TrackedObjectProcessor(threading.Thread):
             }
             self.dispatcher.publish("events", json.dumps(message), retain=False)
             obj.previous = after
+            evidence_name, data = recognition_update(
+                camera, obj, frame_name, observed_in_frame
+            )
             self._publish_event_update(
                 (
                     EventTypeEnum.tracked_object,
                     EventStateEnum.update,
                     camera,
-                    frame_name,
-                    obj.to_dict(),
+                    evidence_name,
+                    data,
                 )
             )
 
-        def autotrack(camera: str, obj: TrackedObject, frame_name: str) -> None:
+        def autotrack(
+            camera: str,
+            obj: TrackedObject,
+            frame_name: str,
+            observed_in_frame: bool,
+        ) -> None:
             self.ptz_autotracker_thread.ptz_autotracker.autotrack_object(camera, obj)
 
-        def end(camera: str, obj: TrackedObject, frame_name: str) -> None:
+        def end(
+            camera: str,
+            obj: TrackedObject,
+            frame_name: str,
+            observed_in_frame: bool,
+        ) -> None:
             # populate has_snapshot
             obj.has_snapshot = self.should_save_snapshot(camera, obj) or (
                 obj.face_snapshot is not None
@@ -204,7 +280,7 @@ class TrackedObjectProcessor(threading.Thread):
                     EventStateEnum.end,
                     camera,
                     frame_name,
-                    obj.to_dict(),
+                    {**obj.to_dict(), "observed_in_frame": observed_in_frame},
                 )
             )
 
@@ -966,7 +1042,7 @@ class TrackedObjectProcessor(threading.Thread):
                 obj.obj_data["end_time"] = datetime.datetime.now().timestamp()
                 # end callbacks
                 for callback in camera_state.callbacks["end"]:
-                    callback(camera, obj, last_frame_name)
+                    callback(camera, obj, last_frame_name, False)
 
                 # camera activity callbacks
                 for callback in camera_state.callbacks["camera_activity"]:

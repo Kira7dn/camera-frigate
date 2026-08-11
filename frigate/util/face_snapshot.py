@@ -14,13 +14,10 @@ from collections import Counter, OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import cv2
 import numpy as np
-
-if TYPE_CHECKING:
-    from frigate.data_processing.common.face.pipeline import FaceCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +48,7 @@ class FaceVote:
     face_area: int
     candidate_id: str = ""
     quality_score: float = 0.0
-    candidate: FaceCandidate | None = None
+    candidate: object | None = None
 
 
 @dataclass(frozen=True)

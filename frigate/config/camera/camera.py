@@ -34,7 +34,6 @@ from .notification import CameraNotificationConfig
 from .objects import ObjectConfig
 from .onvif import OnvifConfig
 from .profile import CameraProfileConfig
-from .quality import CameraQualityConfig, RecognitionLifecycleConfig
 from .record import RecordConfig
 from .review import ReviewConfig
 from .snapshots import SnapshotsConfig
@@ -117,16 +116,6 @@ class CameraConfig(FrigateBaseModel):
         default_factory=MotionConfig,
         title="Motion detection",
         description="Default motion detection settings for this camera.",
-    )
-    quality: CameraQualityConfig = Field(
-        default_factory=CameraQualityConfig,
-        title="Recognition input quality",
-        description="Bounded detect-frame evidence and shared Face/LPR candidate quality settings.",
-    )
-    recognition_lifecycle: RecognitionLifecycleConfig = Field(
-        default_factory=RecognitionLifecycleConfig,
-        title="Recognition lifecycle",
-        description="Shared bounded retry and candidate diversity policy for Face and LPR.",
     )
     objects: ObjectConfig = Field(
         default_factory=ObjectConfig,
@@ -213,41 +202,6 @@ class CameraConfig(FrigateBaseModel):
     )
 
     _ffmpeg_cmds: list[dict[str, list[str]]] = PrivateAttr()
-
-    @model_validator(mode="after")
-    def validate_quality_contract(self) -> "CameraConfig":
-        lifecycle = self.recognition_lifecycle
-        if (
-            lifecycle.min_candidate_interval_seconds
-            > self.quality.buffer.window_seconds
-        ):
-            raise ValueError(
-                "recognition_lifecycle.min_candidate_interval_seconds must not "
-                "exceed quality.buffer.window_seconds"
-            )
-        if lifecycle.max_attempts > self.quality.top_k:
-            raise ValueError(
-                "recognition_lifecycle.max_attempts must be less than or equal "
-                "to quality.top_k when quality is enabled"
-            )
-        if self.quality.enabled and self.quality.buffer.sample_fps > self.detect.fps:
-            raise ValueError(
-                "quality.buffer.sample_fps must be less than or equal to detect.fps"
-            )
-        if (
-            self.quality.enabled
-            and self.detect.width is not None
-            and self.detect.height is not None
-        ):
-            required = (
-                self.detect.width * self.detect.height * 3 // 2 * self.quality.top_k
-            )
-            if self.quality.buffer.max_bytes < required:
-                raise ValueError(
-                    "quality.buffer.max_bytes must hold at least quality.top_k "
-                    "raw I420 detect frames"
-                )
-        return self
 
     def __init__(self, **config):
         # Set zone colors

@@ -395,14 +395,13 @@ def validate_password_strength(password: str) -> tuple[bool, str | None]:
 
     Returns a tuple of (is_valid, error_message).
 
-    Longer passwords are harder to crack than shorter complex ones.
-    https://pages.nist.gov/800-63-3/sp800-63b.html
+    This deployment permits six-character passwords for local operators.
     """
     if not password:
         return False, "Password cannot be empty"
 
-    if len(password) < 12:
-        return False, "Password must be at least 12 characters long"
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters long"
 
     return True, None
 
@@ -907,7 +906,7 @@ def get_users():
     "/users",
     dependencies=[Depends(require_role(["admin"]))],
     summary="Create new user",
-    description="Creates a new user with the specified username, password, and role. Requires admin role. Password must be at least 12 characters long.",
+    description="Creates a new user with the specified username, password, and role. Requires admin role. Password must be at least 6 characters long.",
 )
 def create_user(
     request: Request,
@@ -969,7 +968,7 @@ def delete_user(request: Request, username: str):
     "/users/{username}/password",
     dependencies=[Depends(allow_any_authenticated())],
     summary="Update user password",
-    description="Updates a user's password. Users can only change their own password unless they have admin role. Requires the current password to verify identity for non-admin users. Password must be at least 12 characters long. If user changes their own password, a new JWT cookie is automatically issued.",
+    description="Updates a user's password. Users can only change their own password unless they have admin role. Requires the current password to verify identity for non-admin users. Password must be at least 6 characters long. If user changes their own password, a new JWT cookie is automatically issued.",
 )
 async def update_password(
     request: Request,

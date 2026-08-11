@@ -1,6 +1,7 @@
 """Opt-in passage funnel trace, disabled unless explicitly configured."""
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -10,11 +11,75 @@ import time
 from pathlib import Path
 from typing import Any
 
+from frigate.recognition.writer import BoundedTraceWriter
+
 _LOCK = threading.Lock()
 _EVIDENCE_LOCK = threading.Lock()
 _EVIDENCE_SEQUENCE = 0
-_EVIDENCE_BYTES = 0
 _EVIDENCE_LAST_CAPTURE: dict[tuple[str, str], float] = {}
+_WRITERS: dict[str, BoundedTraceWriter] = {}
+
+
+def _encode_jpeg(image: Any) -> bytes:
+    import cv2
+
+    ok, encoded = cv2.imencode(
+        ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 92]
+    )
+    if not ok:
+        raise ValueError("jpeg_encode_failed")
+    return encoded.tobytes()
+
+
+def _writer(
+    path: Path, *, images: bool = False, output_dir: Path | None = None
+) -> BoundedTraceWriter:
+    key = str(path.resolve())
+    with _LOCK:
+        writer = _WRITERS.get(key)
+        if writer is None:
+            base = output_dir or path.parent
+            writer = BoundedTraceWriter(
+                base,
+                capacity=int(os.environ.get("PASSAGE_WRITER_QUEUE_CAPACITY", "64")),
+                manifest_name=path.relative_to(base).as_posix(),
+                copy_image=lambda image: image.copy(),
+                encode_jpeg=_encode_jpeg if images else None,
+                max_artifact_bytes=(
+                    int(
+                        os.environ.get(
+                            "PASSAGE_EVIDENCE_MAX_BYTES", "134217728"
+                        )
+                    )
+                    if images
+                    else None
+                ),
+            )
+            _WRITERS[key] = writer
+        return writer
+
+
+def passage_writer_stats() -> dict[str, int]:
+    return {
+        "depth": sum(writer.depth for writer in _WRITERS.values()),
+        "drops": sum(writer.dropped for writer in _WRITERS.values()),
+        "errors": sum(writer.errors for writer in _WRITERS.values()),
+    }
+
+
+def shutdown_passage_writers(timeout: float = 2.0) -> bool:
+    writers = list(_WRITERS.values())
+    if not writers:
+        return True
+    deadline = time.monotonic() + timeout
+    complete = True
+    for writer in writers:
+        complete = writer.close(max(0.0, deadline - time.monotonic())) and complete
+    _WRITERS.clear()
+    return complete
+
+
+atexit.register(shutdown_passage_writers)
 
 
 def _capture_started(frame_time: float | None) -> bool:
@@ -129,8 +194,7 @@ def passage_trace(
         "run_id": os.environ.get("PASSAGE_RUN_ID") or None,
         **fields,
     }
-    with _LOCK, open(path, "a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    _writer(Path(path)).submit(record)
 
 
 def passage_evidence_enabled() -> bool:
@@ -198,9 +262,8 @@ def passage_evidence(
     ):
         return None
 
-    global _EVIDENCE_BYTES, _EVIDENCE_SEQUENCE
+    global _EVIDENCE_SEQUENCE
     root = Path(root_value)
-    max_bytes = int(os.environ.get("PASSAGE_EVIDENCE_MAX_BYTES", "134217728"))
     max_records = int(os.environ.get("PASSAGE_EVIDENCE_MAX_RECORDS", "4096"))
 
     with _EVIDENCE_LOCK:
@@ -227,48 +290,24 @@ def passage_evidence(
         if image_index is not None:
             record["image_index"] = image_index
 
-        root.mkdir(parents=True, exist_ok=True)
+        image_name: str | None = None
         if sequence >= max_records:
             record["artifact_rejected"] = "record_limit"
-        elif image is not None and _EVIDENCE_BYTES >= max_bytes:
-            record["artifact_rejected"] = "byte_limit"
         elif image is not None:
-            import cv2
-
             suffix = f"-{image_index:02d}" if image_index is not None else ""
             safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage)
             safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", trace_id or canonical_trace_id(pipeline, camera, track_id))
             relative = Path(pipeline) / safe_trace / evidence_id / f"{sequence:05d}-{safe_stage}{suffix}.jpg"
-            target = root / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            ok, encoded = cv2.imencode(
-                ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 92]
-            )
-            if not ok:
-                record["artifact_rejected"] = "jpeg_encode_failed"
-            elif _EVIDENCE_BYTES + int(encoded.nbytes) > max_bytes:
-                record["artifact_rejected"] = "byte_limit"
-            else:
-                payload = encoded.tobytes()
-                target.write_bytes(payload)
-                _EVIDENCE_BYTES += len(payload)
-                record.update(
-                    {
-                        "artifact_path": relative.as_posix(),
-                        "artifact_sha256": hashlib.sha256(payload).hexdigest(),
-                        "artifact_bytes": len(payload),
-                        "image_shape": [int(value) for value in image.shape],
-                    }
-                )
+            image_name = relative.as_posix()
+            record["artifact_path"] = image_name
 
-        # Keep the manifest beside the pipeline trace tree.  The runtime
-        # media root is the canonical evidence root, so there is no staging
-        # directory or later move step.
         manifest = root / pipeline / "evidence.jsonl"
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        with manifest.open("a", encoding="utf-8") as stream:
-            stream.write(
-                json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-                + "\n"
-            )
+        writer = _writer(manifest, images=True, output_dir=root)
+        accepted = writer.submit(
+            record,
+            image_name=image_name,
+            image=image if image_name is not None else None,
+        )
+        if not accepted:
+            record["artifact_rejected"] = "writer_queue_full"
         return record

@@ -1,7 +1,10 @@
-"""Handle processing images for face detection and recognition."""
+"""Canonical tracked-object LPR adapter for the standalone recognition core."""
 
+from __future__ import annotations
+
+import json
 import logging
-from dataclasses import dataclass
+import re
 from typing import Any
 
 import numpy as np
@@ -10,9 +13,19 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.data_processing.common.license_plate.mixin import (
     LicensePlateProcessingMixin,
 )
-from frigate.data_processing.common.license_plate.model import (
-    LicensePlateModelRunner,
+from frigate.data_processing.common.license_plate.model import LicensePlateModelRunner
+from frigate.recognition.adapters.frigate import (
+    BorrowedEvidenceResolver,
+    FrigateEventAdapter,
+    FrigateRecognitionAdapter,
 )
+from frigate.recognition.contracts import RecognitionTask
+from frigate.recognition.core import RecognitionCore
+from frigate.recognition.face import FacePolicy
+from frigate.recognition.lpr import LprPolicy
+from frigate.recognition.ports import RawRecognition
+from frigate.util.passage_trace import passage_trace
+from rapidfuzz.distance import Levenshtein
 
 from frigate.config import FrigateConfig
 
@@ -21,22 +34,10 @@ from .api import RealTimeProcessorApi
 
 logger = logging.getLogger(__name__)
 
-PENDING_ELIGIBILITY_MAX_FRAMES = 12
-PENDING_ELIGIBILITY_MAX_SECONDS = 3.0
-
-
-@dataclass
-class PendingLprEligibility:
-    """Canonical Event ownership waiting for an upstream-eligible frame."""
-
-    camera: str
-    object_id: str
-    scheduled_frame_time: float
-    last_attempt_frame_time: float
-    attempts: int = 0
-
 
 class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcessorApi):
+    CONFIG_UPDATE_TOPIC = "config/lpr"
+
     def __init__(
         self,
         config: FrigateConfig,
@@ -44,240 +45,147 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         sub_label_publisher: EventMetadataPublisher,
         metrics: DataProcessorMetrics,
         model_runner: LicensePlateModelRunner,
-        detected_license_plates: dict[str, dict[str, Any]],
-    ):
+        stream_epoch: str = "process",
+    ) -> None:
         self.requestor = requestor
-        self.detected_license_plates = detected_license_plates
         self.model_runner = model_runner
         self.lpr_config = config.lpr
         self.config = config
         self.sub_label_publisher = sub_label_publisher
-        self.camera_current_cars: dict[str, list[str]] = {}
-        self._pending_eligibility: dict[
-            tuple[str, str], PendingLprEligibility
-        ] = {}
-        self._closed_retry_tracks: set[tuple[str, str]] = set()
-        self._active_eligibility_retry: dict[str, Any] | None = None
+        self.stream_epoch = stream_epoch
+        self._recognition_adapters: dict[str, FrigateRecognitionAdapter] = {}
         super().__init__(config, metrics)
 
-    def _pending(self) -> dict[tuple[str, str], PendingLprEligibility]:
-        """Return lazily initialized state for isolated tests using object.__new__."""
-        pending = getattr(self, "_pending_eligibility", None)
-        if pending is None:
-            pending = {}
-            self._pending_eligibility = pending
-        return pending
-
-    def _closed_retries(self) -> set[tuple[str, str]]:
-        closed = getattr(self, "_closed_retry_tracks", None)
-        if closed is None:
-            closed = set()
-            self._closed_retry_tracks = closed
-        return closed
-
-    @staticmethod
-    def _blocked_by_initial_position_gate(obj_data: dict[str, Any]) -> bool:
-        return (
-            obj_data.get("position_changes", 0) == 0
-            and not bool(obj_data.get("stationary", False))
-        )
-
-    def _supports_pending_retry(self, obj_data: dict[str, Any]) -> bool:
-        camera = str(obj_data.get("camera") or "")
-        object_id = str(obj_data.get("id") or "")
-        label = obj_data.get("label")
-        camera_config = getattr(self, "config", None)
-        cameras = getattr(camera_config, "cameras", {})
-        configured = cameras.get(camera) if camera else None
-        return bool(
-            camera
-            and object_id
-            and configured is not None
-            and getattr(getattr(configured, "lpr", None), "enabled", False)
-            and (
-                label in getattr(self, "lp_objects", ())
-                or label == "license_plate"
+    def _known_plate_label(self, plate: str) -> str | None:
+        try:
+            return next(
+                (
+                    label
+                    for label, patterns in self.lpr_config.known_plates.items()
+                    if any(
+                        re.match(f"^{pattern}$", plate)
+                        or Levenshtein.distance(pattern, plate)
+                        <= self.lpr_config.match_distance
+                        for pattern in patterns
+                    )
+                ),
+                None,
             )
-        )
-
-    def _schedule_pending_retry(self, obj_data: dict[str, Any]) -> None:
-        camera = str(obj_data["camera"])
-        object_id = str(obj_data["id"])
-        frame_time = float(obj_data.get("frame_time") or 0.0)
-        key = (camera, object_id)
-        if key in self._pending() or key in self._closed_retries():
-            return
-        self._pending()[key] = PendingLprEligibility(
-            camera=camera,
-            object_id=object_id,
-            scheduled_frame_time=frame_time,
-            last_attempt_frame_time=frame_time,
-        )
-        from frigate.util.passage_trace import passage_trace
-
-        passage_trace(
-            "eligibility_retry_scheduled",
-            camera=camera,
-            frame_time=frame_time,
-            track_id=object_id,
-            object_box=obj_data.get("box"),
-            reason="no_position_changes",
-        )
-
-    def _cancel_pending(
-        self, camera: str, object_id: str, reason: str, frame_time: float | None = None
-    ) -> bool:
-        pending = self._pending().pop((camera, object_id), None)
-        if pending is None:
-            return False
-        from frigate.util.passage_trace import passage_trace
-
-        passage_trace(
-            "eligibility_retry_cancelled",
-            camera=camera,
-            frame_time=frame_time,
-            track_id=object_id,
-            reason=reason,
-            retry_attempts=pending.attempts,
-            scheduled_frame_time=pending.scheduled_frame_time,
-        )
-        return True
-
-    def has_pending_retry(self, camera: str) -> bool:
-        """Return whether a canonical track on this camera is awaiting eligibility."""
-        return any(key_camera == camera for key_camera, _ in self._pending())
-
-    def reset_camera(self, camera: str) -> None:
-        """Cancel retry state when a detection stream starts a new epoch."""
-        for key_camera, object_id in list(self._pending()):
-            if key_camera == camera:
-                self._cancel_pending(camera, object_id, "stream_epoch_reset")
-        self._closed_retry_tracks = {
-            key for key in self._closed_retries() if key[0] != camera
-        }
-
-    def retry_pending_frame(
-        self,
-        camera: str,
-        tracked_objects: list[dict[str, Any]],
-        frame: np.ndarray,
-        frame_time: float,
-    ) -> int:
-        """Retry only canonical-owned tracks using bbox and pixels from one frame."""
-        current_time = float(frame_time)
-        current_by_id = {
-            str(obj["id"]): obj
-            for obj in tracked_objects
-            if obj.get("id") and obj.get("box")
-        }
-        retried = 0
-        for key, pending in list(self._pending().items()):
-            if pending.camera != camera:
-                continue
-            if current_time < pending.scheduled_frame_time - 1.0:
-                self.reset_camera(camera)
-                break
-            if (
-                current_time - pending.scheduled_frame_time
-                > PENDING_ELIGIBILITY_MAX_SECONDS
-                or pending.attempts >= PENDING_ELIGIBILITY_MAX_FRAMES
-            ):
-                self._cancel_pending(
-                    camera, pending.object_id, "retry_budget_exhausted", current_time
-                )
-                self._closed_retries().add(key)
-                continue
-            if current_time <= pending.last_attempt_frame_time:
-                continue
-            obj = current_by_id.get(pending.object_id)
-            if obj is None:
-                continue
-
-            retry_obj = dict(obj)
-            retry_obj["camera"] = camera
-            retry_obj["frame_time"] = current_time
-            pending.last_attempt_frame_time = current_time
-            pending.attempts += 1
-            retry_context = {
-                "scheduled_frame_time": pending.scheduled_frame_time,
-                "retry_frame_time": current_time,
-                "retry_index": pending.attempts,
-                "retry_object_box": retry_obj.get("box"),
-            }
-            from frigate.util.passage_trace import passage_trace
-
-            passage_trace(
-                "eligibility_retry_attempted",
-                camera=camera,
-                frame_time=current_time,
-                track_id=pending.object_id,
-                object_box=retry_obj.get("box"),
-                **retry_context,
+        except re.error:
+            logger.error(
+                "Invalid regex in known plates configuration: %s",
+                self.lpr_config.known_plates,
             )
-            became_eligible = not self._blocked_by_initial_position_gate(retry_obj)
-            if became_eligible:
-                self._pending().pop(key, None)
-                self._closed_retries().add(key)
+            return None
 
-            self._active_eligibility_retry = retry_context
-            try:
-                self.lpr_process(retry_obj, frame, False)
-            finally:
-                self._active_eligibility_retry = None
-            retried += 1
+    def _recognition_adapter(self, camera: str) -> FrigateRecognitionAdapter:
+        adapter = self._recognition_adapters.get(camera)
+        if adapter is not None:
+            return adapter
 
-            if became_eligible:
-                passage_trace(
-                    "eligibility_retry_resolved",
-                    camera=camera,
-                    frame_time=current_time,
-                    track_id=pending.object_id,
-                    object_box=retry_obj.get("box"),
-                    retry_index=pending.attempts,
-                    scheduled_frame_time=pending.scheduled_frame_time,
-                )
-        return retried
+        evidence = BorrowedEvidenceResolver()
+        event_adapter = FrigateEventAdapter(
+            lambda payload: self.requestor.send_data(
+                "tracked_object_update", json.dumps(payload)
+            ),
+            lambda kind, payload: self.sub_label_publisher.publish(payload, kind),
+            known_plate_label=self._known_plate_label,
+        )
+        core = RecognitionCore(
+            self,
+            evidence,
+            LprPolicy(
+                detect_fps=self.config.cameras[camera].detect.fps,
+                recognition_threshold=self.lpr_config.recognition_threshold,
+                min_plate_length=self.lpr_config.min_plate_length,
+                plate_format=self.lpr_config.format,
+            ),
+            FacePolicy(
+                unknown_score=self.config.face_recognition.unknown_score,
+                recognition_threshold=self.config.face_recognition.recognition_threshold,
+                min_faces=self.config.face_recognition.min_faces,
+            ),
+            event_adapter,
+        )
+        adapter = FrigateRecognitionAdapter(core, self.stream_epoch, evidence)
+        self._recognition_adapters[camera] = adapter
+        return adapter
 
-    CONFIG_UPDATE_TOPIC = "config/lpr"
+    @property
+    def recognition_stats(self) -> dict[str, int]:
+        totals = {"sessions": 0, "in_flight": 0, "evidence_pinned": 0}
+        for adapter in self._recognition_adapters.values():
+            for name in totals:
+                totals[name] += adapter.stats[name]
+        return totals
+
+    def recognize(
+        self, task: RecognitionTask, observation, evidence: object
+    ) -> RawRecognition | None:
+        """Run preprocessing, plate detection and OCR for one core observation."""
+        if task is not RecognitionTask.LPR:
+            return None
+        obj_data, frame = evidence
+        result = self.lpr_process(obj_data, frame, False)
+        return result if isinstance(result, RawRecognition) else None
 
     def update_config(self, topic: str, payload: Any) -> None:
-        """Update LPR config at runtime."""
         if topic != self.CONFIG_UPDATE_TOPIC:
             return
-
         previous_min_area = self.config.lpr.min_area
         self.config.lpr = payload
         self.lpr_config = payload
-
         for camera_config in self.config.cameras.values():
             if camera_config.lpr.min_area == previous_min_area:
                 camera_config.lpr.min_area = payload.min_area
-
-        logger.debug("LPR config updated dynamically")
+        for adapter in self._recognition_adapters.values():
+            adapter.shutdown()
+        self._recognition_adapters.clear()
+        logger.debug("LPR config updated and sessions reset")
 
     def process_frame(
         self,
-        obj_data: dict[str, Any],
+        obj_data: dict[str, Any] | str,
         frame: np.ndarray,
         dedicated_lpr: bool = False,
     ) -> None:
-        """Look for license plates in image."""
-        self.lpr_process(obj_data, frame, dedicated_lpr)
-        if dedicated_lpr or not isinstance(obj_data, dict):
+        """Recognize LPR only from canonical caller-owned track IDs."""
+        if dedicated_lpr:
+            logger.error(
+                "Dedicated untracked LPR is not supported by the Phase 6 track contract"
+            )
             return
-        if not self._supports_pending_retry(obj_data):
+        if not isinstance(obj_data, dict) or not obj_data.get("box"):
             return
         camera = str(obj_data["camera"])
-        object_id = str(obj_data["id"])
-        if self._blocked_by_initial_position_gate(obj_data):
-            self._schedule_pending_retry(obj_data)
-        else:
-            self._closed_retries().add((camera, object_id))
-            self._cancel_pending(
-                camera,
-                object_id,
-                "canonical_event_became_eligible",
-                float(obj_data.get("frame_time") or 0.0),
+        frame_time = float(obj_data["frame_time"])
+        track_id = str(obj_data["id"])
+        evidence_ref = f"lpr:{camera}:{track_id}:{frame_time:.6f}"
+        updates = self._recognition_adapter(camera).observe(
+            RecognitionTask.LPR,
+            obj_data,
+            frame_time,
+            evidence_ref,
+            evidence=(obj_data, frame),
+            observed_in_frame=obj_data.get("observed_in_frame"),
+            attributes={"current_attributes": obj_data.get("current_attributes", ())},
+        )
+        for update in updates:
+            if not update.publish:
+                continue
+            passage_trace(
+                "event_published",
+                camera=camera,
+                frame_time=frame_time,
+                track_id=track_id,
+                trace_id=f"lpr:{camera}:{track_id}",
+                plate=update.aggregate_value,
+                score=update.aggregate_score,
+                plate_box=update.detail_bbox,
+                object_box=update.object_bbox,
+                evidence_id=str(update.evidence_ref),
+                frame_ref=str(update.evidence_ref),
+                source_role="detect",
             )
 
     def handle_request(
@@ -286,13 +194,11 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         return None
 
     def expire_object(self, object_id: str, camera: str) -> None:
-        """Expire lpr objects."""
-        self._cancel_pending(camera, object_id, "event_end")
-        self._closed_retries().discard((camera, object_id))
-        self.lpr_expire(object_id, camera)
+        adapter = self._recognition_adapters.get(camera)
+        if adapter is not None:
+            adapter.end_track(camera, object_id, "event_end")
 
     def shutdown(self) -> None:
-        """Cancel retry-only ownership without running recognition."""
-        for camera, object_id in list(self._pending()):
-            self._cancel_pending(camera, object_id, "shutdown")
-        self._closed_retries().clear()
+        for adapter in self._recognition_adapters.values():
+            adapter.shutdown()
+        self._recognition_adapters.clear()

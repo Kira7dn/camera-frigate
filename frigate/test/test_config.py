@@ -8,6 +8,8 @@ from pydantic import ValidationError
 from ruamel.yaml.constructor import DuplicateKeyError
 
 from frigate.config import BirdseyeModeEnum, FrigateConfig
+from frigate.config.camera.camera import CameraConfig
+from frigate.config.classification import FaceRecognitionConfig
 from frigate.const import MODEL_CACHE_DIR
 from frigate.detectors import DetectorTypeEnum
 from frigate.util.builtin import deep_merge
@@ -68,40 +70,31 @@ class TestConfig(unittest.TestCase):
         assert frigate_config.detectors["cpu"].type == DetectorTypeEnum.cpu
         assert frigate_config.detectors["cpu"].model.width == 320
 
-    def test_recognition_lifecycle_defaults(self):
-        frigate_config = FrigateConfig(**self.minimal)
-        lifecycle = frigate_config.cameras["back"].recognition_lifecycle
-        assert lifecycle.max_attempts == 3
-        assert lifecycle.min_candidate_interval_seconds == 0.4
-        assert lifecycle.max_candidate_bbox_iou == 0.90
-        assert lifecycle.lpr_min_consensus_votes == 2
-        assert lifecycle.candidate_collection_seconds == 0.4
-        assert lifecycle.lpr_observation_threshold == 0.55
-        assert frigate_config.face_recognition.min_identity_margin == 0.10
+    def test_master_face_voting_defaults(self):
+        assert FaceRecognitionConfig().min_faces == 1
 
-    def test_recognition_lifecycle_validates_camera_contracts(self):
-        interval = json.loads(json.dumps(self.minimal))
-        interval["cameras"]["back"]["recognition_lifecycle"] = {
-            "min_candidate_interval_seconds": 3.1
-        }
+    def test_removed_recognition_config_fails_closed(self):
+        camera = self.minimal["cameras"]["back"]
         with self.assertRaises(ValidationError):
-            FrigateConfig(**interval)
+            CameraConfig(**camera, recognition_lifecycle={})
 
-        top_k = json.loads(json.dumps(self.minimal))
-        top_k["cameras"]["back"]["quality"] = {"enabled": True, "top_k": 2}
         with self.assertRaises(ValidationError):
-            FrigateConfig(**top_k)
+            CameraConfig(**camera, quality={})
 
-        deprecated_votes = json.loads(json.dumps(self.minimal))
-        deprecated_votes["face_recognition"] = {"enabled": True, "min_faces": 4}
-        deprecated_votes["cameras"]["back"]["face_recognition"] = {"enabled": True}
-        assert FrigateConfig(**deprecated_votes).face_recognition.min_faces == 4
-
-        observation_threshold = json.loads(json.dumps(self.minimal))
-        observation_threshold["lpr"] = {"enabled": True, "recognition_threshold": 0.5}
-        observation_threshold["cameras"]["back"]["lpr"] = {"enabled": True}
         with self.assertRaises(ValidationError):
-            FrigateConfig(**observation_threshold)
+            FaceRecognitionConfig(min_identity_margin=0.1)
+
+        assert FaceRecognitionConfig(min_faces=4).min_faces == 4
+
+    def test_untracked_dedicated_lpr_fails_closed(self):
+        config = json.loads(json.dumps(self.minimal))
+        config["lpr"] = {"enabled": True}
+        config["cameras"]["back"]["type"] = "lpr"
+        config["cameras"]["back"]["objects"] = {"track": ["car"]}
+        with self.assertRaisesRegex(
+            ValidationError, "requires 'license_plate' in objects.track"
+        ):
+            FrigateConfig(**config)
 
     @patch("frigate.detectors.detector_config.load_labels")
     def test_detector_custom_model_path(self, mock_labels):

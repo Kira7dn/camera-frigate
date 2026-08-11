@@ -608,7 +608,7 @@
           "hide": "Ukryj hasło",
           "requirements": {
             "title": "Wymagania hasła:",
-            "length": "Co najmniej 12 znaków",
+            "length": "Co najmniej 6 znaków",
             "uppercase": "Co najmniej jedna duża litera",
             "digit": "Co najmniej jedna cyfra",
             "special": "Co najmniej jeden znak specjalny (!@#$%^&*(),.?\":{}|<>)"

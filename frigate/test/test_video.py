@@ -1,10 +1,11 @@
 import queue
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import cv2
 import numpy as np
-from norfair.drawing.color import Palette
-from norfair.drawing.drawer import Drawer
 
 from frigate.util.image import intersection, transliterate_to_latin
 from frigate.util.object import (
@@ -17,10 +18,57 @@ from frigate.util.object import (
     reduce_detections,
 )
 from frigate.video.ffmpeg import (
+    CameraWatchdog,
     ordered_source_frame_time,
     put_latest_frame,
     put_ordered_frame,
 )
+
+
+class TestFiniteSourceWatchdog(unittest.TestCase):
+    def test_eof_marker_disables_restart_only_for_matching_camera(self):
+        watchdog = CameraWatchdog.__new__(CameraWatchdog)
+        watchdog.config = SimpleNamespace(name="car_camera")
+
+        with self.subTest("feature is opt in"):
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertFalse(watchdog._finite_source_has_ended())
+
+        with self.subTest("different camera marker is ignored"):
+            with self._temporary_directory() as marker_dir:
+                Path(marker_dir, "face_camera.end").write_text(
+                    "1.0\n", encoding="utf-8"
+                )
+                with patch.dict(
+                    "os.environ", {"PASSAGE_SOURCE_START_DIR": marker_dir}
+                ):
+                    self.assertFalse(watchdog._finite_source_has_ended())
+
+        with self.subTest("matching camera marker disables restart"):
+            with self._temporary_directory() as marker_dir:
+                Path(marker_dir, "car_camera.end").write_text(
+                    "1.0\n", encoding="utf-8"
+                )
+                with patch.dict(
+                    "os.environ", {"PASSAGE_SOURCE_START_DIR": marker_dir}
+                ):
+                    self.assertTrue(watchdog._finite_source_has_ended())
+
+    def test_live_camera_without_marker_keeps_normal_watchdog_behavior(self):
+        watchdog = CameraWatchdog.__new__(CameraWatchdog)
+        watchdog.config = SimpleNamespace(name="live_camera")
+
+        with self._temporary_directory() as marker_dir:
+            with patch.dict(
+                "os.environ", {"PASSAGE_SOURCE_START_DIR": marker_dir}
+            ):
+                self.assertFalse(watchdog._finite_source_has_ended())
+
+    @staticmethod
+    def _temporary_directory():
+        from tempfile import TemporaryDirectory
+
+        return TemporaryDirectory()
 
 
 class _Queue:
@@ -99,6 +147,9 @@ def draw_box(frame, box, color=(255, 0, 0), thickness=2):
 
 
 def save_clusters_image(name, boxes, candidates, regions=[]):
+    from norfair.drawing.color import Palette
+    from norfair.drawing.drawer import Drawer
+
     canvas = np.zeros((1000, 2000, 3), np.uint8)
     for cluster in candidates:
         color = Palette.choose_color(np.random.rand())
@@ -127,6 +178,8 @@ def save_clusters_image(name, boxes, candidates, regions=[]):
 
 
 def save_cluster_boundary_image(name, boxes, bounding_boxes):
+    from norfair.drawing.color import Palette
+
     canvas = np.zeros((1000, 2000, 3), np.uint8)
     color = Palette.choose_color(np.random.rand())
     for box in boxes:

@@ -1,13 +1,12 @@
 """Maintain embeddings in SQLite-vec."""
 
 import base64
-import datetime
 import json
 import logging
 import os
 import queue
 import threading
-from collections import deque
+import uuid
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any, cast
@@ -33,33 +32,17 @@ from frigate.comms.recordings_updater import (
 )
 from frigate.comms.review_updater import ReviewDataSubscriber
 from frigate.config import FrigateConfig
-from frigate.config.camera.camera import CameraTypeEnum
 from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
 from frigate.config.classification import ObjectClassificationType
-from frigate.data_processing.common.evidence import (
-    EvidenceBufferPolicy,
-    EvidenceRingBuffer,
-    EvidenceSourceRole,
-    FrameRef,
-)
 from frigate.data_processing.common.license_plate.model import (
     LicensePlateModelRunner,
 )
-from frigate.data_processing.common.license_plate.pipeline import (
-    PlateActivity,
-    PlateCommit,
-)
-from frigate.data_processing.common.quality import QualitySelector
-from frigate.data_processing.common.recognition import RecognitionLifecycle
 from frigate.data_processing.post.api import PostProcessorApi
 from frigate.data_processing.post.audio_transcription import (
     AudioTranscriptionPostProcessor,
-)
-from frigate.data_processing.post.license_plate import (
-    LicensePlatePostProcessor,
 )
 from frigate.data_processing.post.object_descriptions import ObjectDescriptionProcessor
 from frigate.data_processing.post.review_descriptions import ReviewDescriptionProcessor
@@ -82,7 +65,7 @@ from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import serialize
 from frigate.util.file import get_event_thumbnail_bytes
 from frigate.util.image import SharedMemoryFrameManager
-from frigate.util.passage_trace import canonical_trace_id, passage_trace
+from frigate.util.passage_trace import passage_writer_stats, shutdown_passage_writers
 
 from .embeddings import Embeddings
 
@@ -189,23 +172,8 @@ class EmbeddingMaintainer(threading.Thread):
         )
         self.embeddings_responder = EmbeddingsResponder()
         self.frame_manager = SharedMemoryFrameManager()
-        self.evidence_ring = EvidenceRingBuffer(
-            {
-                name: EvidenceBufferPolicy(
-                    window_seconds=camera.quality.buffer.window_seconds,
-                    max_bytes=camera.quality.buffer.max_bytes,
-                    sample_fps=camera.quality.buffer.sample_fps,
-                )
-                for name, camera in self.config.cameras.items()
-            }
-        )
-        self.quality_selector = QualitySelector(self.evidence_ring)
-        self.recognition_lifecycle = RecognitionLifecycle()
+        self._recognition_stream_epoch = uuid.uuid4().hex
         self._custom_processor_types: tuple[type[Any], type[Any]] | None = None
-
-        self.detected_license_plates: dict[str, dict[str, Any]] = {}
-        self._published_lpr_commits: set[str] = set()
-        self._published_lpr_commit_order: deque[str] = deque()
 
         # model runners to share between realtime and post processors
         if self.config.lpr.enabled:
@@ -226,9 +194,7 @@ class EmbeddingMaintainer(threading.Thread):
                     self.requestor,
                     self.event_metadata_publisher,
                     metrics,
-                    self.evidence_ring,
-                    self.quality_selector,
-                    self.recognition_lifecycle,
+                    self._recognition_stream_epoch,
                 )
             )
             logger.debug("FaceRealTimeProcessor initialized successfully")
@@ -250,7 +216,7 @@ class EmbeddingMaintainer(threading.Thread):
                     self.event_metadata_publisher,
                     metrics,
                     lpr_model_runner,
-                    self.detected_license_plates,
+                    self._recognition_stream_epoch,
                 )
             )
 
@@ -286,18 +252,6 @@ class EmbeddingMaintainer(threading.Thread):
                     self.requestor,
                     self.metrics,
                     self.genai_manager,
-                )
-            )
-
-        if self.config.lpr.enabled:
-            self.post_processors.append(
-                LicensePlatePostProcessor(
-                    self.config,
-                    self.requestor,
-                    self.event_metadata_publisher,
-                    metrics,
-                    lpr_model_runner,
-                    self.detected_license_plates,
                 )
             )
 
@@ -379,18 +333,15 @@ class EmbeddingMaintainer(threading.Thread):
             self._process_review_updates()
             self._process_frame_updates()
             self._process_deferred_results()
-            self._cleanup_idle_recognition_ownership()
-            self._sync_quality_metrics()
-            self._expire_dedicated_lpr()
+            self._sync_recognition_metrics()
             self._process_finalized()
             self._process_event_metadata()
 
         # Shutdown deferred processors
         for processor in self.realtime_processors:
             processor.shutdown()
-        self.quality_selector.shutdown()
-        self.recognition_lifecycle.shutdown()
-        self.evidence_ring.close()
+        if not shutdown_passage_writers(2.0):
+            logger.warning("Recognition trace writer did not flush before deadline")
 
         self.config_updater.stop()
         self.enrichment_config_subscriber.stop()
@@ -405,66 +356,23 @@ class EmbeddingMaintainer(threading.Thread):
         self.requestor.stop()
         logger.info("Exiting embeddings maintenance...")
 
-    def _cleanup_idle_recognition_ownership(self) -> None:
-        """Release stale quality leases after all recognition work is idle.
-
-        A terminal lifecycle normally expires its own candidates.  This
-        bounded sweep covers a candidate that was admitted just as its
-        tracker generation disappeared; once no lifecycle or inference owns
-        work, retaining the lease can only pin SHM/evidence indefinitely.
-        """
-        lifecycle = self.recognition_lifecycle.stats()
-        if lifecycle.get("active_lifecycles", 0) or lifecycle.get("in_flight", 0):
-            return
-        if self.quality_selector.stats().get("top_k_depth", 0):
-            self.quality_selector.shutdown()
-
-    def _sync_quality_metrics(self) -> None:
-        ring = self.evidence_ring.stats()
-        camera_snapshot = ring.get("cameras", {})
-        self.metrics.evidence_camera_stats.update(camera_snapshot)
-        for stale_camera in set(self.metrics.evidence_camera_stats.keys()) - set(
-            camera_snapshot
-        ):
-            self.metrics.evidence_camera_stats.pop(stale_camera, None)
-        camera_stats = ring.get("cameras", {}).values()
-        self.metrics.evidence_frames.value = sum(
-            camera.get("frames", 0) for camera in camera_stats
+    def _sync_recognition_metrics(self) -> None:
+        recognition = {"sessions": 0, "in_flight": 0, "evidence_pinned": 0}
+        for processor in self.realtime_processors:
+            stats = getattr(processor, "recognition_stats", None)
+            if stats is None:
+                continue
+            for name in recognition:
+                recognition[name] += int(stats[name])
+        writer = passage_writer_stats()
+        self.metrics.recognition_sessions.value = float(recognition["sessions"])
+        self.metrics.recognition_in_flight.value = float(recognition["in_flight"])
+        self.metrics.recognition_evidence_pinned.value = float(
+            recognition["evidence_pinned"]
         )
-        camera_stats = ring.get("cameras", {}).values()
-        self.metrics.evidence_bytes.value = sum(
-            camera.get("bytes", 0) for camera in camera_stats
-        )
-        camera_stats = ring.get("cameras", {}).values()
-        self.metrics.evidence_pinned.value = sum(
-            camera.get("pinned", 0) for camera in camera_stats
-        )
-        for metric, counter in (
-            ("evidence_time_evictions", "time_evictions"),
-            ("evidence_capacity_evictions", "capacity_evictions"),
-            ("evidence_pinned_capacity_drops", "pinned_capacity_drops"),
-            ("evidence_misses", "misses"),
-        ):
-            getattr(self.metrics, metric).value = float(ring.get(counter, 0))
-
-        quality = self.quality_selector.stats()
-        for metric, counter in (
-            ("quality_accepted", "accepted"),
-            ("quality_observed", "observed"),
-            ("quality_selected", "selected"),
-            ("quality_rejected", "rejected"),
-            ("quality_deduped", "deduped"),
-            ("quality_replaced", "replaced"),
-            ("quality_diversity_skipped", "diversity_skipped"),
-            ("quality_top_k_depth", "top_k_depth"),
-        ):
-            getattr(self.metrics, metric).value = float(quality.get(counter, 0))
-        reject_counts = quality.get("reject_reasons", {})
-        for name, metric in self.metrics.quality_reject_counts.items():
-            metric.value = float(reject_counts.get(name, 0))
-        self.metrics.recognition_lifecycle_stats.update(
-            self.recognition_lifecycle.stats()
-        )
+        self.metrics.recognition_writer_depth.value = float(writer["depth"])
+        self.metrics.recognition_writer_drops.value = float(writer["drops"])
+        self.metrics.recognition_writer_errors.value = float(writer["errors"])
 
     def _check_enrichment_config_updates(self) -> None:
         """Check for enrichment config updates and delegate to processors."""
@@ -614,6 +522,9 @@ class EmbeddingMaintainer(threading.Thread):
             return
 
         source_type, event_type, camera, frame_name, data = update
+        owned_recognition_evidence = bool(
+            data.pop("_recognition_evidence_owned", False)
+        )
 
         logger.debug(
             f"Received update - source_type: {source_type}, camera: {camera}, data label: {data.get('label') if data else 'None'}"
@@ -623,6 +534,8 @@ class EmbeddingMaintainer(threading.Thread):
             logger.debug(
                 f"Skipping update - camera: {camera}, source_type: {source_type}"
             )
+            if owned_recognition_evidence:
+                self.frame_manager.delete(frame_name)
             return
 
         if self.config.semantic_search.enabled and self.embeddings is not None:
@@ -630,6 +543,8 @@ class EmbeddingMaintainer(threading.Thread):
 
         camera_config = self.config.cameras.get(camera)
         if camera_config is None:
+            if owned_recognition_evidence:
+                self.frame_manager.delete(frame_name)
             return
 
         # no need to process updated objects if no processors are active
@@ -637,7 +552,22 @@ class EmbeddingMaintainer(threading.Thread):
             logger.debug(
                 f"No processors active - realtime: {len(self.realtime_processors)}, post: {len(self.post_processors)}"
             )
+            if owned_recognition_evidence:
+                self.frame_manager.delete(frame_name)
             return
+
+        if event_type == EventStateEnum.end:
+            object_id = str(data.get("id", ""))
+            if object_id:
+                for processor in self.realtime_processors:
+                    if isinstance(
+                        processor,
+                        FaceRealTimeProcessor | LicensePlateRealTimeProcessor,
+                    ):
+                        # The canonical tracked-object end owns recognition
+                        # cleanup. The finalized-event subscriber repeats this
+                        # as an idempotent safety net for DB/media processing.
+                        processor.expire_object(object_id, camera)
 
         # Create our own thumbnail based on the bounding box and the frame time
         yuv_frame = None
@@ -647,54 +577,54 @@ class EmbeddingMaintainer(threading.Thread):
             )
         except FileNotFoundError:
             logger.debug(f"Frame {frame_name} not found for camera {camera}")
-            pass
 
         if yuv_frame is None:
             logger.debug(
                 "Unable to process object update because frame is unavailable."
             )
+            if owned_recognition_evidence:
+                self.frame_manager.delete(frame_name)
             return
 
-        logger.debug(
-            f"Processing {len(self.realtime_processors)} realtime processors for object {data.get('id')} (label: {data.get('label')})"
-        )
-        for processor in self.realtime_processors:
-            if isinstance(processor, FaceRealTimeProcessor):
-                # Face keeps its detection-frame evidence path. LPR intentionally
-                # follows upstream here so processing and expiry use the same
-                # canonical tracked-object Event ID.
-                continue
-            if (
-                isinstance(processor, LicensePlateRealTimeProcessor)
-                and event_type == EventStateEnum.end
-            ):
-                # The end callback carries the current frame_name but the
-                # removed object's last frame_time/bbox. Running LPR here would
-                # crop stale coordinates from a different frame. Finalization
-                # expires this Event ID through expire_object() instead.
-                continue
-            logger.debug(f"Calling process_frame on {processor.__class__.__name__}")
-            processor.process_frame(data, yuv_frame)
-
-        for processor in self.post_processors:
-            if isinstance(processor, ObjectDescriptionProcessor):
-                # skip end events — _process_finalized handles them via event_end_subscriber.
-                # processing them here can re-create tracked_events entries after cleanup
-                # when the event_subscriber queue is backlogged behind event_end_subscriber.
-                if event_type == EventStateEnum.end:
+        try:
+            logger.debug(
+                f"Processing {len(self.realtime_processors)} realtime processors for object {data.get('id')} (label: {data.get('label')})"
+            )
+            for processor in self.realtime_processors:
+                if event_type == EventStateEnum.end and isinstance(
+                    processor,
+                    FaceRealTimeProcessor | LicensePlateRealTimeProcessor,
+                ):
+                    # End callbacks carry the current frame but the removed
+                    # object's prior bbox. Cleanup already ran before frame lookup.
                     continue
-
-                processor.process_data(
-                    {
-                        "camera": camera,
-                        "data": data,
-                        "state": "update",
-                        "yuv_frame": yuv_frame,
-                    },
-                    PostProcessDataEnum.tracked_object,
+                logger.debug(
+                    f"Calling process_frame on {processor.__class__.__name__}"
                 )
+                processor.process_frame(data, yuv_frame)
 
-        self.frame_manager.close(frame_name)
+            for processor in self.post_processors:
+                if isinstance(processor, ObjectDescriptionProcessor):
+                    # skip end events — _process_finalized handles them via event_end_subscriber.
+                    # processing them here can re-create tracked_events entries after cleanup
+                    # when the event_subscriber queue is backlogged behind event_end_subscriber.
+                    if event_type == EventStateEnum.end:
+                        continue
+
+                    processor.process_data(
+                        {
+                            "camera": camera,
+                            "data": data,
+                            "state": "update",
+                            "yuv_frame": yuv_frame,
+                        },
+                        PostProcessDataEnum.tracked_object,
+                    )
+        finally:
+            if owned_recognition_evidence:
+                self.frame_manager.delete(frame_name)
+            else:
+                self.frame_manager.close(frame_name)
 
     def _process_finalized(self) -> None:
         """Process the end of an event."""
@@ -738,27 +668,7 @@ class EmbeddingMaintainer(threading.Thread):
 
             # call any defined post processors
             for processor in self.post_processors:
-                if isinstance(processor, LicensePlatePostProcessor):
-                    recordings_available = self.recordings_available_through.get(camera)
-                    if (
-                        recordings_available is not None
-                        and event_id in self.detected_license_plates
-                        and self.config.cameras[camera].type != "lpr"
-                    ):
-                        processor.process_data(
-                            {
-                                "event_id": event_id,
-                                "camera": camera,
-                                "recordings_available": self.recordings_available_through[
-                                    camera
-                                ],
-                                "obj_data": self.detected_license_plates[event_id][
-                                    "obj_data"
-                                ],
-                            },
-                            PostProcessDataEnum.recording,
-                        )
-                elif isinstance(processor, AudioTranscriptionPostProcessor):
+                if isinstance(processor, AudioTranscriptionPostProcessor):
                     continue
                 elif isinstance(processor, SemanticTriggerProcessor):
                     processor.process_data(
@@ -785,30 +695,6 @@ class EmbeddingMaintainer(threading.Thread):
                         {"event_id": event_id, "camera": camera},
                         PostProcessDataEnum.tracked_object,
                     )
-
-            # Realtime LPR state is worker-owned; release the maintainer's
-            # compatibility payload only after post-processors have seen it.
-            self.detected_license_plates.pop(event_id, None)
-
-    def _expire_dedicated_lpr(self) -> None:
-        """Remove plates not seen for longer than expiration timeout for dedicated lpr cameras."""
-        now = datetime.datetime.now().timestamp()
-
-        to_remove = []
-
-        for id, data in self.detected_license_plates.items():
-            last_seen = data.get("last_seen", 0)
-            if not last_seen:
-                continue
-
-            if now - last_seen > self.config.cameras[data["camera"]].lpr.expire_time:
-                to_remove.append(id)
-        for id in to_remove:
-            self.event_metadata_publisher.publish(
-                (id, now),
-                EventMetadataTypeEnum.manual_event_end.value,
-            )
-            self.detected_license_plates.pop(id)
 
     def _process_recordings_updates(self) -> None:
         """Process recordings updates."""
@@ -926,43 +812,13 @@ class EmbeddingMaintainer(threading.Thread):
         if camera_config is None:
             return
 
-        dedicated_lpr_enabled = (
-            camera_config.type == CameraTypeEnum.lpr
-            and "license_plate" not in camera_config.objects.track
-        )
-
         has_enabled_custom = any(
             c.enabled for c in self.config.classification.custom.values()
         )
-        face_processors = [
-            processor
-            for processor in self.realtime_processors
-            if isinstance(processor, FaceRealTimeProcessor)
-        ]
-        lpr_processors = [
-            processor
-            for processor in self.realtime_processors
-            if isinstance(processor, LicensePlateRealTimeProcessor)
-        ]
-        face_enabled = bool(face_processors and camera_config.face_recognition.enabled)
-        pending_lpr_retry = any(
-            processor.has_pending_retry(camera) for processor in lpr_processors
-        )
-        current_objects = tracked_objects or []
-        if face_enabled:
-            active_people = {
-                str(obj.get("id"))
-                for obj in current_objects
-                if obj.get("id") and obj.get("label") == "person"
-            }
-            for processor in face_processors:
-                processor.expire_missing_objects(camera, active_people)
-        if (
-            not dedicated_lpr_enabled
-            and not has_enabled_custom
-            and not face_enabled
-            and not pending_lpr_retry
-        ):
+        # Face recognition is driven only by the canonical tracked-object
+        # callback above. Detection-frame processing was a superseded Phase 5
+        # decision path and must not run in parallel.
+        if not has_enabled_custom:
             # no active features that use this data
             return
 
@@ -980,54 +836,7 @@ class EmbeddingMaintainer(threading.Thread):
             )
             return
 
-        if hasattr(self, "evidence_ring") and face_enabled:
-            evidence_ref = self.evidence_ring.ingest(
-                camera,
-                EvidenceSourceRole.detect,
-                frame_name,
-                float(frame_time),
-                yuv_frame,
-            )
-            if (
-                evidence_ref is None
-                and self.evidence_ring.last_reject_reason(camera) == "buffer_capacity"
-            ):
-                if face_enabled:
-                    self.quality_selector.record_reject("face", "buffer_capacity")
-        else:
-            # Compatibility for isolated processor tests that bypass __init__.
-            evidence_ref = yuv_frame
-
-        owns_evidence = hasattr(self, "evidence_ring")
         for processor in self.realtime_processors:
-            if (
-                pending_lpr_retry
-                and isinstance(processor, LicensePlateRealTimeProcessor)
-            ):
-                processor.retry_pending_frame(
-                    camera, current_objects, yuv_frame, float(frame_time)
-                )
-
-            if face_enabled and isinstance(processor, FaceRealTimeProcessor):
-                people = [
-                    obj
-                    for obj in current_objects
-                    if obj.get("label") == "person" and obj.get("box")
-                ]
-                people.sort(key=lambda obj: int(obj.get("area", 0)), reverse=True)
-                for obj in people[:4]:
-                    if owns_evidence and evidence_ref is not None:
-                        processor.submit_frame(obj, cast(FrameRef, evidence_ref))
-                    else:
-                        processor.process_frame(obj, yuv_frame)
-
-            if (
-                dedicated_lpr_enabled
-                and len(motion_boxes) > 0
-                and isinstance(processor, LicensePlateRealTimeProcessor)
-            ):
-                processor.process_frame(camera, yuv_frame, True)
-
             custom_processor_types = getattr(self, "_custom_processor_types", None)
             if (
                 custom_processor_types is not None
@@ -1045,17 +854,6 @@ class EmbeddingMaintainer(threading.Thread):
             results = processor.drain_results()
 
             for result in results:
-                if isinstance(result, PlateActivity):
-                    state = self.detected_license_plates.get(result.event_id)
-                    if (
-                        state is not None
-                        and state.get("generation") == result.key.generation
-                    ):
-                        state["last_seen"] = result.frame_time
-                    continue
-                if isinstance(result, PlateCommit):
-                    self._publish_lpr_commit(result)
-                    continue
                 if result.get("type") == "face_snapshot":
                     payload = {
                         key: result[key]
@@ -1138,102 +936,6 @@ class EmbeddingMaintainer(threading.Thread):
                                 }
                             ),
                         )
-
-    def _publish_lpr_commit(self, commit: PlateCommit) -> None:
-        """Publish a worker decision once from the maintainer-owned IPC path."""
-        if commit.commit_id in self._published_lpr_commits:
-            return
-        self._published_lpr_commits.add(commit.commit_id)
-        self._published_lpr_commit_order.append(commit.commit_id)
-        while len(self._published_lpr_commit_order) > 4096:
-            expired = self._published_lpr_commit_order.popleft()
-            self._published_lpr_commits.discard(expired)
-
-        if commit.dedicated_lpr and commit.event_id not in self.detected_license_plates:
-            self.event_metadata_publisher.publish(
-                (
-                    commit.frame_time,
-                    commit.camera,
-                    "license_plate",
-                    commit.event_id,
-                    True,
-                    commit.score,
-                    None,
-                    commit.plate,
-                ),
-                EventMetadataTypeEnum.lpr_event_create.value,
-            )
-
-        self.detected_license_plates[commit.event_id] = {
-            "camera": commit.camera,
-            "plate": commit.plate,
-            "plates": [],
-            "last_seen": commit.frame_time if commit.dedicated_lpr else None,
-            "obj_data": commit.obj_data,
-            "generation": commit.key.generation,
-            "commit_id": commit.commit_id,
-        }
-        if commit.sub_label is not None:
-            self.event_metadata_publisher.publish(
-                (commit.event_id, commit.sub_label, commit.score),
-                EventMetadataTypeEnum.sub_label.value,
-            )
-        self.requestor.send_data(
-            "tracked_object_update",
-            json.dumps(
-                {
-                    "type": TrackedObjectUpdateTypesEnum.lpr,
-                    "name": commit.sub_label,
-                    "plate": commit.plate,
-                    "score": commit.score,
-                    "id": commit.event_id,
-                    "camera": commit.camera,
-                    "timestamp": commit.timestamp,
-                    "frame_time": commit.frame_time,
-                    "plate_box": commit.plate_box,
-                    "object_box": commit.object_box,
-                    "frame_ref": commit.frame_ref,
-                    "frame_width": commit.frame_width,
-                    "frame_height": commit.frame_height,
-                    "evidence_id": commit.evidence_id,
-                }
-            ),
-        )
-        self.event_metadata_publisher.publish(
-            (commit.event_id, "recognized_license_plate", commit.plate, commit.score),
-            EventMetadataTypeEnum.attribute.value,
-        )
-        if commit.snapshot is not None:
-            self.event_metadata_publisher.publish(
-                (commit.snapshot, commit.event_id, commit.camera),
-                EventMetadataTypeEnum.save_lpr_snapshot.value,
-            )
-        passage_trace(
-            "event_published",
-            camera=commit.camera,
-            frame_time=commit.frame_time,
-            trace_id=canonical_trace_id(
-                "lpr", commit.camera, commit.key.passage_id
-            ),
-            passage_id=commit.key.passage_id,
-            track_id=commit.event_id,
-            vehicle_track_id=(commit.obj_data or {}).get(
-                "_recognition_vehicle_track_id"
-            ),
-            plate_track_ids=list(
-                (commit.obj_data or {}).get("_recognition_plate_track_ids", ())
-            ),
-            plate=commit.plate,
-            score=commit.score,
-            plate_box=commit.plate_box,
-            object_box=commit.object_box,
-            evidence_id=commit.evidence_id,
-            frame_ref=commit.frame_ref,
-            candidate_id=commit.candidate_id,
-            source_role=commit.source_role,
-            quality_score=commit.quality_score,
-            quality_components=commit.quality_components,
-        )
 
     def _embed_thumbnail(self, event_id: str, thumbnail: bytes) -> None:
         """Embed the thumbnail for an event."""

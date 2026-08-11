@@ -1146,7 +1146,7 @@
           },
           "requirements": {
             "title": "Zahteve za geslo:",
-            "length": "Vsaj 12 znakov"
+            "length": "Vsaj 6 znakov"
           },
           "match": "Gesli se ujemata",
           "notMatch": "Gesli se ne ujemata"

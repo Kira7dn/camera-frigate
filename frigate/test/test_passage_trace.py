@@ -129,3 +129,41 @@ def test_trace_and_evidence_have_producer_owned_trace_id(tmp_path, monkeypatch) 
     assert record["trace_id"] == "lpr:car_camera:passage-7"
     assert record["pipeline"] == "lpr"
     assert record["source_pts"] == 12.5
+
+
+def test_evidence_budget_counts_encoded_bytes_not_raw_frames(
+    tmp_path, monkeypatch
+) -> None:
+    class LargeRawImage:
+        nbytes = 1024
+        shape = (16, 16, 3)
+
+        def copy(self):
+            return self
+
+    evidence = tmp_path / "evidence"
+    monkeypatch.setenv("PASSAGE_EVIDENCE_DIR", str(evidence))
+    monkeypatch.setenv("PASSAGE_EVIDENCE_MAX_BYTES", "5")
+    monkeypatch.delenv("PASSAGE_CAPTURE_CUTOFF_PATH", raising=False)
+    monkeypatch.setattr(passage_trace_module, "_encode_jpeg", lambda _image: b"1234")
+
+    for index in range(2):
+        passage_evidence(
+            "runtime_frame_object_box",
+            evidence_id=f"track-{index}-shot",
+            camera="car_camera",
+            frame_time=10.0 + index,
+            track_id=f"track-{index}",
+            image=LargeRawImage(),
+        )
+    assert passage_trace_module.shutdown_passage_writers(1)
+
+    records = [
+        json.loads(line)
+        for line in (evidence / "lpr" / "evidence.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert records[0]["artifact_bytes"] == 4
+    assert records[1]["artifact_rejected"] == "byte_limit"
+    assert (evidence / records[0]["artifact_path"]).read_bytes() == b"1234"
