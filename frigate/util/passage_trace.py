@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import atexit
+import contextvars
 import hashlib
 import json
 import os
 import re
 import threading
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,9 @@ _EVIDENCE_LOCK = threading.Lock()
 _EVIDENCE_SEQUENCE = 0
 _EVIDENCE_LAST_CAPTURE: dict[tuple[str, str], float] = {}
 _WRITERS: dict[str, BoundedTraceWriter] = {}
+_EVIDENCE_COLLECTOR: contextvars.ContextVar[
+    Callable[[dict[str, Any], Any | None], None] | None
+] = contextvars.ContextVar("passage_evidence_collector", default=None)
 
 
 def _encode_jpeg(image: Any) -> bytes:
@@ -199,7 +205,23 @@ def passage_trace(
 
 def passage_evidence_enabled() -> bool:
     """Return whether opt-in runtime image evidence is enabled."""
-    return bool(os.environ.get("PASSAGE_EVIDENCE_DIR"))
+    return bool(os.environ.get("PASSAGE_EVIDENCE_DIR")) or evidence_collector_active()
+
+
+def evidence_collector_active() -> bool:
+    return _EVIDENCE_COLLECTOR.get() is not None
+
+
+@contextmanager
+def capture_passage_evidence(
+    collector: Callable[[dict[str, Any], Any | None], None],
+) -> Iterator[None]:
+    """Capture evidence at its source without granting filesystem ownership."""
+    token = _EVIDENCE_COLLECTOR.set(collector)
+    try:
+        yield
+    finally:
+        _EVIDENCE_COLLECTOR.reset(token)
 
 
 def passage_evidence_should_capture(
@@ -255,15 +277,13 @@ def passage_evidence(
 ) -> dict[str, Any] | None:
     """Persist bounded acceptance-only LPR evidence and its integrity metadata."""
     root_value = os.environ.get("PASSAGE_EVIDENCE_DIR")
-    if (
-        not root_value
-        or not _capture_started(frame_time)
-        or _past_capture_cutoff(frame_time)
-    ):
+    collector = _EVIDENCE_COLLECTOR.get()
+    if (not root_value and collector is None) or not _capture_started(
+        frame_time
+    ) or _past_capture_cutoff(frame_time):
         return None
 
     global _EVIDENCE_SEQUENCE
-    root = Path(root_value)
     max_records = int(os.environ.get("PASSAGE_EVIDENCE_MAX_RECORDS", "4096"))
 
     with _EVIDENCE_LOCK:
@@ -301,6 +321,12 @@ def passage_evidence(
             image_name = relative.as_posix()
             record["artifact_path"] = image_name
 
+        if collector is not None:
+            collector(dict(record), image)
+        if not root_value:
+            return record
+
+        root = Path(root_value)
         manifest = root / pipeline / "evidence.jsonl"
         writer = _writer(manifest, images=True, output_dir=root)
         accepted = writer.submit(
@@ -311,3 +337,58 @@ def passage_evidence(
         if not accepted:
             record["artifact_rejected"] = "writer_queue_full"
         return record
+
+
+def persist_passage_evidence_bundle(artifacts: tuple[Any, ...]) -> bool:
+    """Queue one source-produced artifact bundle without reconstructing images."""
+    root_value = os.environ.get("PASSAGE_EVIDENCE_DIR")
+    if not artifacts:
+        return True
+    if not root_value:
+        return False
+    pipelines = {str(item.pipeline) for item in artifacts}
+    if len(pipelines) != 1:
+        return False
+    pipeline = pipelines.pop()
+    root = Path(root_value)
+    entries = []
+    for item in artifacts:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", str(item.evidence_id)):
+            return False
+        record = {
+            "sequence": int(item.sequence),
+            "stage": str(item.stage),
+            "pipeline": pipeline,
+            "trace_id": str(item.trace_id),
+            "evidence_id": str(item.evidence_id),
+            "camera": str(item.camera),
+            "frame_time": item.frame_time,
+            "track_id": item.track_id,
+            **dict(item.metadata),
+        }
+        if item.image_index is not None:
+            record["image_index"] = int(item.image_index)
+        record.pop("artifact_path", None)
+        image_name = None
+        encoded = None
+        if item.image_jpeg:
+            suffix = (
+                f"-{int(item.image_index):02d}"
+                if item.image_index is not None
+                else ""
+            )
+            safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item.stage))
+            safe_trace = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item.trace_id))
+            image_name = (
+                Path(pipeline)
+                / safe_trace
+                / str(item.evidence_id)
+                / f"{int(item.sequence):05d}-{safe_stage}{suffix}.jpg"
+            ).as_posix()
+            record["artifact_path"] = image_name
+            encoded = bytes(item.image_jpeg)
+        entries.append((record, image_name, encoded, tuple(item.image_shape)))
+
+    manifest = root / pipeline / "evidence.jsonl"
+    writer = _writer(manifest, images=True, output_dir=root)
+    return writer.submit_encoded_batch(entries)

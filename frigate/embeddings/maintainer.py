@@ -37,6 +37,7 @@ from frigate.config.camera.updater import (
     CameraConfigUpdateSubscriber,
 )
 from frigate.config.classification import ObjectClassificationType
+from frigate.config.recognition import RecognitionRuntimeEnum
 from frigate.data_processing.common.license_plate.model import (
     LicensePlateModelRunner,
 )
@@ -48,6 +49,9 @@ from frigate.data_processing.post.object_descriptions import ObjectDescriptionPr
 from frigate.data_processing.post.review_descriptions import ReviewDescriptionProcessor
 from frigate.data_processing.post.semantic_trigger import SemanticTriggerProcessor
 from frigate.data_processing.real_time.api import RealTimeProcessorApi
+from frigate.data_processing.real_time.external_recognition import (
+    ExternalRecognitionProcessor,
+)
 from frigate.data_processing.real_time.face import FaceRealTimeProcessor
 from frigate.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
@@ -175,8 +179,12 @@ class EmbeddingMaintainer(threading.Thread):
         self._recognition_stream_epoch = uuid.uuid4().hex
         self._custom_processor_types: tuple[type[Any], type[Any]] | None = None
 
+        external_recognition = (
+            self.config.recognition.runtime is RecognitionRuntimeEnum.EXTERNAL
+        )
+
         # model runners to share between realtime and post processors
-        if self.config.lpr.enabled:
+        if self.config.lpr.enabled and not external_recognition:
             lpr_model_runner = LicensePlateModelRunner(
                 self.requestor,
                 device=self.config.lpr.device or "CPU",
@@ -186,7 +194,22 @@ class EmbeddingMaintainer(threading.Thread):
         # realtime processors
         self.realtime_processors: list[RealTimeProcessorApi] = []
 
-        if self.config.face_recognition.enabled:
+        if external_recognition and (
+            self.config.face_recognition.enabled or self.config.lpr.enabled
+        ):
+            logger.info(
+                "External recognition enabled; local Face and LPR models are disabled"
+            )
+            self.realtime_processors.append(
+                ExternalRecognitionProcessor(
+                    self.config,
+                    self.requestor,
+                    self.event_metadata_publisher,
+                    metrics,
+                    self._recognition_stream_epoch,
+                )
+            )
+        elif self.config.face_recognition.enabled:
             logger.debug("Face recognition enabled, initializing FaceRealTimeProcessor")
             self.realtime_processors.append(
                 FaceRealTimeProcessor(
@@ -208,7 +231,7 @@ class EmbeddingMaintainer(threading.Thread):
                 )
             )
 
-        if self.config.lpr.enabled:
+        if self.config.lpr.enabled and not external_recognition:
             self.realtime_processors.append(
                 LicensePlateRealTimeProcessor(
                     self.config,
@@ -357,18 +380,34 @@ class EmbeddingMaintainer(threading.Thread):
         logger.info("Exiting embeddings maintenance...")
 
     def _sync_recognition_metrics(self) -> None:
-        recognition = {"sessions": 0, "in_flight": 0, "evidence_pinned": 0}
+        recognition = {
+            "sessions": 0,
+            "in_flight": 0,
+            "evidence_pinned": 0,
+            "queue_depth": 0,
+            "outcome_depth": 0,
+            "rejected": 0,
+            "service_healthy": 0,
+        }
         for processor in self.realtime_processors:
             stats = getattr(processor, "recognition_stats", None)
             if stats is None:
                 continue
             for name in recognition:
-                recognition[name] += int(stats[name])
+                recognition[name] += int(stats.get(name, 0))
         writer = passage_writer_stats()
         self.metrics.recognition_sessions.value = float(recognition["sessions"])
         self.metrics.recognition_in_flight.value = float(recognition["in_flight"])
         self.metrics.recognition_evidence_pinned.value = float(
             recognition["evidence_pinned"]
+        )
+        self.metrics.recognition_queue_depth.value = float(recognition["queue_depth"])
+        self.metrics.recognition_outcome_depth.value = float(
+            recognition["outcome_depth"]
+        )
+        self.metrics.recognition_rejected.value = float(recognition["rejected"])
+        self.metrics.recognition_service_healthy.value = float(
+            recognition["service_healthy"]
         )
         self.metrics.recognition_writer_depth.value = float(writer["depth"])
         self.metrics.recognition_writer_drops.value = float(writer["drops"])
@@ -562,7 +601,9 @@ class EmbeddingMaintainer(threading.Thread):
                 for processor in self.realtime_processors:
                     if isinstance(
                         processor,
-                        FaceRealTimeProcessor | LicensePlateRealTimeProcessor,
+                        FaceRealTimeProcessor
+                        | LicensePlateRealTimeProcessor
+                        | ExternalRecognitionProcessor,
                     ):
                         # The canonical tracked-object end owns recognition
                         # cleanup. The finalized-event subscriber repeats this
@@ -593,7 +634,9 @@ class EmbeddingMaintainer(threading.Thread):
             for processor in self.realtime_processors:
                 if event_type == EventStateEnum.end and isinstance(
                     processor,
-                    FaceRealTimeProcessor | LicensePlateRealTimeProcessor,
+                    FaceRealTimeProcessor
+                    | LicensePlateRealTimeProcessor
+                    | ExternalRecognitionProcessor,
                 ):
                     # End callbacks carry the current frame but the removed
                     # object's prior bbox. Cleanup already ran before frame lookup.
@@ -816,8 +859,8 @@ class EmbeddingMaintainer(threading.Thread):
             c.enabled for c in self.config.classification.custom.values()
         )
         # Face recognition is driven only by the canonical tracked-object
-        # callback above. Detection-frame processing was a superseded Phase 5
-        # decision path and must not run in parallel.
+        # callback above. Detection-frame decision processing is superseded
+        # and must not run in parallel.
         if not has_enabled_custom:
             # no active features that use this data
             return

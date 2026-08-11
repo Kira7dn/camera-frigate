@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
-from .contracts import RecognitionTask, RecognitionUpdate, TrackedObservation, TrackKey
+from collections.abc import Callable
+
+from .contracts import (
+    RecognitionArtifact,
+    RecognitionTask,
+    RecognitionUpdate,
+    TrackedObservation,
+    TrackKey,
+)
 from .face import FaceEngine, FacePolicy
 from .lpr import LprEngine, LprPolicy
-from .ports import EvidenceResolver, RecognitionModel, RecognitionObserver
+from .ports import (
+    EvidenceResolver,
+    ModelRecognition,
+    RecognitionModel,
+    RecognitionObserver,
+)
 
 
 class RecognitionCore:
@@ -25,7 +38,9 @@ class RecognitionCore:
         self._shutdown = False
         self._in_flight = 0
         self._active_tasks: dict[TrackKey, set[RecognitionTask]] = {}
-        self._seen_observations: dict[TrackKey, set[tuple[RecognitionTask, float, str]]] = {}
+        self._seen_observations: dict[
+            TrackKey, set[tuple[RecognitionTask, float, str]]
+        ] = {}
         self._ended: set[TrackKey] = set()
 
     @property
@@ -39,10 +54,38 @@ class RecognitionCore:
         }
 
     def observe(self, observation: TrackedObservation) -> tuple[RecognitionUpdate, ...]:
+        updates, _, _ = self._observe(observation, lambda: True)
+        return updates
+
+    def observe_guarded(
+        self,
+        observation: TrackedObservation,
+        should_commit: Callable[[], bool],
+    ) -> tuple[RecognitionUpdate, ...]:
+        """Run inference and commit state only while the caller still accepts it."""
+        updates, _, _ = self._observe(observation, should_commit)
+        return updates
+
+    def observe_guarded_with_artifacts(
+        self,
+        observation: TrackedObservation,
+        should_commit: Callable[[], bool],
+    ) -> tuple[
+        tuple[RecognitionUpdate, ...], tuple[RecognitionArtifact, ...], str
+    ]:
+        return self._observe(observation, should_commit)
+
+    def _observe(
+        self,
+        observation: TrackedObservation,
+        should_commit: Callable[[], bool],
+    ) -> tuple[
+        tuple[RecognitionUpdate, ...], tuple[RecognitionArtifact, ...], str
+    ]:
         if self._shutdown or observation.key in self._ended:
-            return ()
+            return (), (), "track_ended"
         if observation.observed_in_frame is False:
-            return ()
+            return (), (), "observation_not_in_frame"
         observation_id = (
             observation.task,
             observation.frame_time,
@@ -50,16 +93,28 @@ class RecognitionCore:
         )
         seen = self._seen_observations.setdefault(observation.key, set())
         if observation_id in seen:
-            return ()
-        seen.add(observation_id)
+            return (), (), "duplicate_observation"
         engine = self._face if observation.task is RecognitionTask.FACE else self._lpr
         if isinstance(engine, FaceEngine) and not engine.should_attempt(observation):
-            return ()
+            return (), (), "attempt_cadence"
 
         self._in_flight += 1
         try:
             with self._evidence.resolve(observation) as evidence:
-                result = self._model.recognize(observation.task, observation, evidence)
+                model_result = self._model.recognize(
+                    observation.task, observation, evidence
+                )
+            if isinstance(model_result, ModelRecognition):
+                result = model_result.result
+                artifacts = model_result.artifacts
+            else:
+                result = model_result
+                artifacts = ()
+            if not should_commit():
+                if not seen:
+                    self._seen_observations.pop(observation.key, None)
+                return (), (), "cancelled_before_commit"
+            seen.add(observation_id)
             updates = engine.observe(observation, result)
             if updates:
                 self._active_tasks.setdefault(observation.key, set()).add(
@@ -68,7 +123,8 @@ class RecognitionCore:
             if self._observer is not None:
                 for update in updates:
                     self._observer.on_update(update)
-            return updates
+            reason = "" if updates else "no_recognition_result"
+            return updates, artifacts, reason
         finally:
             self._in_flight -= 1
 

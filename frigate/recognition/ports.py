@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from .contracts import (
     BBox,
+    RecognitionArtifact,
     RecognitionTask,
     RecognitionUpdate,
     TrackedObservation,
@@ -29,6 +30,12 @@ class RawRecognition:
         object.__setattr__(self, "metadata", _freeze(self.metadata))
 
 
+@dataclass(frozen=True, slots=True)
+class ModelRecognition:
+    result: RawRecognition | None
+    artifacts: tuple[RecognitionArtifact, ...] = ()
+
+
 class EvidenceResolver(Protocol):
     def resolve(
         self, observation: TrackedObservation
@@ -41,7 +48,7 @@ class RecognitionModel(Protocol):
         task: RecognitionTask,
         observation: TrackedObservation,
         evidence: object,
-    ) -> RawRecognition | None: ...
+    ) -> RawRecognition | ModelRecognition | None: ...
 
 
 class RecognitionObserver(Protocol):

@@ -280,7 +280,7 @@ print(json.dumps(sorted(sys.modules)))
     assert not any(name.startswith(forbidden) for name in loaded)
 
 
-def test_production_has_no_phase5_decision_owner():
+def test_production_has_only_canonical_decision_owner():
     package = Path(__file__).parents[1]
     production = (
         package / "embeddings" / "maintainer.py",

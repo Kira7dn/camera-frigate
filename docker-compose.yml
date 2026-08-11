@@ -1,4 +1,32 @@
 services:
+  recognition:
+    profiles: ["recognition"]
+    container_name: frigate-recognition
+    build:
+      context: .
+      dockerfile: docker/main/Dockerfile
+      target: recognition-runtime
+    command:
+      - --config
+      - /config/config.yml
+      - --bind
+      - 0.0.0.0:50051
+      - --certificate
+      - /run/recognition-tls/server.crt
+      - --key
+      - /run/recognition-tls/server.key
+      - --client-ca
+      - /run/recognition-tls/ca.crt
+      - --allow-client
+      - frigate
+    volumes:
+      - ./config:/config:ro
+      - ./config/recognition-tls:/run/recognition-tls:ro
+      - ./models:/models:ro
+      - ./debug:/media/frigate
+    shm_size: "256mb"
+    restart: unless-stopped
+
   devcontainer:
     container_name: frigate-devcontainer
     # Check host system's actual render/video/plugdev group IDs with 'getent group render', 'getent group video', and 'getent group plugdev'

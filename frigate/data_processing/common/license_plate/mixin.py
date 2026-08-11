@@ -8,23 +8,24 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import cv2
 import numpy as np
 import pyclipper
 from shapely.geometry import Polygon
 
-from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import FrigateConfig
 from frigate.config.classification import LicensePlateRecognitionConfig
 from frigate.const import CLIPS_DIR, MODEL_CACHE_DIR
+from frigate.data_processing.common.face_pipeline import render_recognition_boxes
 from frigate.recognition.lpr import select_lpr_representative
 from frigate.recognition.ports import RawRecognition
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed
 from frigate.util.image import area
 from frigate.util.passage_trace import (
     canonical_trace_id,
+    evidence_collector_active,
     passage_evidence,
     passage_evidence_enabled,
     passage_evidence_id,
@@ -37,7 +38,15 @@ from .constants import LPR_EMBEDDING_SIZE
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from frigate.comms.inter_process import InterProcessRequestor
+
 WRITE_DEBUG_IMAGES = False
+
+
+def lpr_camera_eligible(camera: str) -> bool:
+    """Keep Face-only replay sources out of the LPR pipeline in every runtime."""
+    return camera != "face_camera"
 
 
 def _box4(values: Any) -> tuple[int, int, int, int]:
@@ -1261,7 +1270,7 @@ class LicensePlateProcessingMixin:
 
         # This shared mixin is available to the face camera, but LPR is a car
         # pipeline. Do not create LPR lineage/evidence for face detections.
-        if camera == "face_camera":
+        if not lpr_camera_eligible(camera):
             return None
         current_time = (
             datetime.datetime.now().timestamp()
@@ -1281,17 +1290,28 @@ class LicensePlateProcessingMixin:
             or object_data.get("_recognition_passage_id")
             or "dedicated-lpr"
         )
-        runtime_trace_id = canonical_trace_id("lpr", camera, runtime_passage_id)
-        runtime_evidence_id = passage_evidence_id(
-            camera, runtime_track_id, current_time, debug_frame_id
+        runtime_trace_id = str(
+            object_data.get("_recognition_trace_id")
+            or canonical_trace_id("lpr", camera, runtime_passage_id)
+        )
+        runtime_evidence_id = str(
+            object_data.get("_recognition_evidence_id")
+            or passage_evidence_id(
+                camera, runtime_track_id, current_time, debug_frame_id
+            )
         )
         runtime_rgb: np.ndarray | None = None
         evidence_eligible = dedicated_lpr or (
             object_data.get("label") in self.lp_objects
             or object_data.get("label") == "license_plate"
         )
-        capture_runtime_evidence = passage_evidence_enabled() and evidence_eligible
-        if capture_runtime_evidence:
+        emit_runtime_side_effects = getattr(self, "_emit_runtime_side_effects", True)
+        source_collector_active = evidence_collector_active()
+        capture_runtime_evidence = evidence_eligible and (
+            source_collector_active
+            or (emit_runtime_side_effects and passage_evidence_enabled())
+        )
+        if capture_runtime_evidence and not source_collector_active:
             capture_runtime_evidence = passage_evidence_should_capture(
                 camera,
                 runtime_track_id,
@@ -1320,6 +1340,10 @@ class LicensePlateProcessingMixin:
                 **fields,
             )
 
+        def trace(stage: str, **fields: Any) -> None:
+            if emit_runtime_side_effects:
+                passage_trace(stage, **fields)
+
         if not self.config.cameras[camera].lpr.enabled:
             save_evidence("eligibility_decision", accepted=False, reason="lpr_disabled")
             return
@@ -1345,18 +1369,18 @@ class LicensePlateProcessingMixin:
             # only the annotated full frame below. Encoding both full-size
             # images doubled acceptance I/O without adding review evidence.
             save_evidence("runtime_frame")
-            annotated = runtime_rgb.copy()
             object_box = object_data.get("box")
-            if object_box:
-                x1, y1, x2, y2 = (int(value) for value in object_box)
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            annotated = render_recognition_boxes(
+                runtime_rgb,
+                object_box=_box4(object_box) if object_box else None,
+            )
             save_evidence(
                 "runtime_frame_object_box",
                 annotated,
                 object_box=object_box,
             )
 
-        passage_trace(
+        trace(
             "track_seen",
             camera=camera,
             frame_time=current_time,
@@ -1437,7 +1461,7 @@ class LicensePlateProcessingMixin:
                 return
 
             plate_box = license_plate
-            passage_trace(
+            trace(
                 "plate_detected",
                 camera=camera,
                 frame_time=current_time,
@@ -1516,7 +1540,7 @@ class LicensePlateProcessingMixin:
             if eligibility_retry:
                 save_evidence("eligibility_retry_resolved", **eligibility_retry)
 
-            passage_trace(
+            trace(
                 "lpr_eligible",
                 camera=camera,
                 frame_time=current_time,
@@ -1675,7 +1699,7 @@ class LicensePlateProcessingMixin:
                     minimum_detector_area=self.config.cameras[camera].lpr.min_area
                     * 4,
                 )
-                passage_trace(
+                trace(
                     "plate_detected",
                     camera=camera,
                     frame_time=current_time,
@@ -1896,7 +1920,7 @@ class LicensePlateProcessingMixin:
             recognition_threshold=self.lpr_config.recognition_threshold,
             plate_box=list(plate_box),
         )
-        passage_trace(
+        trace(
             "ocr_result",
             camera=camera,
             frame_time=current_time,

@@ -1,4 +1,4 @@
-"""Phase 6 Face media tests; decision ownership is covered by recognition tests."""
+"""Face media tests; decision ownership is covered by recognition tests."""
 
 from types import SimpleNamespace
 from unittest.mock import Mock

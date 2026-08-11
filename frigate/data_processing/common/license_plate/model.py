@@ -1,4 +1,4 @@
-from frigate.comms.inter_process import InterProcessRequestor
+from typing import Any
 from frigate.embeddings.onnx.lpr_embedding import (
     LicensePlateDetector,
     PaddleOCRClassification,
@@ -12,7 +12,7 @@ from ...types import DataProcessorModelRunner
 class LicensePlateModelRunner(DataProcessorModelRunner):
     def __init__(
         self,
-        requestor: InterProcessRequestor,
+        requestor: Any,
         device: str = "CPU",
         model_size: str = "small",
     ):

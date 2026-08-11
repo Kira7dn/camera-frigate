@@ -369,3 +369,13 @@ FROM deps AS frigate
 
 WORKDIR /opt/frigate/
 COPY --from=rootfs / /
+
+# Dedicated recognition image. It shares the immutable inference dependencies,
+# but it starts only the gRPC runtime and never starts the Frigate application.
+FROM frigate AS recognition-runtime
+
+ENTRYPOINT ["python3", "-m", "frigate.recognition.service.app"]
+CMD ["--config", "/config/config.yml"]
+EXPOSE 50051
+
+HEALTHCHECK NONE

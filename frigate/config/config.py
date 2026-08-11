@@ -70,6 +70,7 @@ from .mqtt import MqttConfig
 from .network import NetworkingConfig
 from .profile import ProfileDefinitionConfig
 from .proxy import ProxyConfig
+from .recognition import RecognitionRuntimeConfig
 from .telemetry import TelemetryConfig
 from .tls import TlsConfig
 from .ui import UIConfig
@@ -648,6 +649,11 @@ class FrigateConfig(FrigateBaseModel):
         title="License Plate Recognition",
         description="License plate recognition settings including detection thresholds, formatting, and known plates.",
     )
+    recognition: RecognitionRuntimeConfig = Field(
+        default_factory=RecognitionRuntimeConfig,
+        title="Recognition runtime",
+        description="Select local inference or an external fail-closed service.",
+    )
 
     camera_groups: dict[str, CameraGroupConfig] = Field(
         default_factory=dict,
@@ -702,7 +708,7 @@ class FrigateConfig(FrigateBaseModel):
                     )
                 role_to_name[role] = name
 
-        # Phase 6 recognition requires a caller-owned stable track ID. The
+        # Recognition requires a caller-owned stable track ID. The
         # legacy motion-frame-only dedicated LPR path has no such lifecycle.
         if self.lpr.enabled:
             unsupported_lpr_cameras = [
@@ -713,7 +719,7 @@ class FrigateConfig(FrigateBaseModel):
             ]
             if unsupported_lpr_cameras:
                 raise ValueError(
-                    "Phase 6 LPR requires 'license_plate' in objects.track for "
+                    "LPR recognition requires 'license_plate' in objects.track for "
                     "dedicated LPR cameras: "
                     + ", ".join(sorted(unsupported_lpr_cameras))
                 )

@@ -24,6 +24,13 @@ from frigate.data_processing.common.face.model import (
     FaceNetRecognizer,
     FaceRecognizer,
 )
+from frigate.data_processing.common.face_pipeline import (
+    PreparedFaceAttempt,
+    clamp_box,
+    detect_largest_face,
+    emit_face_attempt_evidence,
+    prepare_face_attempt,
+)
 from frigate.recognition.adapters.frigate import (
     BorrowedEvidenceResolver,
     FrigateEventAdapter,
@@ -46,10 +53,8 @@ from frigate.util.face_snapshot import (
     write_face_attempt,
     write_face_snapshot_artifact,
 )
-from frigate.util.image import area
 from frigate.util.passage_trace import (
     canonical_trace_id,
-    passage_evidence,
     passage_evidence_id,
     passage_trace,
 )
@@ -62,7 +67,6 @@ from .api import RealTimeProcessorApi
 logger = logging.getLogger(__name__)
 
 
-MAX_DETECTION_HEIGHT = 1080
 def _box4(values: Any) -> tuple[int, int, int, int]:
     if len(values) != 4:
         raise ValueError("face bbox must contain exactly four coordinates")
@@ -70,7 +74,6 @@ def _box4(values: Any) -> tuple[int, int, int, int]:
 
 
 class FaceRealTimeProcessor(RealTimeProcessorApi):
-
     def __init__(
         self,
         config: FrigateConfig,
@@ -215,42 +218,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         self, input: np.ndarray, threshold: float
     ) -> tuple[int, int, int, int] | None:
         """Detect faces in input image."""
-        if not self.face_detector:
-            return None
-
-        # YN face detector fails at extreme definitions
-        # this rescales to a size that can properly detect faces
-        # still retaining plenty of detail
-        if input.shape[0] > MAX_DETECTION_HEIGHT:
-            scale_factor = MAX_DETECTION_HEIGHT / input.shape[0]
-            new_width = int(scale_factor * input.shape[1])
-            input = cv2.resize(input, (new_width, MAX_DETECTION_HEIGHT))
-        else:
-            scale_factor = 1
-
-        self.face_detector.setInputSize((input.shape[1], input.shape[0]))
-        faces = self.face_detector.detect(input)
-
-        if faces is None or faces[1] is None:
-            return None  # type: ignore[unreachable]
-
-        face = None
-
-        for _, potential_face in enumerate(faces[1]):
-            if potential_face[-1] < threshold:
-                continue
-
-            raw_bbox = potential_face[0:4].astype(np.uint16)
-            x: int = int(max(raw_bbox[0], 0) / scale_factor)
-            y: int = int(max(raw_bbox[1], 0) / scale_factor)
-            w: int = int(raw_bbox[2] / scale_factor)
-            h: int = int(raw_bbox[3] / scale_factor)
-            bbox = (x, y, x + w, y + h)
-
-            if face is None or area(bbox) > area(face):  # type: ignore[unreachable]
-                face = bbox
-
-        return face
+        return detect_largest_face(self.face_detector, input, threshold)
 
     def __update_metrics(self, duration: float) -> None:
         self.faces_per_second.update()
@@ -327,59 +295,22 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         frame = np.asarray(yuv_frame)
         bgr_frame = None if supplied_bgr is None else np.asarray(supplied_bgr)
         camera = observation.key.camera_id
-        person_box = observation.object_bbox
-        face_box: tuple[int, int, int, int] | None = None
-
-        if self.requires_face_detection:
-            bgr = (
-                bgr_frame
-                if bgr_frame is not None
-                else cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-            )
-            left, top, right, bottom = person_box
-            person = bgr[top:bottom, left:right]
-            detected = self.__detect_face(
-                person, self.face_config.detection_threshold
-            )
-            if detected is None:
-                self.face_counters["no_face"] += 1
-                return None
-            face_box = (
-                detected[0] + left,
-                detected[1] + top,
-                detected[2] + left,
-                detected[3] + top,
-            )
-        else:
-            faces = [
-                attr
-                for attr in observation.attributes.get("current_attributes", ())
-                if attr.get("label") == "face" and attr.get("box")
-            ]
-            if not faces:
-                self.face_counters["no_face"] += 1
-                return None
-            best_face = max(faces, key=lambda attr: float(attr.get("score", 0.0)))
-            face_box = _box4(best_face["box"])
-            bgr = (
-                bgr_frame
-                if bgr_frame is not None
-                else cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
-            )
-
-        if area(face_box) < self.config.cameras[camera].face_recognition.min_area:
-            self.face_counters["too_small"] += 1
-            return None
-        face_frame = bgr[
-            max(0, face_box[1]) : min(bgr.shape[0], face_box[3]),
-            max(0, face_box[0]) : min(bgr.shape[1], face_box[2]),
-        ]
-        if face_frame.size == 0:
-            self.face_counters["empty_crop"] += 1
+        attempt, reason = prepare_face_attempt(
+            frame,
+            bgr_frame,
+            observation.object_bbox,
+            observation.attributes.get("current_attributes", ()),
+            requires_face_detection=self.requires_face_detection,
+            detection_threshold=self.face_config.detection_threshold,
+            min_area=self.config.cameras[camera].face_recognition.min_area,
+            detect_face=self.__detect_face,
+        )
+        if attempt is None:
+            self.face_counters[reason] += 1
             return None
 
         started = datetime.datetime.now().timestamp()
-        result = self.recognizer.classify(face_frame)
+        result = self.recognizer.classify(attempt.crop)
         self.__update_metrics(datetime.datetime.now().timestamp() - started)
         if result is None:
             self.face_counters["classifier_unavailable"] += 1
@@ -394,8 +325,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         return RawRecognition(
             name,
             float(score),
-            detail_bbox=face_box,
-            area=int(face_frame.shape[0] * face_frame.shape[1]),
+            detail_bbox=attempt.detector_box,
+            area=int(attempt.crop.shape[0] * attempt.crop.shape[1]),
         )
 
     def process_frame(
@@ -451,24 +382,23 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             evidence_id = passage_evidence_id(
                 camera, track_id, frame_time, int(frame_time * 1000)
             )
-            passage_evidence(
-                "recognition_attempt",
+            effective_box = clamp_box(face_box, bgr)
+            face_crop = bgr[
+                effective_box[1] : effective_box[3],
+                effective_box[0] : effective_box[2],
+            ]
+            attempt = PreparedFaceAttempt(bgr, face_box, effective_box, face_crop)
+            emit_face_attempt_evidence(
+                attempt,
                 evidence_id=evidence_id,
                 camera=camera,
                 frame_time=frame_time,
                 track_id=track_id,
                 trace_id=canonical_trace_id("face", camera, track_id),
-                pipeline="face",
-                image=bgr,
-                object_box=list(person_box),
-                detail_box=list(face_box),
-                raw_identity=update.raw_value,
+                person_box=person_box,
+                raw_identity=update.raw_value or "unknown",
                 raw_score=update.raw_score,
             )
-            face_crop = bgr[
-                max(0, face_box[1]) : min(bgr.shape[0], face_box[3]),
-                max(0, face_box[0]) : min(bgr.shape[1], face_box[2]),
-            ]
             if face_crop.size:
                 self.queue_face_attempt(
                     camera,

@@ -18,6 +18,13 @@ class TraceJob:
     record: Mapping[str, Any]
     image_name: str | None = None
     image: object | None = None
+    encoded_image: bytes | None = None
+    image_shape: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TraceBatchJob:
+    entries: tuple[TraceJob, ...]
 
 
 class BoundedTraceWriter:
@@ -33,7 +40,9 @@ class BoundedTraceWriter:
     ) -> None:
         self._output_dir = output_dir
         self._manifest_name = manifest_name
-        self._queue: queue.Queue[TraceJob | None] = queue.Queue(maxsize=capacity)
+        self._queue: queue.Queue[TraceJob | TraceBatchJob | None] = queue.Queue(
+            maxsize=capacity
+        )
         self._copy_image = copy_image or (lambda image: image)
         self._encode_jpeg = encode_jpeg
         self._max_artifact_bytes = max_artifact_bytes
@@ -74,6 +83,34 @@ class BoundedTraceWriter:
             self.dropped += 1
             return False
 
+    def submit_encoded_batch(
+        self,
+        entries: list[
+            tuple[Mapping[str, Any], str | None, bytes | None, tuple[int, ...]]
+        ],
+    ) -> bool:
+        if self._closed:
+            return False
+        if not self._started:
+            self.start()
+        batch = TraceBatchJob(
+            tuple(
+                TraceJob(
+                    dict(record),
+                    image_name,
+                    encoded_image=bytes(encoded) if encoded is not None else None,
+                    image_shape=tuple(image_shape),
+                )
+                for record, image_name, encoded, image_shape in entries
+            )
+        )
+        try:
+            self._queue.put_nowait(batch)
+            return True
+        except queue.Full:
+            self.dropped += 1
+            return False
+
     def flush(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
         while self._queue.unfinished_tasks and time.monotonic() < deadline:
@@ -105,35 +142,72 @@ class BoundedTraceWriter:
                     if job is None:
                         output.flush()
                         return
-                    record = dict(job.record)
-                    if job.image is not None and job.image_name and self._encode_jpeg:
-                        encoded = self._encode_jpeg(job.image)
-                        if (
-                            self._max_artifact_bytes is not None
-                            and self.artifact_bytes + len(encoded)
-                            > self._max_artifact_bytes
-                        ):
-                            record.pop("artifact_path", None)
-                            record["artifact_rejected"] = "byte_limit"
-                        else:
-                            target = self._output_dir / job.image_name
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            target.write_bytes(encoded)
-                            self.artifact_bytes += len(encoded)
-                            record.update(
-                                {
-                                    "artifact_path": Path(job.image_name).as_posix(),
-                                    "artifact_sha256": hashlib.sha256(encoded).hexdigest(),
-                                    "artifact_bytes": len(encoded),
-                                    "image_shape": [
-                                        int(value)
-                                        for value in getattr(job.image, "shape", ())
-                                    ],
-                                }
-                            )
-                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    output.flush()
+                    entries = job.entries if isinstance(job, TraceBatchJob) else (job,)
+                    written = [self._write_entry(output, entry) for entry in entries]
+                    self._write_evidence_manifests(written)
                 except (OSError, TypeError, ValueError):
                     self.errors += 1
                 finally:
                     self._queue.task_done()
+
+    def _write_entry(self, output: Any, job: TraceJob) -> dict[str, Any]:
+        record = dict(job.record)
+        encoded = job.encoded_image
+        image_shape = job.image_shape
+        if encoded is None and job.image is not None and self._encode_jpeg:
+            encoded = self._encode_jpeg(job.image)
+            image_shape = tuple(int(value) for value in getattr(job.image, "shape", ()))
+        if encoded is not None and job.image_name:
+            if (
+                self._max_artifact_bytes is not None
+                and self.artifact_bytes + len(encoded) > self._max_artifact_bytes
+            ):
+                record.pop("artifact_path", None)
+                record["artifact_rejected"] = "byte_limit"
+            else:
+                target = self._output_dir / job.image_name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(encoded)
+                self.artifact_bytes += len(encoded)
+                record.update(
+                    {
+                        "artifact_path": Path(job.image_name).as_posix(),
+                        "artifact_sha256": hashlib.sha256(encoded).hexdigest(),
+                        "artifact_bytes": len(encoded),
+                        "image_shape": list(image_shape),
+                    }
+                )
+        output.write(json.dumps(record, ensure_ascii=False) + "\n")
+        output.flush()
+        return record
+
+    def _write_evidence_manifests(self, records: list[dict[str, Any]]) -> None:
+        """Store source metadata beside each evidence bundle without deriving media."""
+        grouped: dict[Path, list[dict[str, Any]]] = {}
+        for record in records:
+            artifact_path = record.get("artifact_path")
+            if not artifact_path:
+                continue
+            parent = Path(str(artifact_path)).parent
+            grouped.setdefault(parent, []).append(record)
+
+        for parent, bundle_records in grouped.items():
+            target_dir = self._output_dir / parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / "evidence.json"
+            temporary = target.with_suffix(".json.tmp")
+            payload = {
+                "schema": "camera.recognition.evidence.v1",
+                "evidence_id": bundle_records[0].get("evidence_id"),
+                "trace_id": bundle_records[0].get("trace_id"),
+                "bbox_format": bundle_records[0].get("bbox_format"),
+                "bbox_coordinate_space": bundle_records[0].get(
+                    "bbox_coordinate_space"
+                ),
+                "artifacts": bundle_records,
+            }
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(target)

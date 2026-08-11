@@ -1,0 +1,211 @@
+syntax = "proto3";
+
+package camera.recognition.v1;
+
+service RecognitionService {
+  rpc Recognize(stream ClientEnvelope) returns (stream ServerEnvelope);
+  rpc Configure(ConfigureRequest) returns (ConfigureResponse);
+  rpc GetCapabilities(CapabilitiesRequest) returns (CapabilitiesResponse);
+  rpc ManageFaceLibrary(FaceLibraryRequest) returns (FaceLibraryResponse);
+}
+
+enum RecognitionTask {
+  RECOGNITION_TASK_UNSPECIFIED = 0;
+  RECOGNITION_TASK_FACE = 1;
+  RECOGNITION_TASK_LPR = 2;
+}
+
+enum RecognitionOutcomeStatus {
+  RECOGNITION_OUTCOME_STATUS_UNSPECIFIED = 0;
+  RECOGNITION_OUTCOME_STATUS_SUCCEEDED = 1;
+  RECOGNITION_OUTCOME_STATUS_ENDED = 2;
+  RECOGNITION_OUTCOME_STATUS_CANCELLED = 3;
+  RECOGNITION_OUTCOME_STATUS_DEADLINE_EXCEEDED = 4;
+  RECOGNITION_OUTCOME_STATUS_FAILED = 5;
+}
+
+enum FaceLibraryOperation {
+  FACE_LIBRARY_OPERATION_UNSPECIFIED = 0;
+  FACE_LIBRARY_OPERATION_REGISTER = 1;
+  FACE_LIBRARY_OPERATION_CLEAR = 2;
+  FACE_LIBRARY_OPERATION_RECOGNIZE = 3;
+  FACE_LIBRARY_OPERATION_REPROCESS = 4;
+}
+
+message BBox {
+  int32 left = 1;
+  int32 top = 2;
+  int32 right = 3;
+  int32 bottom = 4;
+}
+
+message TrackKey {
+  string camera_id = 1;
+  string stream_epoch = 2;
+  string track_id = 3;
+}
+
+message RawI420Evidence {
+  string evidence_id = 1;
+  bytes data = 2;
+  repeated uint32 shape = 3;
+  string dtype = 4;
+  string layout = 5;
+  uint64 byte_length = 6;
+  int64 expiry_unix_ms = 7;
+}
+
+message EvidenceCaptureRequest {
+  string trace_id = 1;
+  string evidence_id = 2;
+  optional string run_id = 3;
+}
+
+message Observation {
+  RecognitionTask task = 1;
+  TrackKey key = 2;
+  double frame_time = 3;
+  BBox object_bbox = 4;
+  optional BBox detail_bbox = 5;
+  optional bool observed_in_frame = 6;
+  RawI420Evidence evidence = 7;
+  string attributes_json = 8;
+  optional EvidenceCaptureRequest evidence_capture = 9;
+}
+
+message Observe {
+  string job_id = 1;
+  string client_id = 2;
+  string expected_service_epoch = 3;
+  uint64 sequence = 4;
+  uint32 deadline_budget_ms = 5;
+  Observation observation = 6;
+}
+
+message EndTrack {
+  string job_id = 1;
+  string client_id = 2;
+  string expected_service_epoch = 3;
+  TrackKey key = 4;
+  uint64 sequence = 5;
+  string reason = 6;
+}
+
+message Cancel {
+  string job_id = 1;
+  string client_id = 2;
+  string expected_service_epoch = 3;
+  TrackKey key = 4;
+  uint64 sequence = 5;
+  string target_job_id = 6;
+}
+
+message ClientEnvelope {
+  oneof request {
+    Observe observe = 1;
+    EndTrack end_track = 2;
+    Cancel cancel = 3;
+  }
+}
+
+message JobReceipt {
+  string job_id = 1;
+  string service_epoch = 2;
+  bool accepted = 3;
+  string reason = 4;
+  bool retryable = 5;
+}
+
+message RecognitionUpdate {
+  RecognitionTask task = 1;
+  TrackKey key = 2;
+  double frame_time = 3;
+  string evidence_id = 4;
+  optional string raw_value = 5;
+  double raw_score = 6;
+  optional string aggregate_value = 7;
+  double aggregate_score = 8;
+  BBox object_bbox = 9;
+  optional BBox detail_bbox = 10;
+  bool publish = 11;
+  string reason = 12;
+  string metadata_json = 13;
+}
+
+message RecognitionOutcome {
+  string job_id = 1;
+  string client_id = 2;
+  string service_epoch = 3;
+  TrackKey key = 4;
+  uint64 sequence = 5;
+  RecognitionOutcomeStatus status = 6;
+  repeated RecognitionUpdate updates = 7;
+  string reason = 8;
+  bool retryable = 9;
+  repeated RecognitionArtifact artifacts = 10;
+}
+
+message RecognitionArtifact {
+  uint64 sequence = 1;
+  string stage = 2;
+  string pipeline = 3;
+  string trace_id = 4;
+  string evidence_id = 5;
+  string camera = 6;
+  optional double frame_time = 7;
+  optional string track_id = 8;
+  optional uint32 image_index = 9;
+  string metadata_json = 10;
+  bytes image_jpeg = 11;
+  repeated uint32 image_shape = 12;
+  string image_sha256 = 13;
+}
+
+message ServiceHello {
+  string service_epoch = 1;
+  string config_hash = 2;
+}
+
+message ServerEnvelope {
+  oneof response {
+    ServiceHello hello = 1;
+    JobReceipt receipt = 2;
+    RecognitionOutcome outcome = 3;
+  }
+}
+
+message ConfigureRequest {
+  string client_id = 1;
+  string config_json = 2;
+  string config_hash = 3;
+}
+
+message ConfigureResponse {
+  string service_epoch = 1;
+  string config_hash = 2;
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  string schema_version = 1;
+  string service_epoch = 2;
+  uint64 max_evidence_bytes = 3;
+  repeated RecognitionTask tasks = 4;
+  bool mtls_required = 5;
+}
+
+message FaceLibraryRequest {
+  FaceLibraryOperation operation = 1;
+  string label = 2;
+  bytes image = 3;
+  string logical_name = 4;
+  uint32 deadline_budget_ms = 5;
+}
+
+message FaceLibraryResponse {
+  bool success = 1;
+  string message = 2;
+  optional string face_name = 3;
+  optional double score = 4;
+}

@@ -26,6 +26,10 @@ class DataProcessorMetrics:
     recognition_sessions: ValueProxy[float]
     recognition_in_flight: ValueProxy[float]
     recognition_evidence_pinned: ValueProxy[float]
+    recognition_queue_depth: ValueProxy[float]
+    recognition_outcome_depth: ValueProxy[float]
+    recognition_rejected: ValueProxy[float]
+    recognition_service_healthy: ValueProxy[float]
     recognition_writer_depth: ValueProxy[float]
     recognition_writer_drops: ValueProxy[float]
     recognition_writer_errors: ValueProxy[float]
@@ -50,6 +54,10 @@ class DataProcessorMetrics:
         self.recognition_sessions = manager.Value("d", 0.0)
         self.recognition_in_flight = manager.Value("d", 0.0)
         self.recognition_evidence_pinned = manager.Value("d", 0.0)
+        self.recognition_queue_depth = manager.Value("d", 0.0)
+        self.recognition_outcome_depth = manager.Value("d", 0.0)
+        self.recognition_rejected = manager.Value("d", 0.0)
+        self.recognition_service_healthy = manager.Value("d", 0.0)
         self.recognition_writer_depth = manager.Value("d", 0.0)
         self.recognition_writer_drops = manager.Value("d", 0.0)
         self.recognition_writer_errors = manager.Value("d", 0.0)

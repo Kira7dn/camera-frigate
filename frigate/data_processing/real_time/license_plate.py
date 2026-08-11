@@ -152,7 +152,7 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         """Recognize LPR only from canonical caller-owned track IDs."""
         if dedicated_lpr:
             logger.error(
-                "Dedicated untracked LPR is not supported by the Phase 6 track contract"
+                "Dedicated untracked LPR is not supported by the track contract"
             )
             return
         if not isinstance(obj_data, dict) or not obj_data.get("box"):

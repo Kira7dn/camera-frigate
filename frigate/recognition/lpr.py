@@ -67,7 +67,10 @@ class LprEngine:
 
         history = self._history.setdefault(observation.key, [])
         history.append(result)
-        window = self.policy.detect_fps * 5
+        detect_fps = int(
+            observation.attributes.get("detect_fps", self.policy.detect_fps)
+        )
+        window = max(1, detect_fps) * 5
         if len(history) > window:
             del history[:-window]
 

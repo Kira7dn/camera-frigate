@@ -1,4 +1,5 @@
 ruff == 0.15.20
+grpcio-tools == 1.71.2
 
 # types
 types-peewee == 3.17.*

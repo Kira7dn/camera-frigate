@@ -470,6 +470,12 @@ def stats_snapshot(
             "evidence_pinned": int(
                 embeddings_metrics.recognition_evidence_pinned.value
             ),
+            "queue_depth": int(embeddings_metrics.recognition_queue_depth.value),
+            "outcome_depth": int(embeddings_metrics.recognition_outcome_depth.value),
+            "rejected": int(embeddings_metrics.recognition_rejected.value),
+            "service_healthy": bool(
+                embeddings_metrics.recognition_service_healthy.value
+            ),
             "writer_depth": int(embeddings_metrics.recognition_writer_depth.value),
             "writer_drops": int(embeddings_metrics.recognition_writer_drops.value),
             "writer_errors": int(embeddings_metrics.recognition_writer_errors.value),
