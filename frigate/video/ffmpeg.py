@@ -33,6 +33,11 @@ from frigate.util.image import (
 )
 
 
+def ordered_source_frame_time(source_epoch: float, frame_number: int, fps: int) -> float:
+    """Map a finite file frame to a stable source timeline."""
+    return source_epoch + frame_number / fps
+
+
 def put_latest_frame(
     frame_queue: Queue,
     frame_manager: FrameManager,
@@ -59,6 +64,26 @@ def put_latest_frame(
         frame_manager.close(frame_name)
     except queue.Full:
         frame_manager.close(frame_name)
+
+
+def put_ordered_frame(
+    frame_queue: Queue,
+    frame_manager: FrameManager,
+    frame_name: str,
+    frame_time: float,
+    stop_event: MpEvent,
+) -> bool:
+    """Apply backpressure for finite file inputs without dropping source frames."""
+    while not stop_event.is_set():
+        try:
+            frame_queue.put((frame_name, frame_time), True, 0.1)
+            frame_manager.close(frame_name)
+            return True
+        except queue.Full:
+            continue
+
+    frame_manager.close(frame_name)
+    return False
 from frigate.util.process import FrigateProcess
 
 logger = logging.getLogger(__name__)
@@ -88,6 +113,14 @@ def capture_frames(
     )
     source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
     source_start_written = False
+    preserve_source_order = any(
+        "detect" in ffmpeg_input.roles and os.path.isfile(str(ffmpeg_input.path))
+        for ffmpeg_input in config.ffmpeg.inputs
+    )
+    source_epoch: float | None = None
+    source_frame_number = 0
+    source_eof = False
+    last_source_frame_time: float | None = None
 
     def get_enabled_state():
         """Fetch the latest enabled state from ZMQ."""
@@ -107,6 +140,8 @@ def capture_frames(
             try:
                 frame_bytes = ffmpeg_process.stdout.read(frame_size)
                 if len(frame_bytes) != frame_size:
+                    frame_manager.close(frame_name)
+                    source_eof = preserve_source_order and not stop_event.is_set()
                     break
                 frame_buffer[:] = frame_bytes
             except Exception:
@@ -126,7 +161,16 @@ def capture_frames(
 
                 continue
 
-            current_frame.value = datetime.now().timestamp()
+            if preserve_source_order:
+                if source_epoch is None:
+                    source_epoch = datetime.now().timestamp()
+                current_frame.value = ordered_source_frame_time(
+                    source_epoch, source_frame_number, config.detect.fps
+                )
+                source_frame_number += 1
+            else:
+                current_frame.value = datetime.now().timestamp()
+            last_source_frame_time = current_frame.value
             frame_rate.update()
             if source_start_dir and not source_start_written:
                 os.makedirs(source_start_dir, exist_ok=True)
@@ -141,16 +185,36 @@ def capture_frames(
                     pass
                 source_start_written = True
 
-            put_latest_frame(
-                frame_queue,
-                frame_manager,
-                frame_name,
-                current_frame.value,
-                skipped_eps,
-            )
+            if preserve_source_order:
+                if not put_ordered_frame(
+                    frame_queue,
+                    frame_manager,
+                    frame_name,
+                    current_frame.value,
+                    stop_event,
+                ):
+                    break
+            else:
+                put_latest_frame(
+                    frame_queue,
+                    frame_manager,
+                    frame_name,
+                    current_frame.value,
+                    skipped_eps,
+                )
 
             frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
     finally:
+        if source_start_dir and source_eof and last_source_frame_time is not None:
+            end_path = os.path.join(source_start_dir, f"{config.name}.end")
+            try:
+                descriptor = os.open(
+                    end_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    stream.write(f"{last_source_frame_time:.9f}\n")
+            except FileExistsError:
+                pass
         config_subscriber.stop()
 
 

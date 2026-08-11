@@ -16,7 +16,11 @@ from frigate.util.object import (
     recovery_detection_supersedes,
     reduce_detections,
 )
-from frigate.video.ffmpeg import put_latest_frame
+from frigate.video.ffmpeg import (
+    ordered_source_frame_time,
+    put_latest_frame,
+    put_ordered_frame,
+)
 
 
 class _Queue:
@@ -24,7 +28,7 @@ class _Queue:
         self.items = list(items or [])
         self.full = full
 
-    def put(self, item, block):
+    def put(self, item, block, timeout=None):
         if self.full:
             self.full = False
             raise queue.Full
@@ -52,6 +56,11 @@ class _Skipped:
         self.count += 1
 
 
+class _Stop:
+    def is_set(self):
+        return False
+
+
 def test_capture_queue_replaces_stale_frame_with_latest() -> None:
     frame_queue = _Queue([("old", 1.0)], full=True)
     manager = _FrameManager()
@@ -62,6 +71,23 @@ def test_capture_queue_replaces_stale_frame_with_latest() -> None:
     assert frame_queue.items == [("new", 2.0)]
     assert manager.closed == ["old", "new"]
     assert skipped.count == 1
+
+
+def test_file_capture_waits_without_removing_stale_frame() -> None:
+    frame_queue = _Queue([("old", 1.0)], full=True)
+    manager = _FrameManager()
+
+    assert put_ordered_frame(frame_queue, manager, "new", 2.0, _Stop())
+
+    assert frame_queue.items == [("old", 1.0), ("new", 2.0)]
+    assert manager.closed == ["new"]
+
+
+def test_file_capture_uses_source_timeline_under_backpressure() -> None:
+    assert ordered_source_frame_time(1000.0, 0, 5) == 1000.0
+    assert ordered_source_frame_time(1000.0, 74, 5) == 1014.8
+
+
 def draw_box(frame, box, color=(255, 0, 0), thickness=2):
     cv2.rectangle(
         frame,
