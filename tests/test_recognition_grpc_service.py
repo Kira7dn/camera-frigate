@@ -1,4 +1,4 @@
-"""External recognition gRPC contract tests."""
+﻿"""External recognition gRPC contract tests."""
 
 from __future__ import annotations
 
@@ -27,19 +27,19 @@ from frigate.application.recognition import (
     TrackKey,
 )
 from frigate.application.recognition.executor import AsyncRecognitionExecutor
-from frigate.application.recognition.service.evidence import (
+from extension.recognition.evidence import (
     RawI420Evidence,
     RawI420EvidenceResolver,
 )
-from frigate.application.recognition.service.grpc_client import RecognitionGrpcClient
-from frigate.application.recognition.service.grpc_server import (
+from extension.recognition.grpc_client import RecognitionGrpcClient
+from extension.recognition.grpc_server import (
     RecognitionGrpcService,
     TlsServerConfig,
     create_grpc_server,
 )
-from frigate.application.recognition.service.v1 import recognition_pb2 as pb
-from frigate.application.recognition.service.v1 import recognition_pb2_grpc as pb_grpc
-from frigate.application.recognition.service.wire import (
+from extension.recognition.v1 import recognition_pb2 as pb
+from extension.recognition.v1 import recognition_pb2_grpc as pb_grpc
+from extension.recognition.wire import (
     job_from_envelope,
     outcome_from_proto,
     outcome_to_proto,

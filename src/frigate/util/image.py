@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from multiprocessing import resource_tracker as _mprt
 from multiprocessing import shared_memory as _mpshm
 from string import printable
-from typing import Any, AnyStr
+from typing import Any, AnyStr, cast
 
 import cv2
 import numpy as np
@@ -790,6 +790,9 @@ def copy_yuv_to_position(
     destination_frame[v2[1] : v2[3], v2[0] : v2[2]] = 128
 
     if source_frame is not None:
+        source_channels = cast(
+            dict[str, tuple[int, int, int, int]], source_channel_dim
+        )
         # calculate the resized frame, maintaining the aspect ratio
         source_aspect_ratio = source_frame.shape[1] / (source_frame.shape[0] // 3 * 2)
         dest_aspect_ratio = destination_shape[1] / destination_shape[0]
@@ -816,8 +819,8 @@ def copy_yuv_to_position(
             y[0] + y_x_offset : y[0] + y_x_offset + y_resize_width,
         ] = cv2.resize(
             source_frame[
-                source_channel_dim["y"][1] : source_channel_dim["y"][3],
-                source_channel_dim["y"][0] : source_channel_dim["y"][2],
+                source_channels["y"][1] : source_channels["y"][3],
+                source_channels["y"][0] : source_channels["y"][2],
             ],
             dsize=(y_resize_width, y_resize_height),
             interpolation=interpolation,
@@ -829,8 +832,8 @@ def copy_yuv_to_position(
             u1[0] + uv_x_offset : u1[0] + uv_x_offset + uv_resize_width,
         ] = cv2.resize(
             source_frame[
-                source_channel_dim["u1"][1] : source_channel_dim["u1"][3],
-                source_channel_dim["u1"][0] : source_channel_dim["u1"][2],
+                source_channels["u1"][1] : source_channels["u1"][3],
+                source_channels["u1"][0] : source_channels["u1"][2],
             ],
             dsize=(uv_resize_width, uv_resize_height),
             interpolation=interpolation,
@@ -841,8 +844,8 @@ def copy_yuv_to_position(
             u2[0] + uv_x_offset : u2[0] + uv_x_offset + uv_resize_width,
         ] = cv2.resize(
             source_frame[
-                source_channel_dim["u2"][1] : source_channel_dim["u2"][3],
-                source_channel_dim["u2"][0] : source_channel_dim["u2"][2],
+                source_channels["u2"][1] : source_channels["u2"][3],
+                source_channels["u2"][0] : source_channels["u2"][2],
             ],
             dsize=(uv_resize_width, uv_resize_height),
             interpolation=interpolation,
@@ -853,8 +856,8 @@ def copy_yuv_to_position(
             v1[0] + uv_x_offset : v1[0] + uv_x_offset + uv_resize_width,
         ] = cv2.resize(
             source_frame[
-                source_channel_dim["v1"][1] : source_channel_dim["v1"][3],
-                source_channel_dim["v1"][0] : source_channel_dim["v1"][2],
+                source_channels["v1"][1] : source_channels["v1"][3],
+                source_channels["v1"][0] : source_channels["v1"][2],
             ],
             dsize=(uv_resize_width, uv_resize_height),
             interpolation=interpolation,
@@ -865,8 +868,8 @@ def copy_yuv_to_position(
             v2[0] + uv_x_offset : v2[0] + uv_x_offset + uv_resize_width,
         ] = cv2.resize(
             source_frame[
-                source_channel_dim["v2"][1] : source_channel_dim["v2"][3],
-                source_channel_dim["v2"][0] : source_channel_dim["v2"][2],
+                source_channels["v2"][1] : source_channels["v2"][3],
+                source_channels["v2"][0] : source_channels["v2"][2],
             ],
             dsize=(uv_resize_width, uv_resize_height),
             interpolation=interpolation,
@@ -921,7 +924,7 @@ def yuv_region_2_bgr(frame, region):
         raise
 
 
-def intersection(box_a, box_b) -> list[int] | None:
+def intersection(box_a, box_b) -> tuple[int, int, int, int] | None:
     """Return intersection box or None if boxes do not intersect."""
     if (
         box_a[2] < box_b[0]
@@ -990,7 +993,7 @@ def clipped(obj, frame_shape):
 
 class FrameManager(ABC):
     @abstractmethod
-    def create(self, name: str, size: int) -> AnyStr:
+    def create(self, name: str, size: int) -> memoryview:
         pass
 
     @abstractmethod
@@ -998,7 +1001,7 @@ class FrameManager(ABC):
         pass
 
     @abstractmethod
-    def get(self, name: str, timeout_ms: int = 0):
+    def get(self, name: str, shape: Any) -> np.ndarray | None:
         pass
 
     @abstractmethod
@@ -1037,32 +1040,35 @@ class UntrackedSharedMemory(_mpshm.SharedMemory):
         # register function during this time
         with self.__lock:
             # temporarily disable registration during initialization
-            orig_register = _mprt.register
-            _mprt.register = self.__tmp_register
+            tracker = cast(Any, _mprt)
+            orig_register = tracker.register
+            tracker.register = self.__tmp_register
 
             # initialize; ensure original register function is
             # re-instated
             try:
                 super().__init__(name=name, create=create, size=size)
             finally:
-                _mprt.register = orig_register
+                tracker.register = orig_register
 
     @staticmethod
     def __tmp_register(*args, **kwargs) -> None:
         return
 
     def unlink(self) -> None:
-        if _mpshm._USE_POSIX and self._name:
-            _mpshm._posixshmem.shm_unlink(self._name)
+        shared_memory = cast(Any, _mpshm)
+        name = getattr(self, "_name", None)
+        if shared_memory._USE_POSIX and name:
+            shared_memory._posixshmem.shm_unlink(name)
             if self._track:
-                _mprt.unregister(self._name, "shared_memory")
+                _mprt.unregister(name, "shared_memory")
 
 
 class SharedMemoryFrameManager(FrameManager):
     def __init__(self):
         self.shm_store: dict[str, UntrackedSharedMemory] = {}
 
-    def create(self, name: str, size) -> AnyStr:
+    def create(self, name: str, size) -> memoryview:
         try:
             shm = UntrackedSharedMemory(
                 name=name,
@@ -1073,7 +1079,10 @@ class SharedMemoryFrameManager(FrameManager):
             shm = UntrackedSharedMemory(name=name)
 
         self.shm_store[name] = shm
-        return shm.buf
+        buffer = shm.buf
+        if buffer is None:
+            raise RuntimeError(f"Shared memory buffer unavailable for {name}")
+        return buffer
 
     def write(self, name: str) -> memoryview | None:
         try:
@@ -1087,7 +1096,7 @@ class SharedMemoryFrameManager(FrameManager):
             logger.info(f"the file {name} not found")
             return None
 
-    def get(self, name: str, shape) -> np.ndarray | None:
+    def get(self, name: str, shape: Any) -> np.ndarray | None:
         try:
             required = int(np.prod(shape))
             shm = self.shm_store.get(name)
@@ -1178,7 +1187,11 @@ def add_mask(mask: str, mask_img: np.ndarray):
             for i in range(0, len(points), 2)
         ]
     )
-    cv2.fillPoly(mask_img, pts=[contour], color=(0))
+    cv2.fillPoly(
+        cast(np.ndarray[Any, Any], mask_img),
+        [cast(np.ndarray[Any, Any], contour.astype(np.int32))],
+        cast(Any, 0),
+    )
 
 
 def run_ffmpeg_snapshot(

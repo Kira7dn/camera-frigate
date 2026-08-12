@@ -6,7 +6,7 @@ import time
 from collections import Counter, OrderedDict
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 from frigate.infrastructure.comms.event_metadata_updater import (
     EventMetadataPublisher,
@@ -259,8 +259,14 @@ class EventProcessor(threading.Thread):
                 camera=str(payload["camera"]),
                 event_id=str(payload["event_id"]),
                 frame_time=float(payload["frame_time"]),
-                person_box=tuple(int(value) for value in payload["person_box"]),
-                face_box=tuple(int(value) for value in payload["face_box"]),
+                person_box=cast(
+                    tuple[int, int, int, int],
+                    tuple(int(value) for value in payload["person_box"]),
+                ),
+                face_box=cast(
+                    tuple[int, int, int, int],
+                    tuple(int(value) for value in payload["face_box"]),
+                ),
                 sub_label=str(payload["sub_label"]),
                 face_score=float(payload["face_score"]),
                 artifact_path=os.path.abspath(str(payload["artifact_path"])),
@@ -683,6 +689,7 @@ class EventProcessor(threading.Thread):
                     ),
                 },
             }
+            event = cast(dict[Any, Any], event)
 
             # only overwrite the sub_label in the database if it's set
             if event_data.get("sub_label") is not None and not face_snapshot_pending:
@@ -761,7 +768,14 @@ class EventProcessor(threading.Thread):
 
         if event_type == EventStateEnum.end:
             del self.events_in_process[event_data["id"]]
-            self.event_end_publisher.publish((event_data["id"], camera, updated_db))  # type: ignore[arg-type]
+            self.event_end_publisher.publish(
+                (
+                    EventTypeEnum.tracked_object,
+                    cast(EventStateEnum, event_type),
+                    camera,
+                    event_data,
+                )
+            )
 
     def handle_external_detection(
         self, event_type: EventStateEnum, event_data: dict[str, Any]
@@ -789,6 +803,7 @@ class EventProcessor(threading.Thread):
                     "snapshot_clean": event_data.get("snapshot_clean", False),
                 },
             }
+            event = cast(dict[Any, Any], event)
             if event_data.get("draw") is not None:
                 event[Event.data]["draw"] = event_data["draw"]
             if event_data.get("recognized_license_plate") is not None:

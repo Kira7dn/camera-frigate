@@ -6,7 +6,7 @@ title: Available Objects
 import ConfigTabs from "@site/src/components/ConfigTabs";
 import TabItem from "@theme/TabItem";
 import NavPath from "@site/src/components/NavPath";
-import labels from "../../../labelmap.txt";
+import labels from "../../../config/assets/labelmap.txt";
 
 Frigate includes the object labels listed below from the Google Coral test data.
 

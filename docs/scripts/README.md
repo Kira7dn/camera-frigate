@@ -175,7 +175,7 @@ docs/scripts/
 
 | Source | Path | What it provides |
 |--------|------|------------------|
-| Pydantic models | `frigate/config/` | Field names, types, defaults, nesting |
+| Pydantic models | `frigate/src/frigate/infrastructure/config/` | Field names, types, defaults, nesting |
 | JSON schema | Generated from Pydantic at runtime | Full schema with `$defs` and `$ref` |
 | i18n (global) | `web/public/locales/en/config/global.json` | Field labels for global settings |
 | i18n (cameras) | `web/public/locales/en/config/cameras.json` | Field labels for camera settings |

@@ -1,4 +1,4 @@
-"""Manages camera object detection processes."""
+﻿"""Manages camera object detection processes."""
 
 import logging
 import queue
@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 import cv2
 
@@ -93,13 +93,13 @@ class CameraTracker(FrigateProcess):
 
         motion_detector = ImprovedMotionDetector(
             frame_shape,
-            self.config.motion,
+            cast(Any, self.config.motion),
             self.config.detect.fps,
-            name=self.config.name,
+            name=self.config.name or "",
             ptz_metrics=self.ptz_metrics,
         )
         object_detector = RemoteObjectDetector(
-            self.config.name,
+            self.config.name or "",
             self.labelmap,
             self.detection_queue,
             self.model_config,
@@ -157,11 +157,13 @@ def detect(
         size = region[2] - region[0]
         x_min = int(max(0, (box[1] * size) + region[0]))
         y_min = int(max(0, (box[0] * size) + region[1]))
-        x_max = int(min(detect_config.width - 1, (box[3] * size) + region[0]))
-        y_max = int(min(detect_config.height - 1, (box[2] * size) + region[1]))
+        frame_width = detect_config.width or 1
+        frame_height = detect_config.height or 1
+        x_max = int(min(frame_width - 1, (box[3] * size) + region[0]))
+        y_max = int(min(frame_height - 1, (box[2] * size) + region[1]))
 
         # ignore objects that were detected outside the frame
-        if (x_min >= detect_config.width - 1) or (y_min >= detect_config.height - 1):
+        if (x_min >= frame_width - 1) or (y_min >= frame_height - 1):
             continue
 
         width = x_max - x_min
@@ -178,11 +180,11 @@ def detect(
 
 def process_frames(
     requestor: InterProcessRequestor,
-    frame_queue: Queue,
+    frame_queue: queue.Queue,
     frame_shape: tuple[int, int],
     model_config: ModelConfig,
     camera_config: CameraConfig,
-    frame_manager: FrameManager,
+    frame_manager: SharedMemoryFrameManager,
     motion_detector: MotionDetector,
     object_detector: RemoteObjectDetector,
     object_tracker: ObjectTracker,
@@ -193,10 +195,12 @@ def process_frames(
     region_grid: list[list[dict[str, Any]]],
     exit_on_empty: bool = False,
 ):
+    motion_detector = cast(Any, motion_detector)
+    object_tracker = cast(Any, object_tracker)
     next_region_update = get_tomorrow_at_time(2)
     config_subscriber = CameraConfigUpdateSubscriber(
         None,
-        {camera_config.name: camera_config},
+        {camera_config.name or "": camera_config},
         [
             CameraConfigUpdateEnum.detect,
             CameraConfigUpdateEnum.enabled,
@@ -470,7 +474,7 @@ def process_frames(
                 if detection[0] in {"car", "person"}:
                     passage_trace(
                         "detector_hit",
-                        camera=camera_config.name,
+                        camera=camera_config.name or "",
                         frame_time=frame_time,
                         label=detection[0],
                         score=float(detection[1]),
@@ -511,7 +515,7 @@ def process_frames(
                 lambda o: attribute.label in attributes_map.get(o["label"], []),
                 all_objects,
             )
-            selected_object_id = attribute.find_best_object(filtered_objects)
+            selected_object_id = attribute.find_best_object(list(filtered_objects))
 
             if selected_object_id is not None:
                 detections[selected_object_id]["attributes"].append(
@@ -612,3 +616,4 @@ def process_frames(
     motion_detector.stop()
     requestor.stop()
     config_subscriber.stop()
+

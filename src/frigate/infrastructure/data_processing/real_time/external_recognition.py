@@ -1,4 +1,4 @@
-"""Fail-closed Frigate adapter for the dedicated recognition runtime."""
+﻿"""Fail-closed Frigate adapter for the dedicated recognition runtime."""
 
 from __future__ import annotations
 
@@ -30,11 +30,11 @@ from frigate.application.recognition.contracts import (
     TrackedObservation,
     TrackKey,
 )
-from frigate.application.recognition.service.config_fingerprint import canonical_config_json
-from frigate.application.recognition.service.evidence import RawI420Evidence
-from frigate.application.recognition.service.grpc_client import TlsClientConfig
-from frigate.application.recognition.service.threaded_client import ThreadedRecognitionClient
-from frigate.application.recognition.service.v1 import recognition_pb2 as pb
+from extension.recognition.config_fingerprint import canonical_config_json
+from extension.recognition.evidence import RawI420Evidence
+from extension.recognition.grpc_client import TlsClientConfig
+from extension.recognition.threaded_client import ThreadedRecognitionClient
+from extension.recognition.v1 import recognition_pb2 as pb
 from frigate.util.face_snapshot import (
     FaceAttemptJob,
     FaceRecognitionResult,

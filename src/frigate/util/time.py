@@ -45,7 +45,7 @@ def is_current_hour(timestamp: int) -> bool:
 
 def get_dst_transitions(
     tz_name: str, start_time: float, end_time: float
-) -> list[tuple[float, float]]:
+) -> list[tuple[float, float, int]]:
     """
     Find DST transition points and return time periods with consistent offsets.
 

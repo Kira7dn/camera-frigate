@@ -10,7 +10,7 @@
 <img src="https://hosted.weblate.org/widget/frigate-nvr/language-badge.svg" alt="Translation status" />
 </a>
 
-\[English\] | [简体中文](https://github.com/blakeblackshear/frigate/blob/dev/README_CN.md)
+\[English\] | [简体中文](docs/reference/README_CN.md)
 
 A complete and local NVR designed for [Home Assistant](https://www.home-assistant.io) with AI object detection. Uses OpenCV and Tensorflow to perform realtime object detection locally for IP cameras.
 
@@ -42,7 +42,7 @@ This project is licensed under the **MIT License**.
 - **Code:** The source code, configuration files, and documentation in this repository are available under the [MIT License](LICENSE). You are free to use, modify, and distribute the code as long as you include the original copyright notice.
 - **Trademarks:** The "Frigate" name, the "Frigate NVR" brand, and the Frigate logo are **trademarks of Frigate, Inc.** and are **not** covered by the MIT License.
 
-Please see our [Trademark Policy](TRADEMARK.md) for details on acceptable use of our brand assets.
+Please see our [Trademark Policy](docs/reference/TRADEMARK.md) for details on acceptable use of our brand assets.
 
 ## Screenshots
 

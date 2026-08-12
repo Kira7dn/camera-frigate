@@ -1,1 +1,0 @@
-"""External recognition service transport."""

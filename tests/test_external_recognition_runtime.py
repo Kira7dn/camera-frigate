@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter
 from types import SimpleNamespace
@@ -20,8 +20,8 @@ from frigate.application.recognition.contracts import (
     TrackedObservation,
     TrackKey,
 )
-from frigate.application.recognition.service.models import FaceRecognitionModel
-from frigate.application.recognition.service.threaded_client import ClientResult
+from extension.recognition.models import FaceRecognitionModel
+from extension.recognition.threaded_client import ClientResult
 
 
 class FakeClient:

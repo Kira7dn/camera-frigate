@@ -1,4 +1,4 @@
-"""Notification apis."""
+﻿"""Notification apis."""
 
 import datetime
 import hashlib
@@ -29,7 +29,7 @@ from frigate.infrastructure.config.camera.notification import (
 from frigate.const import CONFIG_DIR
 from frigate.models import User
 from frigate.application.notifications.media import load_snapshot
-from camera_platform.tracker.adapters.media import resolve_media_id
+from extension.tracker.adapters.media import resolve_media_id
 from frigate.util.config import find_config_file
 
 logger = logging.getLogger(__name__)

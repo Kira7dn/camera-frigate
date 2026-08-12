@@ -1,4 +1,4 @@
-"""Shared bootstrap for embedded and edge-owned camera lanes."""
+﻿"""Shared bootstrap for embedded and edge-owned camera lanes."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from frigate.const import (
 )
 from frigate.models import Recordings, Regions, ReviewSegment
 from frigate.domain.object_detection.base import ObjectDetectProcess
-from camera_platform.topology.compiler import PlatformTopologyPlan, compile_topology
+from extension.topology.compiler import PlatformTopologyPlan, compile_topology
 from frigate.util.image import UntrackedSharedMemory
 
 logger = logging.getLogger(__name__)

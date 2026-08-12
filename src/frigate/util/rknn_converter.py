@@ -94,7 +94,7 @@ def is_rknn_compatible(model_path: str, model_type: str | None = None) -> bool:
 def ensure_torch_dependencies() -> bool:
     """Dynamically install torch dependencies if not available."""
     try:
-        import torch  # type: ignore
+        import torch
 
         logger.debug("PyTorch is already available")
         return True
@@ -117,7 +117,7 @@ def ensure_torch_dependencies() -> bool:
                 stderr=subprocess.DEVNULL,
             )
 
-            import torch  # type: ignore # noqa: F401
+            import torch  # noqa: F401
 
             logger.info("PyTorch installed successfully")
             return True

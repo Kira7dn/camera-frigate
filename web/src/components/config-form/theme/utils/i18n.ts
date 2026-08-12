@@ -75,7 +75,7 @@ export function buildTranslationPath(
   // to `filters_attribute.<field>` when the dynamic key is an attribute
   // label (face, license_plate, courier logos) so attribute filter fields
   // pick up the attribute-worded translations emitted by
-  // generate_config_translations.py.
+  // tools/generators/generate_config_translations.py.
   // Example: filters.person.threshold      -> filters.threshold
   // Example: filters.face.min_area         -> filters_attribute.min_area
   const filtersIndex = stringSegments.indexOf("filters");

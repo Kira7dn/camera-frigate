@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import copy
@@ -21,34 +21,34 @@ from frigate.domain.camera.state import CameraState
 from frigate.infrastructure.config import FrigateConfig
 from frigate.infrastructure.config.tracker import TrackerConfig
 from frigate.models import EdgeMediaManifest, EventObservation, TrackerJournalEntry
-from camera_platform.topology.compiler import compile_topology, materialize_topology
-from camera_platform.tracker.adapters.canonical import TrackerCanonicalStore
-from camera_platform.tracker.adapters.frigate import TrackerMaintainer
-from camera_platform.tracker.adapters.ingest import TrackerHostIngest, TrackerIngestError
-from camera_platform.tracker.adapters.media import resolve_event_media, resolve_media_id
-from camera_platform.tracker.config.fingerprint import (
+from extension.topology.compiler import compile_topology, materialize_topology
+from extension.tracker.adapters.canonical import TrackerCanonicalStore
+from extension.tracker.adapters.frigate import TrackerMaintainer
+from extension.tracker.adapters.ingest import TrackerHostIngest, TrackerIngestError
+from extension.tracker.adapters.media import resolve_event_media, resolve_media_id
+from extension.tracker.config.fingerprint import (
     canonical_tracker_config_json,
     tracker_config_fingerprint,
 )
-from camera_platform.tracker.domain.contracts import (
+from extension.tracker.domain.contracts import (
     BoundingBox,
     MediaManifest,
     TrackerOperation,
     TrackerUpdate,
 )
-from camera_platform.tracker.runtime.evidence import (
+from extension.tracker.runtime.evidence import (
     EvidenceCapacityError,
     EvidenceRing,
     EvidenceUnavailableError,
 )
-from camera_platform.tracker.runtime.journal import EdgeJournal, SpoolFullError
-from camera_platform.tracker.runtime.media import MediaAuthority
-from camera_platform.tracker.runtime.processor import EdgeTrackedObjectProcessor
-from camera_platform.tracker.runtime.producer import ProducerContext, TrackerProducerCore
-from camera_platform.tracker.service.grpc_server import TrackerGrpcService
-from camera_platform.tracker.service.v1 import tracker_pb2 as pb
-from camera_platform.tracker.service.wire import update_from_proto, update_to_proto
-from camera_platform.tracker.domain.lifecycle import apply_media_policy, project_tracker_observation
+from extension.tracker.runtime.journal import EdgeJournal, SpoolFullError
+from extension.tracker.runtime.media import MediaAuthority
+from extension.tracker.runtime.processor import EdgeTrackedObjectProcessor
+from extension.tracker.runtime.producer import ProducerContext, TrackerProducerCore
+from extension.tracker.service.grpc_server import TrackerGrpcService
+from extension.tracker.service.v1 import tracker_pb2 as pb
+from extension.tracker.service.wire import update_from_proto, update_to_proto
+from extension.tracker.domain.lifecycle import apply_media_policy, project_tracker_observation
 
 
 def _update(

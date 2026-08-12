@@ -131,7 +131,9 @@ class ModelConfig(BaseModel):
 
         labelmap_path = config.get("labelmap_path") or "/labelmap.txt"
         if labelmap_path == "/labelmap.txt" and not os.path.exists(labelmap_path):
-            labelmap_path = str(Path(__file__).resolve().parents[4] / "labelmap.txt")
+            labelmap_path = str(
+                Path(__file__).resolve().parents[4] / "config" / "assets" / "labelmap.txt"
+            )
 
         self._merged_labelmap = {
             **load_labels(labelmap_path),

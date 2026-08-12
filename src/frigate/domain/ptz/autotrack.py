@@ -137,17 +137,20 @@ class PtzMotionEstimator:
                 mask[y1:y2, x1:x2] = 0
 
             # merge camera config motion mask with detections. Norfair function needs 0,1 mask
-            mask = np.bitwise_and(mask, self.camera_config.motion.rasterized_mask).clip(
-                max=1
-            )
+            configured_mask = getattr(self.camera_config.motion, "rasterized_mask", None)
+            if configured_mask is not None:
+                mask = np.bitwise_and(mask, configured_mask).clip(max=1)
 
             # Norfair estimator function needs color so it can convert it right back to gray
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGRA)
 
+            estimator = self.norfair_motion_estimator
+            if estimator is None:
+                self.frame_manager.close(frame_name)
+                return self.coord_transformations
+
             try:
-                self.coord_transformations = self.norfair_motion_estimator.update(
-                    frame, mask
-                )
+                self.coord_transformations = estimator.update(frame, mask)
             except Exception:
                 # sometimes opencv can't find enough features in the image to find homography, so catch this error
                 # https://github.com/tryolabs/norfair/pull/278
@@ -169,9 +172,12 @@ class PtzMotionEstimator:
                 self.coord_transformations = None
                 self.ptz_metrics.reset.set()
 
+            transformations = self.coord_transformations
             try:
+                if transformations is None:
+                    return self.coord_transformations
                 logger.debug(
-                    f"{camera}: Motion estimator transformation: {self.coord_transformations.rel_to_abs([[0, 0]])}"
+                    f"{camera}: Motion estimator transformation: {transformations.rel_to_abs(np.array([[0, 0]]))}"
                 )
             except Exception:
                 pass
@@ -233,7 +239,7 @@ class PtzAutoTracker:
         self,
         config: FrigateConfig,
         onvif: OnvifController,
-        ptz_metrics: PTZMetrics,
+        ptz_metrics: dict[str, PTZMetrics],
         dispatcher: Dispatcher,
         stop_event: MpEvent,
         config_patch_sink: Callable[[str, dict[str, Any]], None] | None = None,
@@ -244,21 +250,21 @@ class PtzAutoTracker:
         self.dispatcher = dispatcher
         self.stop_event = stop_event
         self.config_patch_sink = config_patch_sink
-        self.tracked_object: dict[str, object] = {}
-        self.tracked_object_history: dict[str, object] = {}
-        self.tracked_object_metrics: dict[str, object] = {}
-        self.object_types: dict[str, object] = {}
-        self.required_zones: dict[str, object] = {}
-        self.move_queues: dict[str, object] = {}
-        self.move_queue_locks: dict[str, object] = {}
-        self.move_threads: dict[str, object] = {}
-        self.autotracker_init: dict[str, object] = {}
-        self.move_metrics: dict[str, object] = {}
-        self.calibrating: dict[str, object] = {}
-        self.intercept: dict[str, object] = {}
-        self.move_coefficients: dict[str, object] = {}
+        self.tracked_object: dict[str, Any] = {}
+        self.tracked_object_history: dict[str, Any] = {}
+        self.tracked_object_metrics: dict[str, Any] = {}
+        self.object_types: dict[str, Any] = {}
+        self.required_zones: dict[str, Any] = {}
+        self.move_queues: dict[str, Any] = {}
+        self.move_queue_locks: dict[str, Any] = {}
+        self.move_threads: dict[str, Any] = {}
+        self.autotracker_init: dict[str, Any] = {}
+        self.move_metrics: dict[str, Any] = {}
+        self.calibrating: dict[str, Any] = {}
+        self.intercept: dict[str, Any] = {}
+        self.move_coefficients: dict[str, Any] = {}
         self.zoom_time: dict[str, float] = {}
-        self.zoom_factor: dict[str, object] = {}
+        self.zoom_factor: dict[str, Any] = {}
 
         self.config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
@@ -382,30 +388,28 @@ class PtzAutoTracker:
                 self._process_move_queue(camera), self.onvif.loop
             )
 
-            if camera_config.onvif.autotracking.movement_weights:
-                if len(camera_config.onvif.autotracking.movement_weights) == 6:
-                    camera_config.onvif.autotracking.movement_weights = [
-                        float(val)
-                        for val in camera_config.onvif.autotracking.movement_weights
-                    ]
+            movement_weights = camera_config.onvif.autotracking.movement_weights
+            if movement_weights:
+                if len(movement_weights) == 6:
+                    weights = [float(val) for val in movement_weights]
                     self.ptz_metrics[
                         camera
                     ].min_zoom.value = (
-                        camera_config.onvif.autotracking.movement_weights[0]
+                        weights[0]
                     )
                     self.ptz_metrics[
                         camera
                     ].max_zoom.value = (
-                        camera_config.onvif.autotracking.movement_weights[1]
+                        weights[1]
                     )
                     self.intercept[camera] = (
-                        camera_config.onvif.autotracking.movement_weights[2]
+                        weights[2]
                     )
                     self.move_coefficients[camera] = (
-                        camera_config.onvif.autotracking.movement_weights[3:5]
+                        weights[3:5]
                     )
                     self.zoom_time[camera] = (
-                        camera_config.onvif.autotracking.movement_weights[5]
+                        weights[5]
                     )
                 else:
                     camera_config.onvif.autotracking.enabled = False
@@ -818,9 +822,9 @@ class PtzAutoTracker:
         )
 
         centroid_distance = np.linalg.norm(
-            [
-                obj.obj_data["centroid"][0] - camera_config.detect.width / 2,
-                obj.obj_data["centroid"][1] - camera_config.detect.height / 2,
+                [
+                obj.obj_data["centroid"][0] - (camera_config.detect.width or 0) / 2,
+                obj.obj_data["centroid"][1] - (camera_config.detect.height or 0) / 2,
             ]
         )
 
@@ -1080,7 +1084,7 @@ class PtzAutoTracker:
             and self.tracked_object_metrics[camera]["valid_velocity"]
             else 0.03
         )
-        distance_threshold = percentage * max_frame * scaling_factor
+        distance_threshold = percentage * (max_frame or 1) * scaling_factor
 
         logger.debug(f"{camera}: Distance threshold: {distance_threshold}")
 
@@ -1579,7 +1583,7 @@ class PtzAutoTracker:
         autotracker_config = self.config.cameras[camera].onvif.autotracking
 
         if not self.autotracker_init[camera]:
-            self._autotracker_setup(self.config.cameras[camera], camera)
+            await self._autotracker_setup(self.config.cameras[camera], camera)
         # regularly update camera status
         if not self.ptz_metrics[camera].motor_stopped.is_set():
             await self.onvif.get_camera_status(camera)

@@ -126,7 +126,7 @@ class LicensePlateProcessingMixin:
             )
 
         try:
-            outputs = cast(Any, self.model_runner.detection_model)(
+            outputs = (self.model_runner.detection_model)(
                 [normalized_image]
             )[0]
         except Exception as e:
@@ -169,7 +169,7 @@ class LicensePlateProcessingMixin:
                 norm_images.append(norm_img)
 
         try:
-            outputs = cast(Any, self.model_runner.classification_model)(norm_images)
+            outputs = (self.model_runner.classification_model)(norm_images)
         except Exception as e:
             logger.warning(f"Error running LPR classification model: {e}")
             return None
@@ -232,7 +232,7 @@ class LicensePlateProcessingMixin:
                 norm_images.append(norm_image)
 
         try:
-            recognition_model = cast(Any, self.model_runner.recognition_model)
+            recognition_model = self.model_runner.recognition_model
             outputs = recognition_model(norm_images)
         except Exception as e:
             logger.warning(f"Error running LPR recognition model: {e}")
@@ -1130,7 +1130,7 @@ class LicensePlateProcessingMixin:
         """
         self._last_plate_detector_score = None
         try:
-            predictions = cast(Any, self.model_runner.yolov9_detection_model)(input)
+            predictions = (self.model_runner.yolov9_detection_model)(input)
         except Exception as e:
             logger.warning(f"Error running YOLOv9 license plate detection model: {e}")
             return None

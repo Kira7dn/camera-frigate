@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import logging
 import multiprocessing as mp
 import os
@@ -80,13 +80,13 @@ from frigate.domain.record.cleanup import RecordingCleanup
 from frigate.domain.record.export import migrate_exports
 from frigate.domain.record.record import RecordProcess
 from frigate.application.review.review import ReviewProcess
-from camera_platform.topology.compiler import compile_topology
+from extension.topology.compiler import compile_topology
 from frigate.application.stats.emitter import StatsEmitter
 from frigate.application.stats.util import stats_init
 from frigate.storage import StorageMaintainer
 from frigate.timeline import TimelineProcessor
 from frigate.domain.track.object_processing import TrackedObjectProcessor
-from camera_platform.tracker.adapters.frigate import TrackerMaintainer
+from extension.tracker.adapters.frigate import TrackerMaintainer
 from frigate.util.builtin import empty_and_close_queue
 from frigate.util.process import FrigateProcess
 from frigate.util.services import set_file_limit

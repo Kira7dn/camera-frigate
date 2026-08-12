@@ -1,11 +1,11 @@
-services:
+﻿services:
   recognition:
     profiles: ["recognition"]
-    container_name: frigate-recognition
+    container_name: frigate-recognition-runner
     build:
       context: .
       dockerfile: docker/main/Dockerfile
-      target: recognition-runtime
+      target: camera-platform-recognition-runner
     command:
       - --config
       - /config/config.yml

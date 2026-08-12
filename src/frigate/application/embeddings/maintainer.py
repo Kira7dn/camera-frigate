@@ -1,4 +1,4 @@
-"""Maintain embeddings in SQLite-vec."""
+﻿"""Maintain embeddings in SQLite-vec."""
 
 import base64
 import json
@@ -64,7 +64,7 @@ from frigate.application.events.types import (
 )
 from frigate.application.genai import GenAIClientManager
 from frigate.models import Event, Recordings, ReviewSegment, Trigger
-from camera_platform.topology.compiler import compile_topology
+from extension.topology.compiler import compile_topology
 from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import serialize
 from frigate.util.file import get_event_thumbnail_bytes

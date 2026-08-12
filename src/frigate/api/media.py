@@ -1,4 +1,4 @@
-"""Image and video apis."""
+﻿"""Image and video apis."""
 
 import asyncio
 import glob
@@ -9,7 +9,7 @@ import subprocess as sp
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path as FilePath
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote
 
 import cv2
@@ -55,7 +55,7 @@ from frigate.models import (
 from frigate.infrastructure.output.preview import get_most_recent_preview_frame
 from frigate.domain.record.clip import prepare_recording_clip
 from frigate.domain.track.object_processing import TrackedObjectProcessor
-from camera_platform.tracker.adapters.media import resolve_event_media
+from extension.tracker.adapters.media import resolve_event_media
 from frigate.util.file import (
     get_event_snapshot_path,
     get_event_thumbnail_bytes,
@@ -321,10 +321,13 @@ async def latest_frame(
         and request.app.frigate_config.birdseye.enabled
         and request.app.frigate_config.birdseye.restream
     ):
-        frame = cv2.cvtColor(
-            frame_processor.get_current_frame(camera_name),
-            cv2.COLOR_YUV2BGR_I420,
-        )
+        current_frame = frame_processor.get_current_frame(camera_name)
+        if current_frame is None:
+            return JSONResponse(
+                content={"success": False, "message": "Frame unavailable"},
+                status_code=503,
+            )
+        frame = cv2.cvtColor(current_frame, cv2.COLOR_YUV2BGR_I420)
 
         height = int(params.height or str(frame.shape[0]))
         width = int(height * frame.shape[1] / frame.shape[0])
@@ -357,7 +360,7 @@ async def get_snapshot_from_recording(
     camera_name: str,
     frame_time: float,
     format: str = Path(enum=["png", "jpg"]),
-    height: int = None,
+    height: int | None = None,
 ):
     if camera_name not in request.app.frigate_config.cameras:
         return JSONResponse(
@@ -438,7 +441,7 @@ async def get_snapshot_from_recording(
     "/{camera_name}/plus/{frame_time}", dependencies=[Depends(require_camera_access)]
 )
 async def submit_recording_snapshot_to_plus(
-    request: Request, camera_name: str, frame_time: str
+    request: Request, camera_name: str, frame_time: float
 ):
     if camera_name not in request.app.frigate_config.cameras:
         return JSONResponse(
@@ -446,7 +449,6 @@ async def submit_recording_snapshot_to_plus(
             status_code=404,
         )
 
-    frame_time = float(frame_time)
     recording_query = (
         Recordings.select(
             Recordings.path,
@@ -465,7 +467,7 @@ async def submit_recording_snapshot_to_plus(
         recording: Recordings = recording_query.get()
         time_in_segment = frame_time - recording.start_time
         image_data = get_image_from_recording(
-            config.ffmpeg, recording.path, time_in_segment, "png"
+            config.ffmpeg, cast(str, recording.path), time_in_segment, "png"
         )
 
         if not image_data:
@@ -518,13 +520,15 @@ async def recording_clip(
             text=False,
         ) as ffmpeg:
             while True:
+                if ffmpeg.stdout is None:
+                    raise RuntimeError("ffmpeg stdout is unavailable")
                 data = ffmpeg.stdout.read(8192)
                 if data is not None and len(data) > 0:
                     yield data
                 else:
                     if ffmpeg.returncode and ffmpeg.returncode != 0:
                         logger.error(
-                            f"Failed to generate clip, ffmpeg logs: {ffmpeg.stderr.read()}"
+                            f"Failed to generate clip, ffmpeg logs: {ffmpeg.stderr.read() if ffmpeg.stderr is not None else ''}"
                         )
                     else:
                         FilePath(file_path).unlink(missing_ok=True)
@@ -627,9 +631,10 @@ async def vod_ts(
         # segment. Snap clipFrom back to the preceding keyframe so the
         # segment always starts with a decodable frame.
         if "clipFrom" in clip:
-            keyframe_ms = get_keyframe_before(recording.path, clip["clipFrom"])
+            clip_from = int(cast(str, clip["clipFrom"]))
+            keyframe_ms = get_keyframe_before(cast(str, recording.path), clip_from)
             if keyframe_ms is not None:
-                gained = clip["clipFrom"] - keyframe_ms
+                gained = clip_from - keyframe_ms
                 clip["clipFrom"] = keyframe_ms
                 duration += gained
                 logger.debug(
@@ -719,7 +724,7 @@ async def vod_hour(
     parts = year_month.split("-")
     start_date = (
         datetime(int(parts[0]), int(parts[1]), day, hour, tzinfo=UTC)
-        - datetime.now(pytz.timezone(tz_name.replace(",", "/"))).utcoffset()
+        - (datetime.now(pytz.timezone(tz_name.replace(",", "/"))).utcoffset() or timedelta())
     )
     end_date = start_date + timedelta(hours=1) - timedelta(milliseconds=1)
     start_ts = start_date.timestamp()
@@ -750,14 +755,14 @@ async def vod_event(
             status_code=404,
         )
 
-    await require_camera_access(event.camera, request=request)
+    await require_camera_access(cast(str | None, event.camera), request=request)
 
     end_ts = (
         datetime.now().timestamp()
         if event.end_time is None
         else (event.end_time + padding)
     )
-    vod_response = await vod_ts(event.camera, event.start_time - padding, end_ts)
+    vod_response = await vod_ts(cast(str, event.camera), event.start_time - padding, end_ts)
 
     # If the recordings are not found and the event started more than 5 minutes ago, set has_clip to false
     if (
@@ -799,7 +804,7 @@ async def event_snapshot(
     try:
         event = Event.get(Event.id == event_id, Event.end_time != None)
         event_complete = True
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
         if not event.has_snapshot:
             return JSONResponse(
                 content={"success": False, "message": "Snapshot not available"},
@@ -814,9 +819,9 @@ async def event_snapshot(
                     f"attachment; filename=snapshot-{event_id}.jpg"
                 )
             return edge_response
-        artifact = CanonicalMediaStore().get(event.canonical_artifact_id)
+        artifact = CanonicalMediaStore().get(cast(str | None, event.canonical_artifact_id))
         if artifact is not None:
-            jpg_bytes = CanonicalMediaStore().bytes(artifact.id)
+            jpg_bytes = CanonicalMediaStore().bytes(cast(str | None, artifact.id))
             frame_time = EventEvidence.get_by_id(artifact.evidence_id).frame_time
         else:
             return JSONResponse(
@@ -877,7 +882,7 @@ async def event_snapshot(
     return Response(
         jpg_bytes,
         media_type="image/jpeg",
-        headers=headers,
+        headers=cast(dict[str, str], headers),
     )
 
 
@@ -897,18 +902,18 @@ async def event_thumbnail(
     event_complete = False
     try:
         event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
         if event.end_time is not None:
             event_complete = True
-            artifact = CanonicalMediaStore().get(event.canonical_artifact_id)
+            artifact = CanonicalMediaStore().get(cast(str | None, event.canonical_artifact_id))
             if artifact is not None:
-                thumbnail_bytes = CanonicalMediaStore().bytes(artifact.id)
+                thumbnail_bytes = CanonicalMediaStore().bytes(cast(str | None, artifact.id))
                 return Response(
                     thumbnail_bytes,
                     media_type="image/jpeg",
                     headers={
                         "Cache-Control": f"private, max-age={_resolve_cache_age(max_cache_age)}",
-                        "X-Media-Artifact-Id": artifact.id,
+                        "X-Media-Artifact-Id": str(artifact.id),
                         "ETag": f'"{artifact.sha256}"',
                     },
                 )
@@ -944,26 +949,32 @@ async def event_thumbnail(
 
     img_as_np = np.frombuffer(thumbnail_bytes, dtype=np.uint8)
     img = cv2.imdecode(img_as_np, flags=1)
+    if img is None:
+        return JSONResponse(
+            content={"success": False, "message": "Invalid thumbnail image"},
+            status_code=422,
+        )
+    image = cast(np.ndarray[Any, Any], img)
 
     # android notifications prefer a 2:1 ratio
     if format == "android":
         img = cv2.copyMakeBorder(
-            img,
+            image,
             0,
             0,
             int(img.shape[1] * 0.5),
             int(img.shape[1] * 0.5),
             cv2.BORDER_CONSTANT,
-            (0, 0, 0),
+            cast(Any, (0, 0, 0)),
         )
 
-    quality_params = None
+    quality_params: tuple[int, int] | None = None
     if extension in (Extension.jpg, Extension.jpeg):
-        quality_params = [int(cv2.IMWRITE_JPEG_QUALITY), 70]
+        quality_params = (int(cv2.IMWRITE_JPEG_QUALITY), 70)
     elif extension == Extension.webp:
-        quality_params = [int(cv2.IMWRITE_WEBP_QUALITY), 60]
+        quality_params = (int(cv2.IMWRITE_WEBP_QUALITY), 60)
 
-    _, encoded = cv2.imencode(f".{extension.value}", img, quality_params)
+    _, encoded = cv2.imencode(f".{extension.value}", image, cast(Any, quality_params))
     thumbnail_bytes = encoded.tobytes()
 
     return Response(
@@ -1124,7 +1135,7 @@ async def event_snapshot_clean(request: Request, event_id: str, download: bool =
     try:
         event = Event.get(Event.id == event_id)
         event_complete = event.end_time is not None
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
         snapshot_config = request.app.frigate_config.cameras[event.camera].snapshots
         if not (snapshot_config.enabled and event.has_snapshot):
             return JSONResponse(
@@ -1252,7 +1263,7 @@ async def event_clip(
             content={"success": False, "message": "Event not found"}, status_code=404
         )
 
-    await require_camera_access(event.camera, request=request)
+    await require_camera_access(cast(str | None, event.camera), request=request)
 
     if not event.has_clip:
         return JSONResponse(
@@ -1271,7 +1282,7 @@ async def event_clip(
         else event.end_time + padding
     )
     return await recording_clip(
-        request, event.camera, event.start_time - padding, end_ts
+        request, cast(str, event.camera), cast(float, event.start_time) - padding, end_ts
     )
 
 
@@ -1290,7 +1301,7 @@ async def review_clip(
             content={"success": False, "message": "Review not found"}, status_code=404
         )
 
-    await require_camera_access(review.camera, request=request)
+    await require_camera_access(cast(str | None, review.camera), request=request)
 
     end_ts = (
         datetime.now().timestamp()
@@ -1298,7 +1309,7 @@ async def review_clip(
         else review.end_time + padding
     )
     return await recording_clip(
-        request, review.camera, review.start_time - padding, end_ts
+        request, cast(str, review.camera), cast(float, review.start_time) - padding, end_ts
     )
 
 
@@ -1313,13 +1324,13 @@ async def event_preview(request: Request, event_id: str):
             content={"success": False, "message": "Event not found"}, status_code=404
         )
 
-    await require_camera_access(event.camera, request=request)
+    await require_camera_access(cast(str | None, event.camera), request=request)
 
-    start_ts = event.start_time
+    start_ts = cast(float, event.start_time)
     end_ts = start_ts + (
         min(event.end_time - event.start_time, 20) if event.end_time else 20
     )
-    return await preview_gif(request, event.camera, start_ts, end_ts)
+    return await preview_gif(request, cast(str, event.camera), start_ts, end_ts)
 
 
 @router.get(
@@ -1391,8 +1402,10 @@ async def preview_gif(
 
         process = await asyncio.to_thread(
             sp.run,
-            ffmpeg_cmd,
+            [str(value) for value in ffmpeg_cmd],
             capture_output=True,
+            encoding="utf-8",
+            text=False,
         )
 
         if process.returncode != 0:
@@ -1526,7 +1539,7 @@ async def preview_mp4(
     if datetime.fromtimestamp(start_ts) < datetime.now().replace(minute=0, second=0):
         # has preview mp4
         try:
-            preview: Previews = (
+            preview: Previews | None = (
                 Previews.select(
                     Previews.camera,
                     Previews.path,
@@ -1581,8 +1594,10 @@ async def preview_mp4(
 
         process = await asyncio.to_thread(
             sp.run,
-            ffmpeg_cmd,
+            [str(value) for value in ffmpeg_cmd],
             capture_output=True,
+            encoding="utf-8",
+            text=False,
         )
 
         if process.returncode != 0:
@@ -1701,7 +1716,7 @@ async def review_preview(
             status_code=404,
         )
 
-    await require_camera_access(review.camera, request=request)
+    await require_camera_access(cast(str | None, review.camera), request=request)
 
     padding = 8
     start_ts = review.start_time - padding
@@ -1710,9 +1725,9 @@ async def review_preview(
     )
 
     if format == "gif":
-        return await preview_gif(request, review.camera, start_ts, end_ts)
+        return await preview_gif(request, cast(str, review.camera), start_ts, end_ts)
     else:
-        return await preview_mp4(request, review.camera, start_ts, end_ts)
+        return await preview_mp4(request, cast(str, review.camera), start_ts, end_ts)
 
 
 @router.get(
@@ -1844,7 +1859,7 @@ async def label_snapshot(request: Request, camera_name: str, label: str):
 
     try:
         event: Event = event_query.get()
-        return await event_snapshot(request, event.id, MediaEventsSnapshotQueryParams())
+        return await event_snapshot(request, cast(str, event.id), MediaEventsSnapshotQueryParams())
     except DoesNotExist:
         frame = np.zeros((720, 1280, 3), np.uint8)
         _, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
@@ -1853,3 +1868,4 @@ async def label_snapshot(request: Request, camera_name: str, label: str):
             jpg.tobytes(),
             media_type="image/jpeg",
         )
+

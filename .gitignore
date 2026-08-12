@@ -1,40 +1,49 @@
+# Operating system and editor files
 .DS_Store
-__pycache__
-.mypy_cache
+Thumbs.db
 *.swp
-debug
-.claude/*
-.mcp.json
+.idea/
 .vscode/*
 !.vscode/launch.json
-config/*
-!config/*.example
-models
-*.mp4
-*.db
-*.db-*
-*.csv
-frigate/version.py
-web/build
-web/node_modules
-web/coverage
-web/.env
-core
-!/web/**/*.ts
-.idea/*
 
-# Local generated caches and build artifacts
+# Python environments, caches and build output
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
 .pytest_cache/
 .ruff_cache/
-.mypy_cache/
 .coverage
 .coverage.*
 htmlcov/
 *.egg-info/
-*.py[cod]
-.ipynb_checkpoints
+.ipynb_checkpoints/
 
-# Auto-generated Docker Compose Generator config files
-docs/src/components/DockerComposeGenerator/config/devices.ts
-docs/src/components/DockerComposeGenerator/config/hardware.ts
-docs/src/components/DockerComposeGenerator/config/ports.ts
+# Local tooling credentials and state
+.claude/
+.mcp.json
+debug/
+core/
+
+# Frigate local configuration and runtime state
+/config/*
+!/config/*.example
+/config/model_cache/
+*.db
+*.db-*
+
+# Local model and media payloads
+/models/
+*.mp4
+
+# Web generated dependencies and build output
+/web/node_modules/
+/web/dist/
+/web/build/
+/web/coverage/
+/web/.env
+
+# Generated Docker Compose Generator files
+/docs/src/components/DockerComposeGenerator/config/devices.ts
+/docs/src/components/DockerComposeGenerator/config/hardware.ts
+/docs/src/components/DockerComposeGenerator/config/ports.ts

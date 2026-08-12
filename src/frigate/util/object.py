@@ -539,11 +539,13 @@ def get_startup_regions(
 
 def reduce_detections(
     frame_shape: tuple[int, int],
-    all_detections: list[tuple[Any]],
-) -> list[tuple[Any]]:
+    all_detections: list[tuple[Any, ...]],
+) -> list[tuple[Any, ...]]:
     """Take a list of detections and reduce overlaps to create a list of confident detections."""
 
-    def reduce_overlapping_detections(detections: list[tuple[Any]]) -> list[tuple[Any]]:
+    def reduce_overlapping_detections(
+        detections: list[tuple[Any, ...]],
+    ) -> list[tuple[Any, ...]]:
         """apply non-maxima suppression to suppress weak, overlapping bounding boxes."""
         detected_object_groups = defaultdict(lambda: [])
         for detection in detections:

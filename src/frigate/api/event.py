@@ -1,4 +1,4 @@
-"""Event apis."""
+﻿"""Event apis."""
 
 import asyncio
 import base64
@@ -10,6 +10,7 @@ import random
 import string
 from functools import reduce
 from pathlib import Path
+from typing import Annotated, Any, cast
 from urllib.parse import unquote
 
 import numpy as np
@@ -95,34 +96,34 @@ def _build_attribute_filter_clause(attributes: str):
     description="Returns a list of events.",
 )
 def events(
-    params: EventsQueryParams = Depends(),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[EventsQueryParams, Depends()],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
-    camera = params.camera
-    cameras = params.cameras
+    camera = params.camera or "all"
+    cameras = params.cameras or "all"
 
     # handle old camera arg
     if cameras == "all" and camera != "all":
         cameras = camera
 
-    label = unquote(params.label)
-    labels = params.labels
+    label = unquote(params.label or "all")
+    labels = params.labels or "all"
 
     # handle old label arg
     if labels == "all" and label != "all":
         labels = label
 
-    sub_label = params.sub_label
-    sub_labels = params.sub_labels
+    sub_label = params.sub_label or "all"
+    sub_labels = params.sub_labels or "all"
 
     # handle old sub_label arg
     if sub_labels == "all" and sub_label != "all":
         sub_labels = sub_label
 
-    attributes = unquote(params.attributes)
+    attributes = unquote(params.attributes or "all")
 
-    zone = params.zone
-    zones = params.zones
+    zone = params.zone or "all"
+    zones = params.zones or "all"
 
     # handle old label arg
     if zones == "all" and zone != "all":
@@ -131,7 +132,7 @@ def events(
     limit = params.limit
     after = params.after
     before = params.before
-    time_range = params.time_range
+    time_range = params.time_range or DEFAULT_TIME_RANGE
     has_clip = params.has_clip
     has_snapshot = params.has_snapshot
     in_progress = params.in_progress
@@ -145,7 +146,7 @@ def events(
     min_length = params.min_length
     max_length = params.max_length
     event_id = params.event_id
-    recognized_license_plate = params.recognized_license_plate
+    recognized_license_plate = params.recognized_license_plate or "all"
 
     sort = params.sort
 
@@ -278,7 +279,7 @@ def events(
 
     if time_range != DEFAULT_TIME_RANGE:
         # get timezone arg to ensure browser times are used
-        tz_name = params.timezone
+        tz_name = params.timezone or "UTC"
         hour_modifier, minute_modifier, _ = get_tz_modifiers(tz_name)
 
         times = time_range.split(",")
@@ -389,8 +390,8 @@ def events(
     """,
 )
 def events_explore(
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
     limit: int = 10,
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     # get distinct labels for all events
     distinct_labels = (
@@ -488,24 +489,24 @@ def events_explore(
     """,
 )
 async def event_ids(ids: str, request: Request):
-    ids = ids.split(",")
+    event_ids = ids.split(",")
 
-    if not ids:
+    if not event_ids:
         return JSONResponse(
             content=({"success": False, "message": "Valid list of ids must be sent"}),
             status_code=400,
         )
 
-    for event_id in ids:
+    for event_id in event_ids:
         try:
             event = Event.get(Event.id == event_id)
-            await require_camera_access(event.camera, request=request)
+            await require_camera_access(cast(str | None, event.camera), request=request)
         except DoesNotExist:
             # we should not fail the entire request if an event is not found
             continue
 
     try:
-        events = Event.select().where(Event.id << ids).dicts().iterator()
+        events = Event.select().where(Event.id << event_ids).dicts().iterator()
         return JSONResponse(list(events))
     except Exception:
         return JSONResponse(
@@ -523,32 +524,32 @@ async def event_ids(ids: str, request: Request):
 )
 def events_search(
     request: Request,
-    params: EventsSearchQueryParams = Depends(),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[EventsSearchQueryParams, Depends()],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
-    query = params.query
-    search_type = params.search_type
+    query = params.query or ""
+    search_type = params.search_type or "similarity"
     include_thumbnails = params.include_thumbnails
     limit = params.limit
     sort = params.sort
 
     # Filters
-    cameras = params.cameras
-    labels = params.labels
-    sub_labels = params.sub_labels
-    attributes = unquote(params.attributes)
-    zones = params.zones
+    cameras = params.cameras or "all"
+    labels = params.labels or "all"
+    sub_labels = params.sub_labels or "all"
+    attributes = unquote(params.attributes or "all")
+    zones = params.zones or "all"
     after = params.after
     before = params.before
     min_score = params.min_score
     max_score = params.max_score
     min_speed = params.min_speed
     max_speed = params.max_speed
-    time_range = params.time_range
+    time_range = params.time_range or DEFAULT_TIME_RANGE
     has_clip = params.has_clip
     has_snapshot = params.has_snapshot
     is_submitted = params.is_submitted
-    recognized_license_plate = params.recognized_license_plate
+    recognized_license_plate = params.recognized_license_plate or "all"
 
     # for similarity search
     event_id = params.event_id
@@ -728,7 +729,7 @@ def events_search(
             event_filters.append(Event.data["average_estimated_speed"] <= max_speed)
 
     if time_range != DEFAULT_TIME_RANGE:
-        tz_name = params.timezone
+        tz_name = params.timezone or "UTC"
         hour_modifier, minute_modifier, _ = get_tz_modifiers(tz_name)
 
         times = time_range.split(",")
@@ -906,10 +907,10 @@ def events_search(
 
 @router.get("/events/summary", dependencies=[Depends(allow_any_authenticated())])
 def events_summary(
-    params: EventsSummaryQueryParams = Depends(),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[EventsSummaryQueryParams, Depends()],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
-    tz_name = params.timezone
+    tz_name = params.timezone or "UTC"
     has_clip = params.has_clip
     has_snapshot = params.has_snapshot
 
@@ -1021,7 +1022,7 @@ def events_summary(
 async def event(event_id: str, request: Request):
     try:
         event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
         return model_to_dict(event)
     except DoesNotExist:
         return JSONResponse(content="Event not found", status_code=404)
@@ -1064,7 +1065,9 @@ def set_retain(event_id: str):
     Returns a success message or an error if the event is not found.
     """,
 )
-async def send_to_plus(request: Request, event_id: str, body: SubmitPlusBody = None):
+async def send_to_plus(
+    request: Request, event_id: str, body: SubmitPlusBody | None = None
+):
     if not request.app.frigate_config.plus_api.is_active():
         message = "PLUS_API_KEY environment variable is not set"
         logger.error(message)
@@ -1082,7 +1085,7 @@ async def send_to_plus(request: Request, event_id: str, body: SubmitPlusBody = N
 
     try:
         event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         message = f"Event {event_id} not found"
         logger.error(message)
@@ -1205,7 +1208,7 @@ async def false_positive(request: Request, event_id: str):
 
     try:
         event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         message = f"Event {event_id} not found"
         logger.error(message)
@@ -1292,7 +1295,7 @@ async def false_positive(request: Request, event_id: str):
 async def delete_retain(event_id: str, request: Request):
     try:
         event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         return JSONResponse(
             content=({"success": False, "message": "Event " + event_id + " not found"}),
@@ -1322,14 +1325,15 @@ async def set_sub_label(
     event_id: str,
     body: EventsSubLabelBody,
 ):
+    event: Event | None = None
     try:
-        event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        event = Event.get(Event.id == event_id)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         event = None
 
     if request.app.detected_frames_processor:
-        tracked_obj: TrackedObject = None
+        tracked_obj: TrackedObject | None = None
 
         for state in request.app.detected_frames_processor.camera_states.values():
             tracked_obj = state.tracked_objects.get(event_id)
@@ -1381,14 +1385,15 @@ async def set_plate(
     event_id: str,
     body: EventsLPRBody,
 ):
+    event: Event | None = None
     try:
-        event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        event = Event.get(Event.id == event_id)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         event = None
 
     if request.app.detected_frames_processor:
-        tracked_obj: TrackedObject = None
+        tracked_obj: TrackedObject | None = None
 
         for state in request.app.detected_frames_processor.camera_states.values():
             tracked_obj = state.tracked_objects.get(event_id)
@@ -1444,7 +1449,7 @@ async def set_attributes(
 ):
     try:
         event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         return JSONResponse(
             content=({"success": False, "message": f"Event {event_id} not found."}),
@@ -1544,16 +1549,16 @@ async def set_description(
 ):
     try:
         event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         return JSONResponse(
             content=({"success": False, "message": "Event " + event_id + " not found"}),
             status_code=404,
         )
 
-    new_description = body.description
+    new_description = body.description or ""
 
-    event.data["description"] = new_description
+    cast(dict[str, Any], event.data)["description"] = new_description
     event.save()
 
     context: EmbeddingsContext | None = request.app.embeddings
@@ -1597,11 +1602,13 @@ async def set_description(
     """,
 )
 async def regenerate_description(
-    request: Request, event_id: str, params: RegenerateQueryParameters = Depends()
+    request: Request,
+    event_id: str,
+    params: Annotated[RegenerateQueryParameters, Depends()],
 ):
     try:
         event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         return JSONResponse(
             content=({"success": False, "message": "Event " + event_id + " not found"}),
@@ -1623,7 +1630,7 @@ async def regenerate_description(
                     "message": "Event "
                     + event_id
                     + " description regeneration has been requested using "
-                    + params.source,
+                    + (params.source.value if params.source is not None else "thumbnails"),
                 }
             ),
             status_code=200,
@@ -1653,7 +1660,7 @@ def generate_description_embedding(
     request: Request,
     body: EventsDescriptionBody,
 ):
-    new_description = body.description
+    new_description = body.description or ""
 
     # If semantic search is enabled, update the index
     if request.app.frigate_config.semantic_search.enabled:
@@ -1679,7 +1686,7 @@ def generate_description_embedding(
 async def delete_single_event(event_id: str, request: Request) -> dict:
     try:
         event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
     except DoesNotExist:
         return {"success": False, "message": f"Event {event_id} not found"}
 
@@ -1834,7 +1841,7 @@ def create_event(
 async def end_event(request: Request, event_id: str, body: EventsEndBody):
     try:
         event: Event = Event.get(Event.id == event_id)
-        await require_camera_access(event.camera, request=request)
+        await require_camera_access(cast(str | None, event.camera), request=request)
 
         if body.end_time is not None and body.end_time < event.start_time:
             return JSONResponse(
@@ -1928,7 +1935,7 @@ def create_trigger_embedding(
                 )
 
             # Skip the event if not an object
-            if event.data.get("type") != "object":
+            if cast(dict[str, Any], event.data).get("type") != "object":
                 return
 
             # Get the thumbnail
@@ -1958,9 +1965,7 @@ def create_trigger_embedding(
                 embedding = np.frombuffer(query_embedding, dtype=np.float32)
             else:
                 # Generate new embedding
-                embedding = context.generate_image_embedding(
-                    body.data, (base64.b64encode(thumbnail).decode("ASCII"))
-                )
+                embedding = context.generate_image_embedding(body.data, thumbnail)
 
         if embedding is None or (
             isinstance(embedding, (list, np.ndarray)) and len(embedding) == 0
@@ -2067,7 +2072,7 @@ def update_trigger_embedding(
             try:
                 event: Event = Event.get(Event.id == body.data)
                 # Skip the event if not an object
-                if event.data.get("type") != "object":
+                if cast(dict[str, Any], event.data).get("type") != "object":
                     return JSONResponse(
                         content={
                             "success": False,
@@ -2079,6 +2084,8 @@ def update_trigger_embedding(
                 thumbnail = get_event_thumbnail_bytes(event)
 
                 with open(webp_path, "wb") as f:
+                    if thumbnail is None:
+                        raise ValueError("Event thumbnail is unavailable")
                     f.write(thumbnail)
             except DoesNotExist:
                 # check triggers directory for image
@@ -2095,9 +2102,12 @@ def update_trigger_embedding(
                     with open(webp_path, "rb") as f:
                         thumbnail = f.read()
 
-            embedding = context.generate_image_embedding(
-                body.data, (base64.b64encode(thumbnail).decode("ASCII"))
-            )
+            if thumbnail is None:
+                return JSONResponse(
+                    content={"success": False, "message": "Thumbnail is unavailable"},
+                    status_code=400,
+                )
+            embedding = context.generate_image_embedding(body.data, thumbnail)
 
         if embedding is None or (
             isinstance(embedding, (list, np.ndarray)) and len(embedding) == 0
@@ -2312,3 +2322,4 @@ def get_triggers_status(
             content=({"success": False, "message": "Error fetching trigger status"}),
             status_code=400,
         )
+

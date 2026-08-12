@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import datetime
 import json
 import logging
@@ -44,8 +44,8 @@ from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event, ReviewSegment, Timeline
 from frigate.domain.ptz.autotrack import PtzAutoTrackerThread
 from frigate.domain.track.tracked_object import TrackedObject
-from camera_platform.tracker.domain.lifecycle import apply_media_policy, publish_video_detection
-from camera_platform.tracker.domain.policy import should_retain_recording, should_save_snapshot
+from extension.tracker.domain.lifecycle import apply_media_policy, publish_video_detection
+from extension.tracker.domain.policy import should_retain_recording, should_save_snapshot
 from frigate.util.face_snapshot import (
     FACE_EVENT_STAGING_DIR,
     FaceRecognitionResult,
