@@ -21,7 +21,12 @@ from frigate.api.media_auth import (
 )
 from frigate.config import FrigateConfig
 from frigate.models import Event, Export, Recordings, ReviewSegment
-from frigate.test.const import TEST_DB, TEST_DB_CLEANUPS
+from frigate.test.const import (
+    TEST_DB,
+    TEST_MIGRATIONS,
+    close_test_database,
+    reset_test_database,
+)
 
 _CONFIG = {
     "mqtt": {"host": "mqtt"},
@@ -208,22 +213,17 @@ class TestExportResolution(unittest.TestCase):
     """Export resolution requires a DB lookup."""
 
     def setUp(self):
+        reset_test_database()
         migrate_db = SqliteExtDatabase("test.db")
         del logging.getLogger("peewee_migrate").handlers[:]
-        Router(migrate_db).run()
+        Router(migrate_db, migrate_dir=TEST_MIGRATIONS).run()
         migrate_db.close()
         self.db = SqliteQueueDatabase(TEST_DB)
         self.db.bind([Event, ReviewSegment, Recordings, Export])
         self.config = FrigateConfig(**_CONFIG)
 
     def tearDown(self):
-        if not self.db.is_closed():
-            self.db.close()
-        for f in TEST_DB_CLEANUPS:
-            try:
-                os.remove(f)
-            except OSError:
-                pass
+        close_test_database(self.db)
 
     def _insert_export(self, export_id, camera, filename):
         Export.insert(

@@ -17,23 +17,28 @@ def main() -> None:
                 str(Path(__file__).resolve().parents[1] / "migrations"),
             )
         )
-        Router(database, migrate_dir=str(migration_dir)).run()
-        tables = {
-            row[0]
-            for row in database.execute_sql(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-        required = {
-            "event_observation",
-            "event_evidence",
-            "media_artifact",
-            "notification_intent",
-        }
-        missing = required - tables
-        if missing:
-            raise RuntimeError(f"Missing migrated tables: {sorted(missing)}")
-        print("migration 001-039: OK")
+        try:
+            Router(database, migrate_dir=str(migration_dir)).run()
+            tables = {
+                row[0]
+                for row in database.execute_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            required = {
+                "event_observation",
+                "event_evidence",
+                "media_artifact",
+                "notification_intent",
+                "tracker_journal_entry",
+                "edge_media_manifest",
+            }
+            missing = required - tables
+            if missing:
+                raise RuntimeError(f"Missing migrated tables: {sorted(missing)}")
+            print("migration 001-040: OK")
+        finally:
+            database.close()
 
 
 if __name__ == "__main__":

@@ -182,6 +182,12 @@ class FrigateEventAdapter:
                 "type": "lpr",
                 "name": label,
                 "plate": plate,
+                # EventMaintainer consumes the canonical field below when it
+                # merges the producer update into Event.data.  Keep `plate`
+                # as the recognition-specific notification field, but do not
+                # make the maintainer infer the database field from it.
+                "recognized_license_plate": plate,
+                "recognized_license_plate_score": update.aggregate_score,
                 "score": update.aggregate_score,
                 "id": update.key.track_id,
                 "camera": update.key.camera_id,

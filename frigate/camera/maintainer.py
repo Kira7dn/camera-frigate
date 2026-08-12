@@ -16,6 +16,7 @@ from frigate.config.camera.updater import (
 )
 from frigate.const import REPLAY_CAMERA_PREFIX
 from frigate.models import Regions
+from frigate.tracker.ownership import should_start_local_camera
 from frigate.util.builtin import empty_and_close_queue
 from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
 from frigate.util.object import get_camera_regions_grid
@@ -35,6 +36,7 @@ class CameraMaintainer(threading.Thread):
         ptz_metrics: dict[str, PTZMetrics],
         stop_event: MpEvent,
         metrics_manager: SyncManager,
+        edge_node_id: str | None = None,
     ):
         super().__init__(name="camera_processor")
         self.config = config
@@ -59,6 +61,7 @@ class CameraMaintainer(threading.Thread):
         self.capture_processes: dict[str, mp.Process] = {}
         self.camera_stop_events: dict[str, MpEvent] = {}
         self.metrics_manager = metrics_manager
+        self.edge_node_id = edge_node_id
 
     def __ensure_camera_stop_event(self, camera: str) -> MpEvent:
         camera_stop_event = self.camera_stop_events.get(camera)
@@ -109,6 +112,15 @@ class CameraMaintainer(threading.Thread):
     def __start_camera_processor(
         self, name: str, config: CameraConfig, runtime: bool = False
     ) -> None:
+        if not should_start_local_camera(
+            self.config.tracker, name, edge_node_id=self.edge_node_id
+        ):
+            logger.info(
+                "Camera processor not started for edge-owned camera %s (node=%s)",
+                name,
+                self.config.tracker.owner_for(name),
+            )
+            return
         if not config.enabled_in_config:
             logger.info(f"Camera processor not started for disabled camera {name}")
             return
@@ -164,6 +176,15 @@ class CameraMaintainer(threading.Thread):
     def __start_camera_capture(
         self, name: str, config: CameraConfig, runtime: bool = False
     ) -> None:
+        if not should_start_local_camera(
+            self.config.tracker, name, edge_node_id=self.edge_node_id
+        ):
+            logger.info(
+                "Capture process not started for edge-owned camera %s (node=%s)",
+                name,
+                self.config.tracker.owner_for(name),
+            )
+            return
         if not config.enabled_in_config:
             logger.info(f"Capture process not started for disabled camera {name}")
             return
@@ -222,7 +243,7 @@ class CameraMaintainer(threading.Thread):
         for name in names:
             try:
                 self.frame_manager.delete(name)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - cleanup must remain best effort
                 logger.debug("Could not unlink SHM %s: %s", name, exc)
 
     def __stop_camera_process(self, camera: str) -> None:
@@ -317,11 +338,11 @@ class CameraMaintainer(threading.Thread):
                         self.__start_camera_capture(camera, new_config, runtime=True)
 
         # ensure the capture processes are done
-        for camera in self.capture_processes.keys():
+        for camera in self.capture_processes:
             self.__stop_camera_capture_process(camera)
 
         # ensure the camera processors are done
-        for camera in self.camera_processes.keys():
+        for camera in self.camera_processes:
             self.__stop_camera_process(camera)
 
         self.update_subscriber.stop()

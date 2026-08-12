@@ -13,15 +13,21 @@ from playhouse.sqliteq import SqliteQueueDatabase
 from frigate.config import FrigateConfig
 from frigate.models import Event, Recordings
 from frigate.storage import StorageMaintainer
-from frigate.test.const import TEST_DB, TEST_DB_CLEANUPS
+from frigate.test.const import (
+    TEST_DB,
+    TEST_MIGRATIONS,
+    close_test_database,
+    reset_test_database,
+)
 
 
 class TestHttp(unittest.TestCase):
     def setUp(self):
         # setup clean database for each test run
+        reset_test_database()
         migrate_db = SqliteExtDatabase("test.db")
         del logging.getLogger("peewee_migrate").handlers[:]
-        router = Router(migrate_db)
+        router = Router(migrate_db, migrate_dir=TEST_MIGRATIONS)
         router.run()
         migrate_db.close()
         self.db = SqliteQueueDatabase(TEST_DB)
@@ -77,14 +83,7 @@ class TestHttp(unittest.TestCase):
         }
 
     def tearDown(self):
-        if not self.db.is_closed():
-            self.db.close()
-
-        try:
-            for file in TEST_DB_CLEANUPS:
-                os.remove(file)
-        except OSError:
-            pass
+        close_test_database(self.db)
 
     def test_segment_calculations(self):
         """Test that the segment calculations are correct."""

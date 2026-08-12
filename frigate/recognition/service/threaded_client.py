@@ -182,7 +182,21 @@ class ThreadedRecognitionClient:
                 if job.operation is RecognitionOperation.OBSERVE:
                     with self._lock:
                         self._observation_depth -= 1
-                receipt = await self._client.submit(job)
+                try:
+                    receipt = await self._client.submit(job)
+                except (asyncio.InvalidStateError, RuntimeError, OSError) as error:
+                    # The bidirectional stream may finish between dequeue and
+                    # write during a service restart. Convert that transport
+                    # loss into the typed lifecycle result owned by Frigate;
+                    # never let the client thread die with an unobserved job.
+                    self._client._healthy = False
+                    receipt = JobReceipt(
+                        job.job_id,
+                        self.service_epoch,
+                        False,
+                        "service_disconnected",
+                        False,
+                    )
                 await asyncio.to_thread(
                     self._results.put, ClientResult(receipt=receipt)
                 )

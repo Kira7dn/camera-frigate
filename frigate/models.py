@@ -119,6 +119,44 @@ class MediaArtifact(Model):
         )
 
 
+class TrackerJournalEntry(Model):
+    """Canonical acceptance record used for ordered idempotent tracker ACK."""
+
+    node_id = CharField(max_length=64)
+    node_epoch = CharField(max_length=64)
+    journal_sequence = IntegerField()
+    camera_id = CharField(index=True, max_length=64)
+    stream_epoch = CharField(max_length=64)
+    event_id = CharField(index=True, max_length=30)
+    operation = CharField(max_length=16)
+    payload = JSONField()
+    accepted_at = DateTimeField(index=True)
+
+    class Meta:
+        table_name = "tracker_journal_entry"
+        primary_key = CompositeKey("node_id", "node_epoch", "journal_sequence")
+
+
+class EdgeMediaManifest(Model):
+    """Private edge-owned media reference; bytes never live in Frigate."""
+
+    media_id = CharField(primary_key=True, max_length=128)
+    node_id = CharField(max_length=64)
+    camera_id = CharField(index=True, max_length=64)
+    event_id = CharField(index=True, max_length=30)
+    media_type = CharField(max_length=24)
+    codec = CharField(max_length=32)
+    start_time = FloatField()
+    end_time = FloatField()
+    byte_size = IntegerField()
+    sha256 = CharField(max_length=64)
+    expires_at = DateTimeField(index=True)
+    retained = BooleanField(default=False)
+
+    class Meta:
+        table_name = "edge_media_manifest"
+
+
 class NotificationIntent(Model):
     """Immutable presentation contract, coalesced per event recipient/channel."""
 

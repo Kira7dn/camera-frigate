@@ -26,6 +26,7 @@ from frigate.recognition.service.threaded_client import ClientResult
 
 class FakeClient:
     instance = None
+    reject_reason = None
 
     def __init__(self, *args, **kwargs) -> None:
         self.service_epoch = "service"
@@ -36,6 +37,10 @@ class FakeClient:
 
     def submit_nowait(self, job):
         self.jobs.append(job)
+        if self.reject_reason:
+            return JobReceipt(
+                job.job_id, self.service_epoch, False, self.reject_reason, False
+            )
         return JobReceipt(job.job_id, self.service_epoch, True)
 
     def drain_results(self):
@@ -273,6 +278,31 @@ def test_external_processor_submits_copied_evidence_and_ordered_end(
     assert end_job.key in processor._ended
     assert end_job.key not in processor._sequence
     processor.shutdown()
+
+
+def test_external_processor_traces_rejected_observation(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime, "ThreadedRecognitionClient", FakeClient)
+    monkeypatch.setattr(runtime, "_read_bytes", lambda path: path.encode())
+    monkeypatch.setattr(runtime, "canonical_config_json", lambda config: "{}")
+    monkeypatch.setenv("PASSAGE_EVIDENCE_DIR", str(tmp_path))
+    FakeClient.reject_reason = "service_unavailable"
+    traces = []
+    monkeypatch.setattr(runtime, "passage_trace", lambda stage, **fields: traces.append((stage, fields)))
+    processor = runtime.ExternalRecognitionProcessor(
+        config(), SimpleNamespace(send_data=lambda *args: None),
+        SimpleNamespace(publish=lambda *args: None), SimpleNamespace(), "stream"
+    )
+    processor.process_frame(
+        {"camera": "front", "id": "rejected", "frame_time": 1.0,
+         "box": [0, 0, 2, 2], "label": "car"},
+        np.zeros((6, 4), dtype=np.uint8),
+    )
+    assert any(
+        stage == "recognition_failed" and fields["reason"] == "service_unavailable"
+        for stage, fields in traces
+    )
+    processor.shutdown()
+    FakeClient.reject_reason = None
 
 
 def test_face_only_camera_does_not_enqueue_lpr_or_duplicate_lineage(

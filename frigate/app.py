@@ -55,6 +55,7 @@ from frigate.jobs.export import reap_stale_exports
 from frigate.jobs.motion_search import stop_all_motion_search_jobs
 from frigate.log import _stop_logging
 from frigate.models import (
+    EdgeMediaManifest,
     Event,
     EventEvidence,
     EventObservation,
@@ -69,6 +70,7 @@ from frigate.models import (
     Regions,
     ReviewSegment,
     Timeline,
+    TrackerJournalEntry,
     Trigger,
     User,
 )
@@ -311,6 +313,7 @@ class FrigateApp:
             Event,
             EventEvidence,
             EventObservation,
+            EdgeMediaManifest,
             Export,
             Previews,
             Recordings,
@@ -318,6 +321,7 @@ class FrigateApp:
             Regions,
             ReviewSegment,
             Timeline,
+            TrackerJournalEntry,
             User,
             Trigger,
             NotificationDelivery,

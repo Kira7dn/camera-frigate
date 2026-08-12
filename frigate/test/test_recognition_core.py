@@ -216,6 +216,8 @@ def test_adapter_preserves_raw_lineage_and_publishes_once():
     assert tracked[0]["bbox"] == (1, 2, 101, 202)
     assert tracked[0]["plate_box"] == (11, 12, 61, 42)
     assert tracked[0]["evidence_ref"] == "frame-ref"
+    assert tracked[0]["recognized_license_plate"] == "ABC123"
+    assert tracked[0]["recognized_license_plate_score"] == 0.95
     assert metadata == [
         ("attribute", ("raw-track-1", "recognized_license_plate", "ABC123", 0.95))
     ]

@@ -41,6 +41,11 @@ class StationaryThresholds:
     motion_classifier_enabled: bool = False
 
 
+# Shared value-equivalent default. This avoids allocating an identical object
+# for every unknown-label lookup without changing any classification threshold.
+DEFAULT_OBJECT_THRESHOLDS = StationaryThresholds()
+
+
 # Thresholds for objects that are expected to be stationary
 STATIONARY_OBJECT_THRESHOLDS = StationaryThresholds(
     objects=["bbq_grill", "package", "waste_bin"],
@@ -76,7 +81,7 @@ def get_stationary_threshold(label: str) -> StationaryThresholds:
     if label in NON_STATIONARY_OBJECT_THRESHOLDS.objects:
         return NON_STATIONARY_OBJECT_THRESHOLDS
 
-    return StationaryThresholds()
+    return DEFAULT_OBJECT_THRESHOLDS
 
 
 class StationaryMotionClassifier:

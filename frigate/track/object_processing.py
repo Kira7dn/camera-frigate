@@ -30,8 +30,6 @@ from frigate.comms.inter_process import InterProcessRequestor
 from frigate.config import (
     CameraMqttConfig,
     FrigateConfig,
-    RecordConfig,
-    SnapshotsConfig,
 )
 from frigate.config.camera.updater import (
     CameraConfigUpdateEnum,
@@ -46,6 +44,10 @@ from frigate.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event, ReviewSegment, Timeline
 from frigate.ptz.autotrack import PtzAutoTrackerThread
 from frigate.track.tracked_object import TrackedObject
+from frigate.tracker.policy import (
+    should_retain_recording,
+    should_save_snapshot,
+)
 from frigate.util.face_snapshot import (
     FACE_EVENT_STAGING_DIR,
     FaceRecognitionResult,
@@ -340,47 +342,10 @@ class TrackedObjectProcessor(threading.Thread):
         self.camera_states[camera] = camera_state
 
     def should_save_snapshot(self, camera: str, obj: TrackedObject) -> bool:
-        if obj.false_positive:
-            return False
-
-        snapshot_config: SnapshotsConfig = self.config.cameras[camera].snapshots
-
-        if not snapshot_config.enabled:
-            return False
-
-        # object never changed position
-        if obj.obj_data["position_changes"] == 0:
-            return False
-
-        # if there are required zones and there is no overlap
-        required_zones = snapshot_config.required_zones
-        if len(required_zones) > 0 and not set(obj.entered_zones) & set(required_zones):
-            logger.debug(
-                f"Not creating snapshot for {obj.obj_data['id']} because it did not enter required zones"
-            )
-            return False
-
-        return True
+        return should_save_snapshot(self.config, camera, obj)
 
     def should_retain_recording(self, camera: str, obj: TrackedObject) -> bool:
-        if obj.false_positive:
-            return False
-
-        record_config: RecordConfig = self.config.cameras[camera].record
-
-        # Recording is disabled
-        if not record_config.enabled:
-            return False
-
-        # object never changed position
-        if obj.obj_data["position_changes"] == 0:
-            return False
-
-        # If the object is not considered an alert or detection
-        if obj.max_severity is None:
-            return False
-
-        return True
+        return should_retain_recording(self.config, camera, obj)
 
     def should_mqtt_snapshot(self, camera: str, obj: TrackedObject) -> bool:
         # object never changed position

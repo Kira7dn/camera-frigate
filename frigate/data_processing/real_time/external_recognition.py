@@ -101,6 +101,8 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
         self._ended: set[TrackKey] = set()
         self._evidence_by_job: dict[str, np.ndarray] = {}
         self._task_by_job: dict[str, RecognitionTask] = {}
+        self._epoch_by_job: dict[str, str] = {}
+        self._key_by_job: dict[str, TrackKey] = {}
         self._capture_jobs: dict[
             str, tuple[RecognitionTask, float, tuple[int, int, int, int]]
         ] = {}
@@ -247,6 +249,15 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
         receipt = self._client.submit_nowait(job)
         if not receipt.accepted:
             self._rejected += 1
+            passage_trace(
+                "recognition_failed",
+                camera=key.camera_id,
+                frame_time=frame_time,
+                track_id=key.track_id,
+                trace_id=canonical_trace_id(task.value, key.camera_id, key.track_id),
+                task=task.value,
+                reason=receipt.reason or "service_unavailable",
+            )
             logger.warning(
                 "Recognition observation rejected job=%s reason=%s retryable=%s",
                 job_id,
@@ -256,6 +267,8 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             return
         self._evidence_by_job[job_id] = copied
         self._task_by_job[job_id] = task
+        self._epoch_by_job[job_id] = job.service_epoch
+        self._key_by_job[job_id] = key
         if capture is not None:
             self._capture_jobs[job_id] = (
                 task,
@@ -264,11 +277,37 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             )
 
     def drain_results(self) -> list[Any]:
+        if not self._client.stats.get("healthy", 0):
+            self._fail_pending_jobs("service_disconnected")
+        current_epoch = self._client.service_epoch
+        for job_id, job_epoch in tuple(self._epoch_by_job.items()):
+            if job_epoch == current_epoch:
+                continue
+            task = self._task_by_job.pop(job_id, None)
+            key = self._key_by_job.pop(job_id, None)
+            self._evidence_by_job.pop(job_id, None)
+            self._capture_jobs.pop(job_id, None)
+            self._epoch_by_job.pop(job_id, None)
+            if task is not None:
+                passage_trace(
+                    "recognition_failed",
+                    camera=key.camera_id if key else None,
+                    track_id=key.track_id if key else None,
+                    trace_id=(
+                        canonical_trace_id(task.value, key.camera_id, key.track_id)
+                        if key is not None
+                        else None
+                    ),
+                    task=task.value,
+                    reason="epoch_mismatch",
+                )
         for result in self._client.drain_results():
             if result.receipt is not None and not result.receipt.accepted:
                 self._rejected += 1
                 self._evidence_by_job.pop(result.receipt.job_id, None)
                 self._task_by_job.pop(result.receipt.job_id, None)
+                self._epoch_by_job.pop(result.receipt.job_id, None)
+                self._key_by_job.pop(result.receipt.job_id, None)
                 self._capture_jobs.pop(result.receipt.job_id, None)
                 logger.error(
                     "Recognition service rejected job=%s reason=%s",
@@ -281,8 +320,26 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
                 continue
             frame = self._evidence_by_job.pop(outcome.job_id, None)
             task = self._task_by_job.pop(outcome.job_id, None)
+            self._epoch_by_job.pop(outcome.job_id, None)
+            self._key_by_job.pop(outcome.job_id, None)
             capture_info = self._capture_jobs.pop(outcome.job_id, None)
             if outcome.service_epoch != self._client.service_epoch:
+                stale_task = task or (
+                    capture_info[0] if capture_info is not None else None
+                )
+                if stale_task is not None:
+                    passage_trace(
+                        "recognition_failed",
+                        camera=outcome.key.camera_id,
+                        track_id=outcome.key.track_id,
+                        trace_id=canonical_trace_id(
+                            stale_task.value,
+                            outcome.key.camera_id,
+                            outcome.key.track_id,
+                        ),
+                        task=stale_task.value,
+                        reason="epoch_mismatch",
+                    )
                 continue
             if outcome.status is RecognitionOutcomeStatus.ENDED:
                 self._ending.discard(outcome.key)
@@ -365,6 +422,25 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             if isinstance(value, FaceRecognitionResult):
                 payloads.append({"type": "face_snapshot", **value.as_payload()})
         return payloads
+
+    def _fail_pending_jobs(self, reason: str) -> None:
+        """Terminate locally owned jobs when transport cannot return outcomes."""
+        for job_id, task in tuple(self._task_by_job.items()):
+            key = self._key_by_job.pop(job_id, None)
+            self._task_by_job.pop(job_id, None)
+            self._epoch_by_job.pop(job_id, None)
+            self._evidence_by_job.pop(job_id, None)
+            self._capture_jobs.pop(job_id, None)
+            if key is None:
+                continue
+            passage_trace(
+                "recognition_failed",
+                camera=key.camera_id,
+                track_id=key.track_id,
+                trace_id=canonical_trace_id(task.value, key.camera_id, key.track_id),
+                task=task.value,
+                reason=reason,
+            )
 
     def expire_object(self, object_id: str, camera: str) -> None:
         key = TrackKey(camera, self._stream_epoch, str(object_id))
@@ -478,6 +554,20 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
     def shutdown(self) -> None:
         if not self._client.close(self.config.recognition.shutdown_drain):
             logger.error("Recognition client did not drain before shutdown deadline")
+        for job_id, task in tuple(self._task_by_job.items()):
+            key = self._key_by_job.get(job_id)
+            passage_trace(
+                "recognition_failed",
+                camera=key.camera_id if key else None,
+                track_id=key.track_id if key else None,
+                trace_id=(
+                    canonical_trace_id(task.value, key.camera_id, key.track_id)
+                    if key is not None
+                    else None
+                ),
+                task=task.value,
+                reason="service_disconnected",
+            )
         self._snapshot_worker.stop()
         self._attempt_worker.stop()
         self._sequence.clear()
@@ -486,6 +576,8 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
         self._ended.clear()
         self._evidence_by_job.clear()
         self._task_by_job.clear()
+        self._epoch_by_job.clear()
+        self._key_by_job.clear()
         self._capture_jobs.clear()
 
     def _handle_face_media(
@@ -534,27 +626,36 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
     @staticmethod
     def _trace_update(update: Any) -> None:
         task = update.task.value
+        evidence_id = str(update.evidence_ref) if update.evidence_ref is not None else None
         fields = {
             "camera": update.key.camera_id,
             "frame_time": update.frame_time,
             "track_id": update.key.track_id,
+            "event_id": update.key.track_id,
             "trace_id": canonical_trace_id(
                 task, update.key.camera_id, update.key.track_id
             ),
             "object_box": list(update.object_bbox),
         }
+        if evidence_id:
+            fields.update(
+                evidence_id=evidence_id,
+                frame_ref=evidence_id,
+                source_role="detect",
+            )
         if update.task is RecognitionTask.FACE:
             detail_box = (
                 list(update.detail_bbox) if update.detail_bbox is not None else None
             )
+            fields["person_box"] = list(update.object_bbox)
+            fields["face_box"] = detail_box
             for stage in ("first_qualified_face", "candidate_submitted"):
-                passage_trace(stage, **fields, face_box=detail_box)
+                passage_trace(stage, **fields)
             passage_trace(
                 "first_attempt",
                 **fields,
                 identity=update.raw_value,
                 score=update.raw_score,
-                face_box=detail_box,
             )
             if update.publish:
                 passage_trace(
@@ -562,7 +663,6 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
                     **fields,
                     identity=update.aggregate_value,
                     score=update.aggregate_score,
-                    face_box=detail_box,
                 )
             return
         passage_trace(
@@ -577,6 +677,9 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
                 **fields,
                 plate=update.aggregate_value,
                 score=update.aggregate_score,
+                plate_box=(
+                    list(update.detail_bbox) if update.detail_bbox is not None else None
+                ),
             )
 
     def _next_sequence(self, key: TrackKey) -> int:

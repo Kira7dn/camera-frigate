@@ -13,12 +13,17 @@ from pydantic import Json
 
 from frigate.api.fastapi_app import create_fastapi_app
 from frigate.config import FrigateConfig
-from frigate.const import BASE_DIR, CACHE_DIR
+from frigate.const import BASE_DIR, CACHE_DIR, RECORD_DIR
 from frigate.debug_replay import DebugReplayManager
 from frigate.jobs.export import JobStatePublisher
 from frigate.models import Event, Recordings, ReviewSegment
 from frigate.review.types import SeverityEnum
-from frigate.test.const import TEST_DB, TEST_DB_CLEANUPS
+from frigate.test.const import (
+    TEST_DB,
+    TEST_MIGRATIONS,
+    close_test_database,
+    reset_test_database,
+)
 
 
 class AuthTestClient(TestClient):
@@ -38,9 +43,10 @@ class AuthTestClient(TestClient):
 class BaseTestHttp(unittest.TestCase):
     def setUp(self, models):
         # setup clean database for each test run
+        reset_test_database()
         migrate_db = SqliteExtDatabase("test.db")
         del logging.getLogger("peewee_migrate").handlers[:]
-        router = Router(migrate_db)
+        router = Router(migrate_db, migrate_dir=TEST_MIGRATIONS)
         router.run()
         migrate_db.close()
         self.db = SqliteQueueDatabase(TEST_DB)
@@ -115,7 +121,7 @@ class BaseTestHttp(unittest.TestCase):
                         "total": 244529.7,
                         "used": 189607.0,
                     },
-                    os.path.join(BASE_DIR, "recordings"): {
+                    RECORD_DIR: {
                         "free": 0.2,
                         "mount_type": "ext4",
                         "total": 8.0,
@@ -135,14 +141,7 @@ class BaseTestHttp(unittest.TestCase):
         }
 
     def tearDown(self):
-        if not self.db.is_closed():
-            self.db.close()
-
-        try:
-            for file in TEST_DB_CLEANUPS:
-                os.remove(file)
-        except OSError:
-            pass
+        close_test_database(self.db)
 
     def create_app(self, stats=None, event_metadata_publisher=None):
         from frigate.api.auth import get_allowed_cameras_for_filter, get_current_user

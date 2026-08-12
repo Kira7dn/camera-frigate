@@ -73,6 +73,7 @@ from .proxy import ProxyConfig
 from .recognition import RecognitionRuntimeConfig
 from .telemetry import TelemetryConfig
 from .tls import TlsConfig
+from .tracker import TrackerConfig
 from .ui import UIConfig
 
 __all__ = ["FrigateConfig"]
@@ -290,9 +291,7 @@ class RuntimeDeploymentConfig(FrigateBaseModel):
 
 def verify_config_roles(camera_config: CameraConfig) -> None:
     """Verify that roles are setup in the config correctly."""
-    assigned_roles = list(
-        set([r for i in camera_config.ffmpeg.inputs for r in i.roles])
-    )
+    assigned_roles = list({r for i in camera_config.ffmpeg.inputs for r in i.roles})
 
     if camera_config.record.enabled and "record" not in assigned_roles:
         raise ValueError(
@@ -309,10 +308,10 @@ def verify_valid_live_stream_names(
     frigate_config: FrigateConfig, camera_config: CameraConfig
 ) -> ValueError | None:
     """Verify that a restream exists to use for live view."""
-    for _, stream_name in camera_config.live.streams.items():
+    for stream_name in camera_config.live.streams.values():
         if (
             stream_name
-            not in frigate_config.go2rtc.model_dump().get("streams", {}).keys()
+            not in frigate_config.go2rtc.model_dump().get("streams", {})
         ):
             return ValueError(
                 f"No restream with name {stream_name} exists for camera {camera_config.name}."
@@ -357,13 +356,13 @@ def verify_zone_objects_are_tracked(camera_config: CameraConfig) -> None:
 
 def verify_required_zones_exist(camera_config: CameraConfig) -> None:
     for det_zone in camera_config.review.detections.required_zones:
-        if det_zone not in camera_config.zones.keys():
+        if det_zone not in camera_config.zones:
             raise ValueError(
                 f"Camera {camera_config.name} has a required zone for detections {det_zone} that is not defined."
             )
 
     for det_zone in camera_config.review.alerts.required_zones:
-        if det_zone not in camera_config.zones.keys():
+        if det_zone not in camera_config.zones:
             raise ValueError(
                 f"Camera {camera_config.name} has a required zone for alerts {det_zone} that is not defined."
             )
@@ -654,6 +653,11 @@ class FrigateConfig(FrigateBaseModel):
         title="Recognition runtime",
         description="Select local inference or an external fail-closed service.",
     )
+    tracker: TrackerConfig = Field(
+        default_factory=TrackerConfig,
+        title="Tracker edge topology",
+        description="Managed edge nodes and their exclusive camera ownership.",
+    )
 
     camera_groups: dict[str, CameraGroupConfig] = Field(
         default_factory=dict,
@@ -695,6 +699,15 @@ class FrigateConfig(FrigateBaseModel):
 
         # set notifications state
         self.notifications.enabled_in_config = self.notifications.enabled
+
+        unknown_edge_cameras = sorted(
+            set(self.tracker.camera_owners).difference(self.cameras)
+        )
+        if unknown_edge_cameras:
+            raise ValueError(
+                "tracker nodes reference unknown cameras: "
+                + ", ".join(unknown_edge_cameras)
+            )
 
         # validate genai: each role (chat, descriptions, embeddings) at most once
         role_to_name: dict[GenAIRoleEnum, str] = {}
@@ -845,12 +858,12 @@ class FrigateConfig(FrigateBaseModel):
                 "notifications": ["enabled", "cooldown"],
             }
 
-            for section in allowed_fields_map:
+            for section, allowed_fields in allowed_fields_map.items():
                 if section in modified_global_config:
                     modified_global_config[section] = {
                         k: v
                         for k, v in modified_global_config[section].items()
-                        if k in allowed_fields_map[section]
+                        if k in allowed_fields
                     }
 
             merged_config = deep_merge(
@@ -890,7 +903,7 @@ class FrigateConfig(FrigateBaseModel):
                         stream_info = stream_info_retriever.get_stream_info(
                             self.ffmpeg, input.path
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - retain auto-detect fallback
                         logger.warning(
                             f"Error detecting stream parameters automatically for {input.path} Applying default values."
                         )
@@ -1139,9 +1152,9 @@ class FrigateConfig(FrigateBaseModel):
     @field_validator("cameras")
     @classmethod
     def ensure_zones_and_cameras_have_different_names(cls, v: dict[str, CameraConfig]):
-        zones = [zone for camera in v.values() for zone in camera.zones.keys()]
+        zones = [zone for camera in v.values() for zone in camera.zones]
         for zone in zones:
-            if zone in v.keys():
+            if zone in v:
                 raise ValueError("Zones cannot share names with cameras")
         return v
 
@@ -1154,7 +1167,6 @@ class FrigateConfig(FrigateBaseModel):
         new_config = False
         if not os.path.isfile(config_path):
             logger.info("No config file found, saving default config")
-            config_path = config_path
             new_config = True
         else:
             # Check if the config file needs to be migrated.
