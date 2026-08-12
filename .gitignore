@@ -22,6 +22,16 @@ web/.env
 core
 !/web/**/*.ts
 .idea/*
+
+# Local generated caches and build artifacts
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+*.py[cod]
 .ipynb_checkpoints
 
 # Auto-generated Docker Compose Generator config files
