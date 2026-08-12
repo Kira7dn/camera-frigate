@@ -1,2 +1,15 @@
 # Python tooling is owned by the workspace root pyproject.toml so editor and
 # command-line checks use the same Python, import roots and lint policy.
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = ["-ra"]
+markers = [
+    "unit: isolated unit tests without external services",
+    "integration: tests requiring multiple Frigate components",
+    "e2e: tests requiring runtime services or Docker",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

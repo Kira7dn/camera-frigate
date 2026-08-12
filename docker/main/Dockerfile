@@ -318,7 +318,7 @@ COPY docker/main/fake_frigate_run /etc/s6-overlay/s6-rc.d/frigate/run
 
 # Create symbolic link to the frigate source code, as go2rtc's create_config.sh uses it
 RUN mkdir -p /opt/frigate \
-    && ln -svf /workspace/frigate/frigate /opt/frigate/frigate
+    && ln -svf /workspace/frigate/src /opt/frigate/frigate
 
 # Install Node 20
 RUN curl -SLO https://deb.nodesource.com/nsolid_setup_deb.sh && \
@@ -360,7 +360,8 @@ RUN npm run build \
 FROM scratch AS rootfs
 
 WORKDIR /opt/frigate/
-COPY frigate frigate/
+COPY src/frigate frigate/
+COPY src/camera_platform frigate/camera_platform/
 COPY migrations migrations/
 COPY --from=web-build /work/dist/ web/
 
