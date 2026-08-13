@@ -318,7 +318,7 @@ class ReviewSegmentMaintainer(threading.Thread):
             "reviews",
             json.dumps(review_update),
         )
-        self.review_publisher.publish(review_update, segment.camera)  # type: ignore[arg-type]
+        self.review_publisher.publish(review_update, segment.camera)
         self.requestor.send_data(
             f"{segment.camera}/review_status", segment.severity.value.upper()
         )
@@ -346,7 +346,7 @@ class ReviewSegmentMaintainer(threading.Thread):
             "reviews",
             json.dumps(review_update),
         )
-        self.review_publisher.publish(review_update, segment.camera)  # type: ignore[arg-type]
+        self.review_publisher.publish(review_update, segment.camera)
         self.requestor.send_data(
             f"{segment.camera}/review_status", segment.severity.value.upper()
         )
@@ -369,7 +369,7 @@ class ReviewSegmentMaintainer(threading.Thread):
             "reviews",
             json.dumps(review_update),
         )
-        self.review_publisher.publish(review_update, segment.camera)  # type: ignore[arg-type]
+        self.review_publisher.publish(review_update, segment.camera)
         self.requestor.send_data(f"{segment.camera}/review_status", "NONE")
         self.active_review_segments[segment.camera] = None
         return end_time

@@ -8,7 +8,7 @@ import subprocess as sp
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -148,12 +148,12 @@ class FFMpegConverter(threading.Thread):
             if t_idx == item_count - 1:
                 # last frame does not get a duration
                 playlist.append(
-                    f"file '{get_cache_image_name(self.config.name, self.frame_times[t_idx])}'"  # type: ignore[arg-type]
+                    f"file '{get_cache_image_name(cast(str, self.config.name), self.frame_times[t_idx])}'"
                 )
                 continue
 
             playlist.append(
-                f"file '{get_cache_image_name(self.config.name, self.frame_times[t_idx])}'"  # type: ignore[arg-type]
+                f"file '{get_cache_image_name(cast(str, self.config.name), self.frame_times[t_idx])}'"
             )
             playlist.append(
                 f"duration {self.frame_times[t_idx + 1] - self.frame_times[t_idx]}"
@@ -202,7 +202,7 @@ class FFMpegConverter(threading.Thread):
         # unlink files from cache
         # don't delete last frame as it will be used as first frame in next segment
         for t in self.frame_times[0:-1]:
-            Path(get_cache_image_name(self.config.name, t)).unlink(missing_ok=True)  # type: ignore[arg-type]
+            Path(get_cache_image_name(cast(str, self.config.name), t)).unlink(missing_ok=True)
 
 
 class PreviewRecorder:

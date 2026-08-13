@@ -9,7 +9,7 @@ import logging
 import os
 import shutil
 from collections import Counter
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -291,6 +291,8 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
         """Run one Face model attempt for the standalone core."""
         if task is not RecognitionTask.FACE:
             return None
+        if not isinstance(evidence, tuple) or len(evidence) != 2:
+            return None
         yuv_frame, supplied_bgr = evidence
         frame = np.asarray(yuv_frame)
         bgr_frame = None if supplied_bgr is None else np.asarray(supplied_bgr)
@@ -299,7 +301,7 @@ class FaceRealTimeProcessor(RealTimeProcessorApi):
             frame,
             bgr_frame,
             observation.object_bbox,
-            observation.attributes.get("current_attributes", ()),
+            cast(list[dict[str, Any]], observation.attributes.get("current_attributes", ())),
             requires_face_detection=self.requires_face_detection,
             detection_threshold=self.face_config.detection_threshold,
             min_area=self.config.cameras[camera].face_recognition.min_area,

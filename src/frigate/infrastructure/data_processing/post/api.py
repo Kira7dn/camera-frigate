@@ -26,7 +26,7 @@ class PostProcessorApi(ABC):
 
     @abstractmethod
     def process_data(
-        self, data: dict[str, Any], data_type: PostProcessDataEnum
+        self, data: Any, data_type: PostProcessDataEnum
     ) -> None:
         """Processes the data of data type.
         Args:
@@ -40,7 +40,7 @@ class PostProcessorApi(ABC):
 
     @abstractmethod
     def handle_request(
-        self, topic: str, request_data: dict[str, Any]
+        self, topic: str, request_data: Any
     ) -> dict[str, Any] | str | None:
         """Handle metadata requests.
         Args:

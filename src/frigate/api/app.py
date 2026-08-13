@@ -7,15 +7,16 @@ import logging
 import os
 import platform
 import traceback
-import urllib
+import urllib.parse
 from datetime import datetime, timedelta
 from functools import reduce
 from io import StringIO
 from pathlib import Path as FilePath
-from typing import Any
+from typing import Any, Annotated, cast
 
 import aiofiles
 import ruamel.yaml
+from ruamel.yaml.comments import CommentedMap
 from fastapi import APIRouter, Body, Path, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.params import Depends
@@ -117,7 +118,7 @@ def version():
 @router.get("/stats", dependencies=[Depends(allow_any_authenticated())])
 def stats(
     request: Request,
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
     stats_data = request.app.stats_emitter.get_latest_stats()
 
@@ -155,11 +156,9 @@ def stats(
 
 
 @router.get("/stats/history", dependencies=[Depends(require_role(["admin"]))])
-def stats_history(request: Request, keys: str = None):
-    if keys:
-        keys = keys.split(",")
-
-    return JSONResponse(content=request.app.stats_emitter.get_stats_history(keys))
+def stats_history(request: Request, keys: str | None = None):
+    key_list = keys.split(",") if keys else None
+    return JSONResponse(content=request.app.stats_emitter.get_stats_history(key_list))
 
 
 @router.get("/metrics", dependencies=[Depends(allow_any_authenticated())])
@@ -557,9 +556,9 @@ def config_save(save_option: str, body: Any = Body(media_type="text/plain")):
 
             try:
                 for i, part in enumerate(error_path):
-                    key = int(part) if part.isdigit() else part
+                    key = int(part) if isinstance(part, int) or str(part).isdigit() else part
 
-                    if isinstance(current, ruamel.yaml.comments.CommentedMap):
+                    if isinstance(current, CommentedMap):
                         current = current[key]
                     elif isinstance(current, list):
                         current = current[key]
@@ -666,7 +665,10 @@ def _restore_masked_camera_paths(config_data: dict, config: FrigateConfig) -> No
     for camera_name, camera_data in cameras.items():
         if not isinstance(camera_data, dict):
             continue
-        inputs = camera_data.get("ffmpeg", {}).get("inputs")
+        ffmpeg_data = camera_data.get("ffmpeg")
+        if not isinstance(ffmpeg_data, dict):
+            continue
+        inputs = ffmpeg_data.get("inputs")
         if not isinstance(inputs, list):
             continue
         existing = config.cameras.get(camera_name)
@@ -682,7 +684,8 @@ def _restore_masked_camera_paths(config_data: dict, config: FrigateConfig) -> No
             if ("://*:*@" in path or "user=*&password=*" in path) and index < len(
                 existing_paths
             ):
-                input_obj["path"] = existing_paths[index]
+                typed_input_obj = cast(dict[str, Any], input_obj)
+                typed_input_obj["path"] = existing_paths[index]
 
 
 def _config_set_in_memory(request: Request, body: AppConfigSetBody) -> JSONResponse:
@@ -712,7 +715,7 @@ def _config_set_in_memory(request: Request, body: AppConfigSetBody) -> JSONRespo
         config: FrigateConfig = request.app.frigate_config
 
         # Group flat key paths into nested per-camera, per-section dicts
-        grouped: dict[str, dict[str, dict]] = {}
+        grouped: dict[str, dict[str, Any]] = {}
         for key_path, value in updates.items():
             parts = key_path.split(".")
             if len(parts) < 3 or parts[0] != "cameras":
@@ -722,7 +725,7 @@ def _config_set_in_memory(request: Request, body: AppConfigSetBody) -> JSONRespo
             grouped.setdefault(cam, {}).setdefault(section, {})
 
             # Build nested dict from remaining path (e.g. "filters.person.threshold")
-            target = grouped[cam][section]
+            target = cast(dict[str, Any], grouped[cam][section])
             for part in parts[3:-1]:
                 target = target.setdefault(part, {})
             if len(parts) > 3:
@@ -1248,8 +1251,8 @@ def get_media_sync_status(job_id: str):
 
 @router.get("/labels", dependencies=[Depends(allow_any_authenticated())])
 def get_labels(
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
     camera: str = "",
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     try:
         if camera:
@@ -1281,8 +1284,8 @@ def get_labels(
 
 @router.get("/sub_labels", dependencies=[Depends(allow_any_authenticated())])
 def get_sub_labels(
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
     split_joined: int | None = None,
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     try:
         events = (
@@ -1369,8 +1372,8 @@ def plusModels(request: Request, filterByCurrentModelDetector: bool = False):
     "/recognized_license_plates", dependencies=[Depends(allow_any_authenticated())]
 )
 def get_recognized_license_plates(
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
     split_joined: int | None = None,
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     try:
         query = (
@@ -1409,10 +1412,10 @@ def get_recognized_license_plates(
 
 @router.get("/timeline", dependencies=[Depends(allow_any_authenticated())])
 def timeline(
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
     camera: str = "all",
     limit: int = 100,
     source_id: str | None = None,
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     clauses = []
 
@@ -1454,8 +1457,8 @@ def timeline(
 
 @router.get("/timeline/hourly", dependencies=[Depends(allow_any_authenticated())])
 def hourly_timeline(
-    params: AppTimelineHourlyQueryParameters = Depends(),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[AppTimelineHourlyQueryParameters, Depends()],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
     """Get hourly summary for timeline."""
     cameras = params.cameras
@@ -1463,21 +1466,21 @@ def hourly_timeline(
     before = params.before
     after = params.after
     limit = params.limit
-    tz_name = params.timezone
+    tz_name = params.timezone or "utc"
 
     _, minute_modifier, _ = get_tz_modifiers(tz_name)
     minute_offset = int(minute_modifier.split(" ")[0])
 
     clauses = []
 
-    if cameras != "all":
+    if cameras is not None and cameras != "all":
         camera_list = cameras.split(",")
         clauses.append(Timeline.camera << camera_list)
 
     # Enforce per-camera access control
     clauses.append(Timeline.camera << allowed_cameras)
 
-    if labels != "all":
+    if labels and labels != "all":
         label_list = labels.split(",")
         clauses.append(Timeline.data["label"] << label_list)
 
@@ -1527,10 +1530,11 @@ def hourly_timeline(
                 minutes=minute_offset,
             )
         ).timestamp()
-        if hour not in hours:
-            hours[hour] = [t]
+        hour_key = str(hour)
+        if hour_key not in hours:
+            hours[hour_key] = [t]
         else:
-            hours[hour].insert(0, t)
+            hours[hour_key].insert(0, t)
 
     return JSONResponse(
         content={

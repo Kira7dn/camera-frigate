@@ -4,7 +4,8 @@ import logging
 import os
 import queue
 import threading
-from typing import Any
+from multiprocessing.synchronize import Event as MpEvent
+from typing import Any, cast
 
 import numpy as np
 
@@ -33,7 +34,7 @@ class AudioTranscriptionRealTimeProcessor(RealTimeProcessorApi):
         requestor: InterProcessRequestor,
         model_runner: AudioTranscriptionModelRunner,
         metrics: DataProcessorMetrics,
-        stop_event: threading.Event,
+        stop_event: threading.Event | MpEvent,
     ):
         super().__init__(config, metrics)
         self.config = config
@@ -66,7 +67,8 @@ class AudioTranscriptionRealTimeProcessor(RealTimeProcessorApi):
                 )
             else:
                 logger.debug(f"Loading sherpa stream for {self.camera_config.name}")
-                self.stream = self.model_runner.model.create_stream()
+                model = cast(Any, self.model_runner.model)
+                self.stream = model.create_stream()
             logger.debug(
                 f"Audio transcription (live) initialized for {self.camera_config.name}"
             )
@@ -115,13 +117,20 @@ class AudioTranscriptionRealTimeProcessor(RealTimeProcessorApi):
 
             else:
                 # small model
+                if self.stream is None:
+                    return None
+
+                model = cast(Any, self.model_runner.model)
+                if model is None:
+                    return None
+
                 self.stream.accept_waveform(16000, audio_data)
 
-                while self.model_runner.model.is_ready(self.stream):
-                    self.model_runner.model.decode_stream(self.stream)
+                while model.is_ready(self.stream):
+                    model.decode_stream(self.stream)
 
-                text = self.model_runner.model.get_result(self.stream).strip()
-                is_endpoint = self.model_runner.model.is_endpoint(self.stream)
+                text = model.get_result(self.stream).strip()
+                is_endpoint = model.is_endpoint(self.stream)
 
             logger.debug(f"Transcription result: '{text}'")
 
@@ -133,18 +142,22 @@ class AudioTranscriptionRealTimeProcessor(RealTimeProcessorApi):
 
             if is_endpoint and self.config.audio_transcription.model_size == "small":
                 # reset sherpa if we've reached an endpoint
-                self.model_runner.model.reset(self.stream)
+                model = cast(Any, self.model_runner.model)
+                if model is not None and self.stream is not None:
+                    model.reset(self.stream)
 
             return text, is_endpoint
         except Exception as e:
             logger.error(f"Error processing audio stream: {e}")
             return None
 
-    def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
+    def process_frame(
+        self, obj_data: dict[str, Any], frame: np.ndarray, **kwargs: Any
+    ) -> None:
         pass
 
     def process_audio(self, obj_data: dict[str, Any], audio: np.ndarray) -> bool | None:
-        if audio is None or audio.size == 0:
+        if audio.size == 0:
             logger.debug("No audio data provided for transcription")
             return None
 
@@ -220,7 +233,9 @@ class AudioTranscriptionRealTimeProcessor(RealTimeProcessorApi):
             self.transcription_segments = []
         else:
             # reset sherpa
-            self.model_runner.model.reset(self.stream)
+            model = cast(Any, self.model_runner.model)
+            if model is not None and self.stream is not None:
+                model.reset(self.stream)
 
         logger.debug("Stream reset")
 

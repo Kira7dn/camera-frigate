@@ -1,6 +1,7 @@
 """Handle post-processing for audio transcription."""
 
 import logging
+import importlib
 import os
 import threading
 import time
@@ -53,7 +54,7 @@ class AudioTranscriptionPostProcessor(PostProcessorApi):
     def __build_recognizer(self) -> None:
         try:
             # Import dynamically to avoid crashes on systems without AVX support
-            from faster_whisper import WhisperModel
+            WhisperModel = importlib.import_module("faster_whisper").WhisperModel
 
             self.recognizer = WhisperModel(
                 model_size_or_path="small",

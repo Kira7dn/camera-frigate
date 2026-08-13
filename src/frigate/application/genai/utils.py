@@ -2,13 +2,13 @@
 
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
 
 def parse_tool_calls_from_message(
-    message: dict[str, Any],
+    message: dict[str, Any] | None,
 ) -> list[dict[str, Any]] | None:
     """
     Parse tool_calls from an OpenAI-style message dict.
@@ -19,12 +19,22 @@ def parse_tool_calls_from_message(
     Returns a list of {"id", "name", "arguments"} with arguments parsed as dict,
     or None if no tool_calls. Used by Ollama and LlamaCpp (non-stream) responses.
     """
+    if message is None:
+        return None
+
     raw = message.get("tool_calls")
     if not raw or not isinstance(raw, list):
         return None
     result = []
     for idx, tool_call in enumerate(raw):
-        function_data = tool_call.get("function") or {}
+        if not isinstance(tool_call, dict):
+            continue
+        function_data: dict[str, Any]
+        function_data_value = tool_call.get("function")
+        if isinstance(function_data_value, dict):
+            function_data = cast(dict[str, Any], function_data_value)
+        else:
+            function_data = {}
         raw_arguments = function_data.get("arguments") or {}
         if isinstance(raw_arguments, dict):
             arguments = raw_arguments

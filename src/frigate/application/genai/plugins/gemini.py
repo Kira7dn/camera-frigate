@@ -5,7 +5,7 @@ import binascii
 import json
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 from google import genai
 from google.genai import errors, types
@@ -136,7 +136,7 @@ class GeminiClient(GenAIClient):
 
             response = self.provider.models.generate_content(
                 model=self.genai_config.model,
-                contents=contents,  # type: ignore[arg-type]
+                contents=cast(Any, contents),
                 config=types.GenerateContentConfig(
                     **generation_config_dict,
                 ),
@@ -324,7 +324,7 @@ class GeminiClient(GenAIClient):
 
             response = self.provider.models.generate_content(
                 model=self.genai_config.model,
-                contents=gemini_messages,  # type: ignore[arg-type]
+                contents=cast(Any, gemini_messages),
                 config=types.GenerateContentConfig(**config_params),
             )
 
@@ -586,7 +586,7 @@ class GeminiClient(GenAIClient):
 
             stream = await self.provider.aio.models.generate_content_stream(
                 model=self.genai_config.model,
-                contents=gemini_messages,  # type: ignore[arg-type]
+                contents=cast(Any, gemini_messages),
                 config=types.GenerateContentConfig(**config_params),
             )
 

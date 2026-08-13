@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any, cast
 
 from frigate.const import SUPPORTED_RK_SOCS
 from frigate.util.file import FileLock
@@ -194,7 +195,7 @@ def convert_onnx_to_rknn(
         logger.debug(f"Unsupported model type: {model_type}")
         return False
 
-    config = MODEL_TYPE_CONFIGS[model_type].copy()
+    config = cast(dict[str, Any], MODEL_TYPE_CONFIGS[model_type].copy())
     config["target_platform"] = soc
 
     # RKNN toolkit requires .onnx extension, create temporary copy if needed
@@ -384,10 +385,10 @@ def auto_convert_model(
                 rknn_path.parent.mkdir(parents=True, exist_ok=True)
 
                 if not model_type:
-                    model_type = get_rknn_model_type(base_path)
+                    model_type = get_rknn_model_type(str(base_path))
 
                 if convert_onnx_to_rknn(
-                    str(base_path), str(rknn_path), model_type, quantization
+                    str(base_path), str(rknn_path), cast(str, model_type), quantization
                 ):
                     return str(rknn_path)
                 else:
@@ -402,9 +403,11 @@ def auto_convert_model(
             )
 
             if not model_type:
-                model_type = get_rknn_model_type(base_path)
+                model_type = get_rknn_model_type(str(base_path))
 
-            if wait_for_conversion_completion(model_type, rknn_path, lock_file_path):
+            if wait_for_conversion_completion(
+                cast(str, model_type), rknn_path, lock_file_path
+            ):
                 return str(rknn_path)
             else:
                 logger.error(f"Timeout waiting for conversion of {model_path}")

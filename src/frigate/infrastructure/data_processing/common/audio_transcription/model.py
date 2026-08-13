@@ -1,6 +1,7 @@
 """Set up audio transcription models based on model size."""
 
 import logging
+import importlib
 import os
 
 import sherpa_onnx
@@ -25,7 +26,9 @@ class AudioTranscriptionModelRunner:
         if model_size == "large":
             # use the Whisper download function instead of our own
             # Import dynamically to avoid crashes on systems without AVX support
-            from faster_whisper.utils import download_model
+            download_model = importlib.import_module(
+                "faster_whisper.utils"
+            ).download_model
 
             logger.debug("Downloading Whisper audio transcription model")
             download_model(

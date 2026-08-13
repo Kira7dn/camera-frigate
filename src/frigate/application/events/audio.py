@@ -7,7 +7,7 @@ import threading
 import time
 from multiprocessing.managers import DictProxy
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -41,13 +41,18 @@ from frigate.util.builtin import get_ffmpeg_arg_list, load_labels
 from frigate.util.ffmpeg import start_or_restart_ffmpeg, stop_ffmpeg
 from frigate.util.process import FrigateProcess
 
-try:
-    from tflite_runtime.interpreter import Interpreter
-except ModuleNotFoundError:
-    from ai_edge_litert.interpreter import Interpreter
-
 
 logger = logging.getLogger(__name__)
+
+def _load_tflite_interpreter() -> Callable[..., Any]:
+    try:
+        module = __import__("tflite_runtime.interpreter", fromlist=["Interpreter"])
+        return module.Interpreter
+    except ModuleNotFoundError:
+        pass
+
+    module = __import__("ai_edge_litert.interpreter", fromlist=["Interpreter"])
+    return module.Interpreter
 
 
 def get_ffmpeg_command(ffmpeg: CameraFfmpegConfig) -> list[str]:
@@ -199,7 +204,7 @@ class AudioEventMaintainer(threading.Thread):
         config: FrigateConfig,
         camera_metrics: DictProxy,
         audio_transcription_model_runner: AudioTranscriptionModelRunner | None,
-        stop_event: threading.Event,
+        stop_event: threading.Event | MpEvent,
     ) -> None:
         super().__init__(name=f"{camera.name}_audio_event_processor")
 
@@ -451,13 +456,16 @@ class AudioEventMaintainer(threading.Thread):
 
 
 class AudioTfl:
-    def __init__(self, stop_event: threading.Event, num_threads: int = 2) -> None:
+    def __init__(
+        self, stop_event: threading.Event | MpEvent, num_threads: int = 2
+    ) -> None:
         self.stop_event = stop_event
         self.num_threads = num_threads
         self.labels = load_labels("/audio-labelmap.txt", prefill=521)
         # Suppress TFLite delegate creation messages that bypass Python logging
         with suppress_stderr_during("tflite_interpreter_init"):
-            self.interpreter = Interpreter(
+            interpreter_cls = _load_tflite_interpreter()
+            self.interpreter = interpreter_cls(
                 model_path="/cpu_audio_model.tflite",
                 num_threads=self.num_threads,
             )

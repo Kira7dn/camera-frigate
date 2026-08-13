@@ -160,7 +160,7 @@ async def start_debug_replay_from_export(
         )
 
     properties = await get_video_properties(
-        request.app.frigate_config.ffmpeg, export.video_path, get_duration=True
+        request.app.frigate_config.ffmpeg, str(export.video_path), get_duration=True
     )
     duration = properties.get("duration", -1)
 

@@ -823,7 +823,7 @@ class FrigateConfig(FrigateBaseModel):
                 logger.warning(
                     "The model key should be specified at the root level of the config, not under detectors. The nested model key will be ignored."
                 )
-                detector_config.model = None
+                cast(Any, detector_config).model = None
 
             model_config = self.model.model_dump(exclude_unset=True, warnings="none")
 

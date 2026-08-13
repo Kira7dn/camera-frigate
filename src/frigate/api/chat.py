@@ -732,7 +732,13 @@ async def _execute_tool_internal(
         response = await _execute_search_objects(request, arguments, allowed_cameras)
         try:
             if hasattr(response, "body"):
-                body_str = response.body.decode("utf-8")
+                response_body = response.body if response.body is not None else b""
+                body_bytes = (
+                    bytes(response_body)
+                    if isinstance(response_body, (bytes, memoryview))
+                    else b""
+                )
+                body_str = body_bytes.decode("utf-8")
                 return json.loads(body_str)
             elif hasattr(response, "content"):
                 return response.content
@@ -879,7 +885,9 @@ def _execute_get_recap(
     after_str = arguments.get("after")
     before_str = arguments.get("before")
 
-    def _parse_as_local_timestamp(s: str):
+    def _parse_as_local_timestamp(s: str | None):
+        if not s:
+            raise ValueError("empty timestamp")
         s = s.replace("Z", "").strip()[:19]
         dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
         return time.mktime(dt.timetuple())

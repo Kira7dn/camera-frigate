@@ -4,7 +4,8 @@ import subprocess
 import threading
 import urllib.request
 from functools import partial
-from typing import Literal
+import importlib
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -89,14 +90,15 @@ class HailoAsyncInference:
         # when importing hailo it activates the driver
         # which leaves processes running even though it may not be used.
         try:
-            from hailo_platform import (
-                HEF,
-                FormatType,
-                HailoSchedulingAlgorithm,
-                VDevice,
-            )
-        except ModuleNotFoundError:
-            pass
+            hailo_platform = importlib.import_module("hailo_platform")
+            HEF = hailo_platform.HEF
+            FormatType = hailo_platform.FormatType
+            HailoSchedulingAlgorithm = hailo_platform.HailoSchedulingAlgorithm
+            VDevice = hailo_platform.VDevice
+        except (ImportError, ModuleNotFoundError) as e:
+            raise ImportError(
+                "hailo_platform SDK is not available for Hailo detector."
+            ) from e
 
         self.input_store = input_store
         self.output_store = output_store
@@ -106,16 +108,17 @@ class HailoAsyncInference:
 
         self.hef = HEF(hef_path)
         self.target = VDevice(params)
-        self.infer_model = self.target.create_infer_model(hef_path)
+        self.infer_model: Any = self.target.create_infer_model(hef_path)
         self.infer_model.set_batch_size(batch_size)
 
         if input_type is not None:
-            self.infer_model.input().set_format_type(getattr(FormatType, input_type))
+            infer_input = self.infer_model.input()
+            infer_input.set_format_type(getattr(FormatType, input_type))
 
         if output_type is not None:
-            for output_name, output_type in output_type.items():
+            for output_name, fmt in output_type.items():
                 self.infer_model.output(output_name).set_format_type(
-                    getattr(FormatType, output_type)
+                    getattr(FormatType, fmt)
                 )
 
         self.output_type = output_type
@@ -124,10 +127,10 @@ class HailoAsyncInference:
     def callback(
         self,
         completion_info,
-        bindings_list: list,
+        bindings_list: list[Any],
         input_batch: list,
         request_ids: list[int],
-    ):
+    ) -> None:
         if completion_info.exception:
             logger.error(f"Inference error: {completion_info.exception}")
         else:
@@ -135,13 +138,12 @@ class HailoAsyncInference:
                 if len(bindings._output_names) == 1:
                     result = bindings.output().get_buffer()
                 else:
-                    result = {
-                        name: np.expand_dims(bindings.output(name).get_buffer(), axis=0)
-                        for name in bindings._output_names
-                    }
-                self.output_store.put(request_ids[i], (input_batch[i], result))
+                    result = np.array(
+                        bindings.output(bindings._output_names[0]).get_buffer()
+                    )
+                self.output_store.put(request_ids[i], np.asarray(result))
 
-    def _create_bindings(self, configured_infer_model) -> object:
+    def _create_bindings(self, configured_infer_model) -> Any:
         if self.output_type is None:
             output_buffers = {
                 output_info.name: np.empty(
@@ -238,7 +240,7 @@ class HailoDetector(DetectionApi):
             if hasattr(detector_config.model, "input_dtype")
             else None
         )
-        self.output_type = "FLOAT32"
+        self.output_format = "FLOAT32"
         self.set_path_and_url(detector_config.model.path)
         self.working_model_path = self.check_and_prepare()
 
@@ -264,36 +266,36 @@ class HailoDetector(DetectionApi):
             logger.error(f"[INIT] Failed to initialize HailoAsyncInference: {e}")
             raise
 
-    def set_path_and_url(self, path: str = None):
+    def set_path_and_url(self, path: str):
         if not path:
             self.model_path = None
             self.url = None
             return
+
+        self.model_path = None
+        self.url = None
         if self.is_url(path):
             self.url = path
-            self.model_path = None
         else:
             self.model_path = path
-            self.url = None
 
-    def is_url(self, url: str) -> bool:
+    @staticmethod
+    def extract_model_name(path: str | None = None, url: str | None = None) -> str:
+        if path and path.endswith(".hef"):
+            return os.path.basename(path)
+        if url and url.endswith(".hef"):
+            return os.path.basename(url)
+        if ARCH == "hailo8":
+            return H8_DEFAULT_MODEL
+        return H8L_DEFAULT_MODEL
+
+    @staticmethod
+    def is_url(url: str) -> bool:
         return (
             url.startswith("http://")
             or url.startswith("https://")
             or url.startswith("www.")
         )
-
-    @staticmethod
-    def extract_model_name(path: str = None, url: str = None) -> str:
-        if path and path.endswith(".hef"):
-            return os.path.basename(path)
-        elif url and url.endswith(".hef"):
-            return os.path.basename(url)
-        else:
-            if ARCH == "hailo8":
-                return H8_DEFAULT_MODEL
-            else:
-                return H8L_DEFAULT_MODEL
 
     @staticmethod
     def download_model(url: str, destination: str):
@@ -415,7 +417,7 @@ class HailoDetectorConfig(BaseDetectorConfig):
         title="Hailo-8/Hailo-8L",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["hailo8l"]
     device: str = Field(
         default="PCIe",
         title="Device Type",

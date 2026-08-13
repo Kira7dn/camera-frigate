@@ -11,7 +11,7 @@ import shutil
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -48,7 +48,7 @@ from frigate.util.passage_trace import (
     passage_evidence_enabled,
     passage_evidence_id,
     passage_evidence_should_capture,
-    passage_trace,
+    passage_trace as _passage_trace,
     persist_passage_evidence_bundle,
 )
 from rapidfuzz.distance import Levenshtein
@@ -59,6 +59,9 @@ from ..types import DataProcessorMetrics
 from .api import RealTimeProcessorApi
 
 logger = logging.getLogger(__name__)
+def passage_trace(*args: Any, **kwargs: Any) -> Any:
+    """Write a trace record through the dynamically typed evidence boundary."""
+    return _passage_trace(*args, **kwargs)
 
 
 def _read_bytes(path: str) -> bytes:
@@ -156,7 +159,7 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             "service_healthy": stats["healthy"],
         }
 
-    def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
+    def process_frame(self, obj_data: Any, frame: Any, **kwargs: Any) -> None:
         if not obj_data.get("box"):
             return
         camera = str(obj_data["camera"])
@@ -229,7 +232,7 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             task,
             key,
             frame_time,
-            tuple(int(value) for value in obj_data["box"]),
+            cast(tuple[int, int, int, int], tuple(int(value) for value in obj_data["box"])),
             observed_in_frame=obj_data.get("observed_in_frame"),
             evidence_ref=evidence,
             attributes=attributes,
@@ -273,7 +276,7 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             self._capture_jobs[job_id] = (
                 task,
                 frame_time,
-                tuple(int(value) for value in obj_data["box"]),
+                cast(tuple[int, int, int, int], tuple(int(value) for value in obj_data["box"])),
             )
 
     def drain_results(self) -> list[Any]:
@@ -692,7 +695,7 @@ class ExternalRecognitionProcessor(RealTimeProcessorApi):
             return next(
                 (
                     label
-                    for label, patterns in self.config.lpr.known_plates.items()
+        for label, patterns in (self.config.lpr.known_plates or {}).items()
                     if any(
                         re.match(f"^{pattern}$", plate)
                         or Levenshtein.distance(pattern, plate)

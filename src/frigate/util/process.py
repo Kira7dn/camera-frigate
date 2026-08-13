@@ -4,9 +4,12 @@ import logging
 import multiprocessing as mp
 import os
 import pathlib
+import queue
 import subprocess
 import threading
+import importlib
 from collections.abc import Callable
+from typing import Any
 from logging.handlers import QueueHandler
 from multiprocessing.synchronize import Event as MpEvent
 
@@ -49,9 +52,14 @@ class BaseProcess(mp.Process):
 
 class FrigateProcess(BaseProcess):
     logger: logging.Logger
+    __log_queue: queue.Queue[Any]
+    __memray_tracker: Any | None
 
     def before_start(self) -> None:
-        self.__log_queue = frigate.log.log_listener.queue
+        log_listener = getattr(frigate.log, "log_listener", None)
+        if log_listener is None:
+            raise RuntimeError("Log listener is not initialized")
+        self.__log_queue = getattr(log_listener, "queue")
         self.__memray_tracker = None
 
     def pre_run_setup(self, logConfig: LoggerConfig | None = None) -> None:
@@ -96,7 +104,7 @@ class FrigateProcess(BaseProcess):
             return
 
         try:
-            import memray
+            memray = importlib.import_module("memray")
 
             reports_dir = pathlib.Path(CONFIG_DIR) / "memray_reports"
             reports_dir.mkdir(parents=True, exist_ok=True)

@@ -46,8 +46,8 @@ class ModelTypeEnum(str, Enum):
 
 
 class ModelConfig(BaseModel):
-    path: str | None = Field(
-        None,
+    path: str = Field(
+        "",
         title="Custom object detector model path",
         description="Path to a custom detection model file (or plus://<model_id> for Frigate+ models).",
     )
@@ -97,17 +97,20 @@ class ModelConfig(BaseModel):
         description="Detector model architecture type (ssd, yolox, yolonas, yolo-generic, rfdetr, dfine) used by some detectors for optimization.",
     )
     _merged_labelmap: dict[int, str] | None = PrivateAttr()
-    _colormap: dict[int, tuple[int, int, int]] = PrivateAttr()
+    _colormap: dict[str, tuple[int, int, int]] = PrivateAttr()
     _all_attributes: list[str] = PrivateAttr()
     _all_attribute_logos: list[str] = PrivateAttr()
     _model_hash: str = PrivateAttr()
 
     @property
     def merged_labelmap(self) -> dict[int, str]:
-        return self._merged_labelmap
+        merged = self._merged_labelmap
+        if merged is None:
+            return {}
+        return merged
 
     @property
-    def colormap(self) -> dict[int, tuple[int, int, int]]:
+    def colormap(self) -> dict[str, tuple[int, int, int]]:
         return self._colormap
 
     @property
@@ -153,7 +156,7 @@ class ModelConfig(BaseModel):
         )
 
     def check_and_load_plus_model(
-        self, plus_api: PlusApi, detector: str = None
+        self, plus_api: PlusApi, detector: str | None = None
     ) -> None:
         if not self.path or not self.path.startswith("plus://"):
             return
@@ -247,8 +250,8 @@ class BaseDetectorConfig(BaseModel):
         title="Detector Type",
         description="Type of detector to use for object detection (for example 'cpu', 'edgetpu', 'openvino').",
     )
-    model: ModelConfig | None = Field(
-        default=None,
+    model: ModelConfig = Field(
+        default_factory=ModelConfig,
         title="Detector specific model configuration",
         description="Detector-specific model configuration options (path, input size, etc.).",
     )

@@ -11,12 +11,12 @@ import subprocess as sp
 import time
 import traceback
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 try:
     import resource
 except ImportError:  # Windows development and type-check environments
-    resource = None  # type: ignore[assignment]
+    resource = cast(Any, None)
 
 import cv2
 import psutil
@@ -813,7 +813,7 @@ def try_get_info(f, h, default="N/A", sensor=None):
                 v = f(h)
         else:
             v = f()
-    except nvml.NVMLError_NotSupported:
+    except getattr(nvml, "NVMLError_NotSupported", Exception):
         v = default
     return v
 
@@ -881,10 +881,10 @@ def get_nvidia_gpu_stats() -> dict[int, dict]:
     except Exception:
         pass
     finally:
-        return results
+        return cast(dict[int, dict[Any, Any]], results)
 
 
-def get_jetson_stats() -> dict[int, dict] | None:
+def get_jetson_stats() -> dict[str, Any] | None:
     results = {}
 
     try:
@@ -909,7 +909,7 @@ def get_jetson_stats() -> dict[int, dict] | None:
 def get_hailo_temps() -> dict[str, float]:
     """Get temperatures for Hailo devices."""
     try:
-        from hailo_platform import Device
+        Device = __import__("hailo_platform", fromlist=["Device"]).Device
     except ModuleNotFoundError:
         return {}
 
@@ -1182,7 +1182,7 @@ def vainfo_hwaccel(device_name: str | None = None) -> sp.CompletedProcess:
     return sp.run(cmd, capture_output=True)
 
 
-def get_nvidia_driver_info() -> dict[str, Any]:
+def get_nvidia_driver_info() -> dict[int, dict[str, Any]]:
     """Get general hardware info for nvidia GPU."""
     results = {}
     try:
@@ -1204,7 +1204,7 @@ def get_nvidia_driver_info() -> dict[str, Any]:
     except Exception:
         pass
     finally:
-        return results
+        return cast(dict[int, dict[str, Any]], results)
 
 
 def auto_detect_hwaccel() -> str:

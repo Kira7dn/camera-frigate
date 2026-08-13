@@ -8,7 +8,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
@@ -41,6 +41,12 @@ from frigate.util.config import find_config_file
 from frigate.util.image import SharedMemoryFrameManager, intersection_over_union
 
 logger = logging.getLogger(__name__)
+
+
+class DispatcherProtocol(Protocol):
+    """Minimal publish contract required by the PTZ runtime."""
+
+    def publish(self, topic: str, payload: Any, retain: bool = False) -> None: ...
 
 
 def ptz_moving_at_frame_time(frame_time, ptz_start_time, ptz_stop_time):
@@ -193,7 +199,7 @@ class PtzAutoTrackerThread(threading.Thread):
         config: FrigateConfig,
         onvif: OnvifController,
         ptz_metrics: dict[str, PTZMetrics],
-        dispatcher: Dispatcher,
+        dispatcher: DispatcherProtocol,
         stop_event: MpEvent,
         config_patch_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -240,7 +246,7 @@ class PtzAutoTracker:
         config: FrigateConfig,
         onvif: OnvifController,
         ptz_metrics: dict[str, PTZMetrics],
-        dispatcher: Dispatcher,
+        dispatcher: DispatcherProtocol,
         stop_event: MpEvent,
         config_patch_sink: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:

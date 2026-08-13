@@ -6,7 +6,7 @@ configuration migration, but the v2 runtime never consults them.
 """
 
 import os
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import Field, HttpUrl, model_validator
 
@@ -178,7 +178,8 @@ class CameraNotificationConfig(FrigateBaseModel):
     enabled: bool = Field(default=False, title="Enable notifications")
     cooldown: int = Field(default=0, ge=0, title="Cooldown period")
     providers: list[NotificationProviderName] = Field(
-        default_factory=lambda: ["webpush"], title="Notification providers"
+        default_factory=lambda: [cast(NotificationProviderName, "webpush")],
+        title="Notification providers",
     )
     enabled_in_config: bool | None = Field(default=None, title="Original state")
 

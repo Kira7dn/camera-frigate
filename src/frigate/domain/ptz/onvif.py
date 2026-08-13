@@ -7,7 +7,7 @@ import time
 from enum import Enum
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy
 from onvif import ONVIFCamera, ONVIFError, ONVIFService
@@ -158,7 +158,7 @@ class OnvifController:
                     cam.onvif.port,
                     cam.onvif.user,
                     cam.onvif.password,
-                    wsdl_dir=str(Path(find_spec("onvif").origin).parent / "wsdl"),
+                    wsdl_dir=str(Path(cast(Any, find_spec("onvif")).origin).parent / "wsdl"),
                     adjust_time=cam.onvif.ignore_time_mismatch,
                     encrypt=not cam.onvif.tls_insecure,
                 ),
@@ -289,7 +289,7 @@ class OnvifController:
         self.cams[camera_name]["ptz"] = ptz
 
         try:
-            imaging: ONVIFService = await onvif.create_imaging_service()
+            imaging: ONVIFService | None = await onvif.create_imaging_service()
         except (Fault, ONVIFError, TransportError, Exception) as e:
             logger.debug(f"Imaging service not supported for {camera_name}: {e}")
             imaging = None
@@ -375,7 +375,7 @@ class OnvifController:
             rel_move_request.ProfileToken = profile.token
             logger.debug(f"{camera_name}: Relative move request: {rel_move_request}")
 
-            fov_uri = ptz_config["Spaces"]["RelativePanTiltTranslationSpace"][
+            fov_uri = cast(Any, ptz_config)["Spaces"]["RelativePanTiltTranslationSpace"][
                 fov_space_id
             ]["URI"]
 
@@ -399,7 +399,7 @@ class OnvifController:
                     (
                         i
                         for i, space in enumerate(
-                            ptz_config.Spaces.RelativeZoomTranslationSpace
+                            cast(Any, ptz_config).Spaces.RelativeZoomTranslationSpace
                         )
                         if "TranslationGenericSpace" in space["URI"]
                     ),
@@ -407,7 +407,7 @@ class OnvifController:
                 )
                 try:
                     if zoom_space_id is not None:
-                        rel_move_request.Translation.Zoom.space = ptz_config["Spaces"][
+                        cast(Any, rel_move_request.Translation).Zoom.space = cast(Any, ptz_config)["Spaces"][
                             "RelativeZoomTranslationSpace"
                         ][zoom_space_id]["URI"]
                 except Exception as e:
@@ -540,7 +540,7 @@ class OnvifController:
         ):
             supported_features.append("pt-r-fov")
             self.cams[camera_name]["relative_fov_range"] = (
-                ptz_config.Spaces.RelativePanTiltTranslationSpace[fov_space_id]
+                cast(Any, ptz_config).Spaces.RelativePanTiltTranslationSpace[fov_space_id]
             )
 
         self.cams[camera_name]["features"] = supported_features
@@ -951,7 +951,7 @@ class OnvifController:
         logger.debug(f"Could not initialize ONVIF for {camera_name}")
         return {}
 
-    async def get_service_capabilities(self, camera_name: str) -> None:
+    async def get_service_capabilities(self, camera_name: str) -> Any:
         if camera_name not in self.cams.keys():
             logger.error(f"ONVIF is not configured for {camera_name}")
             return {}
@@ -979,7 +979,7 @@ class OnvifController:
             )
             return False
 
-    async def get_camera_status(self, camera_name: str) -> None:
+    async def get_camera_status(self, camera_name: str) -> Any:
         async with self.status_locks[camera_name]:
             if camera_name not in self.cams.keys():
                 logger.error(f"ONVIF is not configured for {camera_name}")

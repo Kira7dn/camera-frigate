@@ -1,6 +1,7 @@
 """Handle processing images to classify birds."""
 
 import logging
+import importlib
 import os
 from typing import Any
 
@@ -20,9 +21,9 @@ from ..types import DataProcessorMetrics
 from .api import RealTimeProcessorApi
 
 try:
-    from tflite_runtime.interpreter import Interpreter
+    Interpreter = importlib.import_module("tflite_runtime.interpreter").Interpreter
 except ModuleNotFoundError:
-    from ai_edge_litert.interpreter import Interpreter
+    Interpreter = importlib.import_module("ai_edge_litert.interpreter").Interpreter
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,7 @@ class BirdRealTimeProcessor(RealTimeProcessorApi):
                 i += 1
                 line = f.readline()
 
-    def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
+    def process_frame(self, obj_data: Any, frame: Any, **kwargs: Any) -> None:
         if (
             not self.interpreter
             or not self.tensor_input_details

@@ -5,7 +5,7 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import cv2
 import numpy as np
@@ -94,7 +94,7 @@ class ObjectDescriptionProcessor(PostProcessorApi):
 
                     if (
                         not camera_config.objects.genai.objects
-                        or event.label in camera_config.objects.genai.objects
+                        or str(event.label) in camera_config.objects.genai.objects
                     ) and (
                         not camera_config.objects.genai.required_zones
                         or set(data["entered_zones"])
@@ -130,11 +130,12 @@ class ObjectDescriptionProcessor(PostProcessorApi):
             and camera_config.objects.genai.send_triggers.tracked_object_end
             and (
                 not camera_config.objects.genai.objects
-                or event.label in camera_config.objects.genai.objects
+                or str(event.label) in camera_config.objects.genai.objects
             )
             and (
                 not camera_config.objects.genai.required_zones
-                or set(event.zones) & set(camera_config.objects.genai.required_zones)
+                or set(cast(list[str], event.zones))
+                & set(camera_config.objects.genai.required_zones)
             )
         ):
             self._process_genai_description(event, camera_config, thumbnail)
@@ -191,8 +192,11 @@ class ObjectDescriptionProcessor(PostProcessorApi):
             event, [img for img in embed_image if img is not None]
         )
 
-    def process_data(self, frame_data: dict, data_type: PostProcessDataEnum) -> None:
+    def process_data(
+        self, data: dict[str, Any], data_type: PostProcessDataEnum
+    ) -> None:
         """Process a frame update."""
+        frame_data = data
         self.metrics.object_desc_dps.value = self.object_desc_dps.eps()
 
         if data_type != PostProcessDataEnum.tracked_object:
@@ -215,11 +219,13 @@ class ObjectDescriptionProcessor(PostProcessorApi):
                 frame_data["camera"], frame_data["event"], frame_data["thumbnail"]
             )
 
-    def handle_request(self, topic: str, data: dict[str, Any]) -> str | None:
+    def handle_request(
+        self, topic: str, request_data: dict[str, Any]
+    ) -> dict[str, Any] | str | None:
         """Handle a request."""
         if topic == "regenerate_description":
             self.__regenerate_description(
-                data["event_id"], data["source"], data["force"]
+                request_data["event_id"], request_data["source"], request_data["force"]
             )
         return None
 
@@ -246,7 +252,8 @@ class ObjectDescriptionProcessor(PostProcessorApi):
             # Crop snapshot based on region
             # provide full image if region doesn't exist (manual events)
             height, width = img.shape[:2]
-            x1_rel, y1_rel, width_rel, height_rel = event.data.get(  # type: ignore[attr-defined]
+            event_data = cast(dict[str, Any], event.data)
+            x1_rel, y1_rel, width_rel, height_rel = event_data.get(
                 "region", [0, 0, 1, 1]
             )
             x1, y1 = int(x1_rel * width), int(y1_rel * height)

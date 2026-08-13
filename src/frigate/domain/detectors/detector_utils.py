@@ -3,10 +3,23 @@ import os
 
 import numpy as np
 
-try:
-    from tflite_runtime.interpreter import Interpreter, load_delegate
-except ModuleNotFoundError:
-    from ai_edge_litert.interpreter import Interpreter, load_delegate
+from typing import Any
+
+
+def _load_tflite_interpreter():
+    try:
+        interpreter_module = __import__(
+            "tflite_runtime.interpreter", fromlist=["Interpreter", "load_delegate"]
+        )
+    except ModuleNotFoundError:
+        interpreter_module = __import__(
+            "ai_edge_litert.interpreter", fromlist=["Interpreter", "load_delegate"]
+        )
+
+    return (
+        getattr(interpreter_module, "Interpreter"),
+        getattr(interpreter_module, "load_delegate"),
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +63,7 @@ def tflite_detect_raw(self, tensor_input):
 def tflite_load_delegate_interpreter(
     delegate_library: str, detector_config, device_config
 ):
+    Interpreter, load_delegate = _load_tflite_interpreter()
     try:
         logger.info("Attempting to load NPU")
         tf_delegate = load_delegate(delegate_library, device_config)

@@ -4,6 +4,7 @@ import datetime
 import logging
 from functools import reduce
 from pathlib import Path
+from typing import Annotated, Any, cast
 
 import pandas as pd
 from fastapi import APIRouter, Request
@@ -48,9 +49,9 @@ router = APIRouter(tags=[Tags.review])
     dependencies=[Depends(allow_any_authenticated())],
 )
 async def review(
-    params: ReviewQueryParams = Depends(),
-    current_user: dict = Depends(get_current_user),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[ReviewQueryParams, Depends()],
+    current_user: Annotated[dict, Depends(get_current_user)],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
     if isinstance(current_user, JSONResponse):
         return current_user
@@ -163,15 +164,15 @@ async def review(
     dependencies=[Depends(allow_any_authenticated())],
 )
 async def review_ids(request: Request, ids: str):
-    ids = ids.split(",")
+    review_ids = ids.split(",")
 
-    if not ids:
+    if not review_ids:
         return JSONResponse(
             content=({"success": False, "message": "Valid list of ids must be sent"}),
             status_code=400,
         )
 
-    for review_id in ids:
+    for review_id in review_ids:
         try:
             review = ReviewSegment.get(ReviewSegment.id == review_id)
             await require_camera_access(review.camera, request=request)
@@ -185,7 +186,9 @@ async def review_ids(request: Request, ids: str):
 
     try:
         reviews = (
-            ReviewSegment.select().where(ReviewSegment.id << ids).dicts().iterator()
+            ReviewSegment.select().where(
+                ReviewSegment.id << cast(Any, review_ids)
+            ).dicts().iterator()
         )
         return JSONResponse(list(reviews))
     except Exception:
@@ -201,9 +204,9 @@ async def review_ids(request: Request, ids: str):
     dependencies=[Depends(allow_any_authenticated())],
 )
 async def review_summary(
-    params: ReviewSummaryQueryParams = Depends(),
-    current_user: dict = Depends(get_current_user),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[ReviewSummaryQueryParams, Depends()],
+    current_user: Annotated[dict, Depends(get_current_user)],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
     if isinstance(current_user, JSONResponse):
         return current_user
@@ -482,7 +485,7 @@ async def review_summary(
 async def set_multiple_reviewed(
     request: Request,
     body: ReviewModifyMultipleBody,
-    current_user: dict = Depends(get_current_user),
+    current_user: Annotated[dict, Depends(get_current_user)],
 ):
     if isinstance(current_user, JSONResponse):
         return current_user
@@ -582,8 +585,8 @@ def delete_reviews(body: ReviewModifyMultipleBody):
     dependencies=[Depends(allow_any_authenticated())],
 )
 def motion_activity(
-    params: ReviewActivityMotionQueryParams = Depends(),
-    allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
+    params: Annotated[ReviewActivityMotionQueryParams, Depends()],
+    allowed_cameras: Annotated[list[str], Depends(get_allowed_cameras_for_filter)],
 ):
     """Get motion and audio activity."""
     cameras = params.cameras
@@ -609,7 +612,7 @@ def motion_activity(
 
     clauses.append(Recordings.camera << camera_list)
 
-    data: list[Recordings] = (
+    data_rows = list(
         Recordings.select(
             Recordings.camera,
             Recordings.start_time,
@@ -620,9 +623,17 @@ def motion_activity(
         .dicts()
         .iterator()
     )
+    data: list[dict[str, Any]] = [
+        {
+            "camera": row["camera"],
+            "start_time": row["start_time"],
+            "motion": row["motion"],
+        }
+        for row in data_rows
+    ]
 
     # resample data using pandas to get activity on scaled basis
-    df = pd.DataFrame(data, columns=["start_time", "motion", "camera"])
+    df = pd.DataFrame.from_records(data, columns=["start_time", "motion", "camera"])
 
     if df.empty:
         logger.warning("No motion data found for the requested time range")
@@ -710,7 +721,7 @@ async def get_review(request: Request, review_id: str):
 )
 async def set_not_reviewed(
     review_id: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: Annotated[dict, Depends(get_current_user)],
 ):
     if isinstance(current_user, JSONResponse):
         return current_user

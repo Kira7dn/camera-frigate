@@ -7,7 +7,7 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import cv2
 from numpy import ndarray
@@ -43,11 +43,11 @@ def _unlock_file_descriptor(fd: int) -> None:
 
 def get_event_thumbnail_bytes(event: Event) -> bytes | None:
     if event.thumbnail:
-        return base64.b64decode(event.thumbnail)
+        return base64.b64decode(cast(str, event.thumbnail))
     else:
         try:
             with open(
-                os.path.join(THUMB_DIR, event.camera, f"{event.id}.webp"), "rb"
+                os.path.join(THUMB_DIR, cast(str, event.camera), f"{event.id}.webp"), "rb"
             ) as f:
                 return f.read()
         except Exception:
@@ -104,7 +104,8 @@ def _get_event_snapshot_overlay_boxes(
     frame_shape: tuple[int, ...], event: Event
 ) -> list[dict[str, Any]]:
     overlay_boxes: list[dict[str, Any]] = []
-    draw_data = event.data.get("draw") if event.data else {}
+    event_data = cast(dict[str, Any], event.data)
+    draw_data = event_data.get("draw") if event.data else {}
     draw_boxes = draw_data.get("boxes", []) if isinstance(draw_data, dict) else []
 
     for draw_box in draw_boxes:
@@ -147,9 +148,10 @@ def get_event_snapshot_bytes(
         return None, 0
 
     frame_time = _get_event_snapshot_frame_time(event)
+    event_data = cast(dict[str, Any], event.data)
     box = relative_box_to_absolute(
         best_frame.shape,
-        event.data.get("box") if event.data else None,
+        event_data.get("box") if event.data else None,
     )
     overlay_boxes = _get_event_snapshot_overlay_boxes(best_frame.shape, event)
     if extra_overlay_boxes:
@@ -170,13 +172,13 @@ def get_event_snapshot_bytes(
         crop=crop and is_clean_snapshot,
         height=height,
         quality=quality,
-        label=label or getattr(event, "sub_label", None) or event.label,
+        label=label or getattr(event, "sub_label", None) or cast(str, event.label),
         box=box,
         score=_get_event_snapshot_score(event),
         area=_get_event_snapshot_area(event),
         attributes=_get_event_snapshot_attributes(
             best_frame.shape,
-            event.data.get("attributes") if event.data else None,
+            event_data.get("attributes") if event.data else None,
         ),
         color=(colormap or {}).get(event.label, (255, 255, 255)),
         overlay_boxes=overlay_boxes,
@@ -194,11 +196,12 @@ def _as_timestamp(value: Any) -> float:
 
 def _get_event_snapshot_frame_time(event: Event) -> float:
     if event.data:
-        snapshot_frame_time = event.data.get("snapshot_frame_time")
+        event_data = cast(dict[str, Any], event.data)
+        snapshot_frame_time = event_data.get("snapshot_frame_time")
         if snapshot_frame_time is not None:
             return _as_timestamp(snapshot_frame_time)
 
-        frame_time = event.data.get("frame_time")
+        frame_time = event_data.get("frame_time")
         if frame_time is not None:
             return _as_timestamp(frame_time)
 
@@ -228,20 +231,21 @@ def _get_event_snapshot_attributes(
 
 def _get_event_snapshot_score(event: Event) -> float:
     if event.data:
-        score = event.data.get("score")
+        event_data = cast(dict[str, Any], event.data)
+        score = event_data.get("score")
         if score is not None:
             return score
 
-        top_score = event.data.get("top_score")
+        top_score = event_data.get("top_score")
         if top_score is not None:
             return top_score
 
-    return event.top_score or event.score or 0
+    return float(cast(float, event.top_score) or cast(float, event.score) or 0)
 
 
 def _get_event_snapshot_area(event: Event) -> int | None:
     if event.data:
-        area = event.data.get("snapshot_area")
+        area = cast(dict[str, Any], event.data).get("snapshot_area")
         if area is not None:
             return int(area)
 
@@ -250,11 +254,12 @@ def _get_event_snapshot_area(event: Event) -> int | None:
 
 def _get_event_snapshot_estimated_speed(event: Event) -> float:
     if event.data:
-        estimated_speed = event.data.get("snapshot_estimated_speed")
+        event_data = cast(dict[str, Any], event.data)
+        estimated_speed = event_data.get("snapshot_estimated_speed")
         if estimated_speed is not None:
             return float(estimated_speed)
 
-        average_speed = event.data.get("average_estimated_speed")
+        average_speed = event_data.get("average_estimated_speed")
         if average_speed is not None:
             return float(average_speed)
 
@@ -288,7 +293,7 @@ def delete_event_thumbnail(event: Event) -> bool:
     if event.thumbnail:
         return True
     else:
-        Path(os.path.join(THUMB_DIR, event.camera, f"{event.id}.webp")).unlink(
+        Path(os.path.join(THUMB_DIR, cast(str, event.camera), f"{event.id}.webp")).unlink(
             missing_ok=True
         )
         return True

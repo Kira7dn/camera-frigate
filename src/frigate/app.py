@@ -12,6 +12,7 @@ from pathlib import Path
 
 import psutil
 import uvicorn
+import multiprocessing.shared_memory
 from peewee_migrate import Router
 from playhouse.sqlite_ext import SqliteExtDatabase
 

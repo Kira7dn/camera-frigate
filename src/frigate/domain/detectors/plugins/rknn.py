@@ -2,7 +2,7 @@ import logging
 import os.path
 import re
 import urllib.request
-from typing import Literal
+from typing import Any, Literal, cast
 
 import cv2
 import numpy as np
@@ -35,7 +35,7 @@ class RknnDetectorConfig(BaseDetectorConfig):
         title="RKNN",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["rknn"]
     num_cores: int = Field(
         default=0,
         ge=0,
@@ -72,11 +72,12 @@ class Rknn(DetectionApi):
                     "For more information, see: https://docs.deci.ai/super-gradients/latest/LICENSE.YOLONAS.html"
                 )
 
+        if config.model.model_type is None:
+            raise RuntimeError("RKNN detector requires a configured model type")
+
         self.runner = RKNNModelRunner(
             model_path=model_props["path"],
-            model_type=config.model.model_type.value
-            if config.model.model_type
-            else None,
+            model_type=config.model.model_type.value,
             core_mask=core_mask,
         )
 
@@ -285,8 +286,8 @@ class Rknn(DetectionApi):
 
         # run nms
         indices = cv2.dnn.NMSBoxes(
-            bboxes=xyxy_to_xywh_for_nms(boxes),
-            scores=scores,
+            bboxes=xyxy_to_xywh_for_nms(boxes).tolist(),
+            scores=scores.tolist() if hasattr(scores, "tolist") else scores,
             score_threshold=0.4,
             nms_threshold=0.4,
         )
@@ -294,7 +295,7 @@ class Rknn(DetectionApi):
         results = np.zeros((20, 6), np.float32)
 
         if len(indices) > 0:
-            for i, idx in enumerate(indices.flatten()[:20]):
+            for i, idx in enumerate(np.array(indices).flatten()[:20]):
                 box = boxes[idx]
                 results[i] = [
                     classes[idx],
@@ -307,13 +308,17 @@ class Rknn(DetectionApi):
 
         return results
 
-    def post_process(self, output):
+    def post_process(self, output: list[np.ndarray]):
         if self.detector_config.model.model_type == ModelTypeEnum.yolonas:
             return self.post_process_yolonas(output)
         elif self.detector_config.model.model_type == ModelTypeEnum.yologeneric:
             return post_process_yolo(output, self.width, self.height)
         elif self.detector_config.model.model_type == ModelTypeEnum.yolox:
-            return self.post_process_yolox(output, self.grids, self.expanded_strides)
+            return self.post_process_yolox(
+                output,
+                np.asarray(self.grids),
+                np.asarray(self.expanded_strides),
+            )
         else:
             raise ValueError(
                 f'Model type "{self.detector_config.model.model_type}" is currently not supported.'
@@ -322,5 +327,5 @@ class Rknn(DetectionApi):
     def detect_raw(self, tensor_input):
         # Prepare input for the runner
         inputs = {"input": tensor_input}
-        output = self.runner.run(inputs)
+        output = cast(list[np.ndarray], self.runner.run(inputs))
         return self.post_process(output)

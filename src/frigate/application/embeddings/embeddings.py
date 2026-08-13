@@ -26,6 +26,7 @@ from frigate.infrastructure.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.models import Event, Trigger
 from frigate.types import ModelStatusTypesEnum
 from frigate.util.builtin import EventsPerSecond, InferenceSpeed, serialize
+from typing import Callable
 from frigate.util.file import get_event_thumbnail_bytes
 
 from .genai_embedding import GenAIEmbedding
@@ -120,11 +121,15 @@ class Embeddings:
                     "has 'embeddings' in its roles."
                 )
             self.embedding = GenAIEmbedding(embeddings_client)
-            self.text_embedding = lambda input_data: self.embedding(
+            self.text_embedding: Callable[[list[str]], list[np.ndarray]] = (
+                lambda input_data: self.embedding(
                 input_data, embedding_type="text"
+                )
             )
-            self.vision_embedding = lambda input_data: self.embedding(
+            self.vision_embedding: Callable[[list[bytes]], list[np.ndarray]] = (
+                lambda input_data: self.embedding(
                 input_data, embedding_type="vision"
+                )
             )
         elif model_cfg == SemanticSearchModelEnum.jinav2:
             # Single JinaV2Embedding instance for both text and vision
@@ -134,24 +139,32 @@ class Embeddings:
                 device=config.semantic_search.device
                 or ("GPU" if config.semantic_search.model_size == "large" else "CPU"),
             )
-            self.text_embedding = lambda input_data: self.embedding(
+            self.text_embedding: Callable[[list[str]], list[np.ndarray]] = (
+                lambda input_data: self.embedding(
                 input_data, embedding_type="text"
+                )
             )
-            self.vision_embedding = lambda input_data: self.embedding(
+            self.vision_embedding: Callable[[list[bytes]], list[np.ndarray]] = (
+                lambda input_data: self.embedding(
                 input_data, embedding_type="vision"
+                )
             )
         else:
             # Default to jinav1
-            self.text_embedding = JinaV1TextEmbedding(
+            self.text_embedding: Callable[[list[str]], list[np.ndarray]] = (
+                JinaV1TextEmbedding(
                 model_size=config.semantic_search.model_size,
                 requestor=self.requestor,
                 device="CPU",
+                )
             )
-            self.vision_embedding = JinaV1ImageEmbedding(
+            self.vision_embedding: Callable[[list[bytes]], list[np.ndarray]] = (
+                JinaV1ImageEmbedding(
                 model_size=config.semantic_search.model_size,
                 requestor=self.requestor,
                 device=config.semantic_search.device
                 or ("GPU" if config.semantic_search.model_size == "large" else "CPU"),
+                )
             )
 
     def update_stats(self) -> None:
@@ -292,13 +305,14 @@ class Embeddings:
 
     def batch_embed_description(
         self, event_descriptions: dict[str, str], upsert: bool = True
-    ) -> np.ndarray:
+    ) -> list[np.ndarray]:
         start = datetime.datetime.now().timestamp()
         # upsert embeddings one by one to avoid token limit
         embeddings = []
 
         for desc in event_descriptions.values():
-            embeddings.append(self.text_embedding([desc])[0])
+            embedding = self.text_embedding([desc])[0]
+            embeddings.append(embedding)
 
         if upsert:
             ids = list(event_descriptions.keys())
@@ -370,7 +384,8 @@ class Embeddings:
             for event in events:
                 totals["processed_objects"] += 1
 
-                if description := event.data.get("description", "").strip():
+                event_data = event.data if isinstance(event.data, dict) else {}
+                if description := str(event_data.get("description", "")).strip():
                     batch_descs[event.id] = description
                     totals["descriptions"] += 1
 
@@ -450,9 +465,10 @@ class Embeddings:
     def sync_triggers(self) -> None:
         for camera in self.config.cameras.values():
             # Get all existing triggers for this camera
+            camera_name = str(camera.name)
             existing_triggers = {
                 trigger.name: trigger
-                for trigger in Trigger.select().where(Trigger.camera == camera.name)
+                for trigger in Trigger.select().where(Trigger.camera == camera_name)
             }
 
             # Get all configured trigger names
@@ -469,12 +485,14 @@ class Embeddings:
 
                     # Check if data has changed or thumbnail is missing for thumbnail type
                     if trigger.type == "thumbnail":
+                        trigger_data = str(trigger.data) if trigger.data is not None else ""
                         thumbnail_path = os.path.join(
-                            TRIGGER_DIR, camera.name, f"{trigger.data}.webp"
+                            TRIGGER_DIR, camera_name, f"{trigger_data}.webp"
                         )
                         try:
                             event = Event.get(Event.id == trigger.data)
-                            if event.data.get("type") != "object":
+                            event_data = event.data if isinstance(event.data, dict) else {}
+                            if event_data.get("type") != "object":
                                 logger.warning(
                                     f"Event {trigger.data} is not a tracked object for {trigger.type} trigger"
                                 )
@@ -492,7 +510,7 @@ class Embeddings:
                                     )
                                     continue
                                 self.write_trigger_thumbnail(
-                                    camera.name, trigger.data, thumbnail
+                                    camera_name, trigger_data, thumbnail
                                 )
                                 thumbnail_missing = True
                         except DoesNotExist:
@@ -519,7 +537,7 @@ class Embeddings:
                         or thumbnail_missing
                     ):
                         existing_trigger.embedding = self._calculate_trigger_embedding(
-                            trigger, trigger_name, camera.name
+                            trigger, trigger_name, camera_name
                         )
                         needs_embedding_update = True
 
@@ -540,7 +558,8 @@ class Embeddings:
                                 continue
 
                             # Skip the event if not an object
-                            if event.data.get("type") != "object":
+                            event_data = event.data if isinstance(event.data, dict) else {}
+                            if event_data.get("type") != "object":
                                 logger.warning(
                                     f"Event ID {trigger.data} for trigger {trigger_name} is not a tracked object."
                                 )
@@ -555,12 +574,12 @@ class Embeddings:
                                 continue
 
                             self.write_trigger_thumbnail(
-                                camera.name, trigger.data, thumbnail
+                                camera_name, str(trigger.data), thumbnail
                             )
 
                         # Calculate embedding for new trigger
                         embedding = self._calculate_trigger_embedding(
-                            trigger, trigger_name, camera.name
+                            trigger, trigger_name, camera_name
                         )
 
                         Trigger.create(
@@ -589,8 +608,13 @@ class Embeddings:
                 for trigger_name in triggers_to_remove:
                     # Only remove thumbnail files for thumbnail triggers
                     if existing_triggers[trigger_name].type == "thumbnail":
+                        trigger_data = (
+                            str(existing_triggers[trigger_name].data)
+                            if existing_triggers[trigger_name].data is not None
+                            else ""
+                        )
                         self.remove_trigger_thumbnail(
-                            camera.name, existing_triggers[trigger_name].data
+                            camera_name, trigger_data
                         )
 
     def write_trigger_thumbnail(
@@ -598,8 +622,13 @@ class Embeddings:
     ) -> None:
         """Write the thumbnail to the trigger directory."""
         try:
-            os.makedirs(os.path.join(TRIGGER_DIR, camera), exist_ok=True)
-            with open(os.path.join(TRIGGER_DIR, camera, f"{event_id}.webp"), "wb") as f:
+            camera_name = str(camera)
+            event_identifier = str(event_id)
+            os.makedirs(os.path.join(TRIGGER_DIR, camera_name), exist_ok=True)
+            with open(
+                os.path.join(TRIGGER_DIR, camera_name, f"{event_identifier}.webp"),
+                "wb",
+            ) as f:
                 f.write(thumbnail)
             logger.debug(
                 f"Writing thumbnail for trigger with data {event_id} in {camera}."
@@ -612,7 +641,9 @@ class Embeddings:
     def remove_trigger_thumbnail(self, camera: str, event_id: str) -> None:
         """Write the thumbnail to the trigger directory."""
         try:
-            os.remove(os.path.join(TRIGGER_DIR, camera, f"{event_id}.webp"))
+            camera_name = str(camera)
+            event_identifier = str(event_id)
+            os.remove(os.path.join(TRIGGER_DIR, camera_name, f"{event_identifier}.webp"))
             logger.debug(
                 f"Deleted thumbnail for trigger with data {event_id} in {camera}."
             )
@@ -625,9 +656,14 @@ class Embeddings:
         self, trigger, trigger_name: str, camera_name: str
     ) -> bytes:
         """Calculate embedding for a trigger based on its type and data."""
+        trigger_data = str(trigger.data) if trigger.data is not None else ""
         if trigger.type == "description":
             logger.debug(f"Generating embedding for trigger description {trigger_name}")
-            embedding = self.embed_description(None, trigger.data, upsert=False)
+            if not isinstance(trigger.data, str):
+                return b""
+            embedding = self.embed_description(
+                event_id=str(trigger.id), description=trigger.data, upsert=False
+            )
             return embedding.astype(np.float32).tobytes()
 
         elif trigger.type == "thumbnail":
@@ -635,33 +671,33 @@ class Embeddings:
             # Try to get embedding from vec_thumbnails table first
             cursor = self.db.execute_sql(
                 "SELECT thumbnail_embedding FROM vec_thumbnails WHERE id = ?",
-                [trigger.data],
+                [trigger_data],
             )
             row = cursor.fetchone() if cursor else None
             if row:
                 return row[0]  # Already in bytes format
             else:
                 logger.debug(
-                    f"No thumbnail embedding found for image ID: {trigger.data}, generating from saved trigger thumbnail"
+                    f"No thumbnail embedding found for image ID: {trigger_data}, generating from saved trigger thumbnail"
                 )
 
                 try:
                     with open(
-                        os.path.join(TRIGGER_DIR, camera_name, f"{trigger.data}.webp"),
+                        os.path.join(TRIGGER_DIR, camera_name, f"{trigger_data}.webp"),
                         "rb",
                     ) as f:
                         thumbnail = f.read()
                 except Exception as e:
                     logger.error(
-                        f"Failed to read thumbnail for trigger {trigger_name} with ID {trigger.data}: {e}"
+                        f"Failed to read thumbnail for trigger {trigger_name} with ID {trigger_data}: {e}"
                     )
                     return b""
 
                 logger.debug(
-                    f"Generating embedding for trigger thumbnail {trigger_name} with ID {trigger.data}"
+                    f"Generating embedding for trigger thumbnail {trigger_name} with ID {trigger_data}"
                 )
                 embedding = self.embed_thumbnail(
-                    str(trigger.data), thumbnail, upsert=False
+                    trigger_data, thumbnail, upsert=False
                 )
                 return embedding.astype(np.float32).tobytes()
 

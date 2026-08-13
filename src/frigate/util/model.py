@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -50,7 +50,7 @@ def post_process_dfine(
 
     input_shape = np.array([height, width, height, width])
     boxes = np.divide(boxes, input_shape, dtype=np.float32)
-    indices = cv2.dnn.NMSBoxes(
+    indices = cast(Any, cv2.dnn.NMSBoxes)(
         xyxy_to_xywh_for_nms(boxes), scores, score_threshold=0.4, nms_threshold=0.4
     )
     detections = np.zeros((20, 6), np.float32)
@@ -73,7 +73,7 @@ def post_process_dfine(
     return detections
 
 
-def post_process_rfdetr(tensor_output: list[np.ndarray, np.ndarray]) -> np.ndarray:
+def post_process_rfdetr(tensor_output: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
     boxes = tensor_output[0]
     raw_scores = tensor_output[1]
 
@@ -104,7 +104,7 @@ def post_process_rfdetr(tensor_output: list[np.ndarray, np.ndarray]) -> np.ndarr
     filtered_boxes = np.stack([x_min, y_min, x_max, y_max], axis=-1)
 
     # apply nms
-    indices = cv2.dnn.NMSBoxes(
+    indices = cast(Any, cv2.dnn.NMSBoxes)(
         xyxy_to_xywh_for_nms(filtered_boxes),
         filtered_scores,
         score_threshold=0.4,
@@ -188,7 +188,7 @@ def __post_process_multipart_yolo(
                     all_scores.append(conf)
                     all_class_ids.append(class_id)
 
-    indices = cv2.dnn.NMSBoxes(
+    indices = cast(Any, cv2.dnn.NMSBoxes)(
         bboxes=xyxy_to_xywh_for_nms(all_boxes),
         scores=all_scores,
         score_threshold=0.4,
@@ -236,7 +236,7 @@ def __post_process_nms_yolo(predictions: np.ndarray, width, height) -> np.ndarra
     boxes = boxes_xyxy
 
     # run NMS
-    indices = cv2.dnn.NMSBoxes(
+    indices = cast(Any, cv2.dnn.NMSBoxes)(
         xyxy_to_xywh_for_nms(boxes), scores, score_threshold=0.4, nms_threshold=0.4
     )
     detections = np.zeros((20, 6), np.float32)
@@ -289,7 +289,7 @@ def post_process_yolox(
     cls_inds = scores.argmax(1)
     scores = scores[np.arange(len(cls_inds)), cls_inds]
 
-    indices = cv2.dnn.NMSBoxes(
+    indices = cast(Any, cv2.dnn.NMSBoxes)(
         xyxy_to_xywh_for_nms(boxes_xyxy), scores, score_threshold=0.4, nms_threshold=0.4
     )
 

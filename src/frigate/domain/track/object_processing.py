@@ -11,7 +11,7 @@ from collections import defaultdict
 from enum import Enum
 from multiprocessing import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -444,13 +444,13 @@ class TrackedObjectProcessor(threading.Thread):
             tracked_obj.obj_data["sub_label"] = (sub_label, score)
 
         if event:
-            event.sub_label = sub_label  # type: ignore[assignment]
-            data = event.data
+            event.sub_label = cast(Any, sub_label)
+            data = cast(dict[str, Any], event.data)
             if sub_label is None:
-                data["sub_label_score"] = None  # type: ignore[index]
+                data["sub_label_score"] = None
             elif score is not None:
-                data["sub_label_score"] = score  # type: ignore[index]
-            event.data = data
+                data["sub_label_score"] = score
+            cast(Any, event).data = data
             event.save()
 
             # update timeline items
@@ -814,13 +814,13 @@ class TrackedObjectProcessor(threading.Thread):
             )
 
         if event:
-            data = event.data
-            data[field_name] = field_value  # type: ignore[index]
+            data = cast(dict[str, Any], event.data)
+            data[field_name] = field_value
             if field_value is None:
-                data[f"{field_name}_score"] = None  # type: ignore[index]
+                data[f"{field_name}_score"] = None
             elif score is not None:
-                data[f"{field_name}_score"] = score  # type: ignore[index]
-            event.data = data
+                data[f"{field_name}_score"] = score
+            cast(Any, event).data = data
             event.save()
 
     def save_lpr_snapshot(self, payload: tuple) -> None:

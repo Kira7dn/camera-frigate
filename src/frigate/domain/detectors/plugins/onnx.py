@@ -1,4 +1,5 @@
 import logging
+from typing import cast
 from typing import Literal
 
 import numpy as np
@@ -32,7 +33,7 @@ class ONNXDetectorConfig(BaseDetectorConfig):
         title="ONNX",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["onnx"]
     device: str = Field(
         default="AUTO",
         title="Device Type",
@@ -165,13 +166,21 @@ class ONNXDetector(DetectionApi):
                     ),
                 }
             )
-            return post_process_dfine(tensor_output, self.width, self.height)
+            outputs = cast(list[np.ndarray], tensor_output)
+            return post_process_dfine(np.stack(outputs), self.width, self.height)
 
         model_input_name = self.runner.get_input_names()[0]
-        tensor_output = self.runner.run({model_input_name: tensor_input})
+        tensor_output_raw = self.runner.run({model_input_name: tensor_input})
+        if tensor_output_raw is None:
+            raise RuntimeError("ONNX runner returned None")
+        if not isinstance(tensor_output_raw, list):
+            raise RuntimeError("ONNX runner output is not list-like")
+        tensor_output: list[np.ndarray] = [
+            cast(np.ndarray, output) for output in tensor_output_raw
+        ]
 
         if self.onnx_model_type == ModelTypeEnum.rfdetr:
-            return post_process_rfdetr(tensor_output)
+            return post_process_rfdetr((tensor_output[0], tensor_output[1]))
         elif self.onnx_model_type == ModelTypeEnum.yolonas:
             predictions = tensor_output[0]
 
@@ -196,12 +205,13 @@ class ONNXDetector(DetectionApi):
         elif self.onnx_model_type == ModelTypeEnum.yologeneric:
             return post_process_yolo(tensor_output, self.width, self.height)
         elif self.onnx_model_type == ModelTypeEnum.yolox:
+            predictions = cast(np.ndarray, tensor_output[0])
             return post_process_yolox(
-                tensor_output[0],
+                predictions,
                 self.width,
                 self.height,
-                self.grids,
-                self.expanded_strides,
+                np.asarray(self.grids),
+                np.asarray(self.expanded_strides),
             )
         else:
             raise Exception(

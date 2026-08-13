@@ -1,15 +1,16 @@
 """FFmpeg utility functions for managing ffmpeg processes."""
 
 import logging
+import os
 import subprocess as sp
 from collections.abc import Callable
-from typing import Any
+from typing import IO, Any, cast
 
 from frigate.const import PROCESS_PRIORITY_LOW
 from frigate.log import LogPipe
 
 
-def stop_ffmpeg(ffmpeg_process: sp.Popen[Any], logger: logging.Logger):
+def stop_ffmpeg(ffmpeg_process: sp.Popen[Any], logger: logging.Logger) -> None:
     logger.info("Terminating the existing ffmpeg process...")
     ffmpeg_process.terminate()
     try:
@@ -21,32 +22,53 @@ def stop_ffmpeg(ffmpeg_process: sp.Popen[Any], logger: logging.Logger):
         ffmpeg_process.kill()
         ffmpeg_process.communicate()
         logger.info("FFmpeg has been killed")
-    ffmpeg_process = None
+    return None
 
 
 def start_or_restart_ffmpeg(
-    ffmpeg_cmd, logger, logpipe: LogPipe, frame_size=None, ffmpeg_process=None
+    ffmpeg_cmd: list[str],
+    logger: logging.Logger,
+    logpipe: LogPipe,
+    frame_size: int | None = None,
+    ffmpeg_process: sp.Popen[Any] | None = None,
 ) -> sp.Popen[Any]:
     if ffmpeg_process is not None:
         stop_ffmpeg(ffmpeg_process, logger)
 
     if frame_size is None:
-        process = sp.Popen(
-            ffmpeg_cmd,
-            stdout=sp.DEVNULL,
-            stderr=logpipe,
-            stdin=sp.DEVNULL,
-            start_new_session=True,
-        )
+        if os.name != "nt":
+                process = sp.Popen(
+                    ffmpeg_cmd,
+                    stdout=sp.DEVNULL,
+                    stderr=cast(IO[Any], logpipe),
+                    stdin=sp.DEVNULL,
+                    start_new_session=True,
+                )
+        else:
+                process = sp.Popen(
+                    ffmpeg_cmd,
+                    stdout=sp.DEVNULL,
+                    stderr=cast(IO[Any], logpipe),
+                    stdin=sp.DEVNULL,
+                )
     else:
-        process = sp.Popen(
-            ffmpeg_cmd,
-            stdout=sp.PIPE,
-            stderr=logpipe,
-            stdin=sp.DEVNULL,
-            bufsize=frame_size * 10,
-            start_new_session=True,
-        )
+        if os.name != "nt":
+                process = sp.Popen(
+                    ffmpeg_cmd,
+                    stdout=sp.PIPE,
+                    stderr=cast(IO[Any], logpipe),
+                    stdin=sp.DEVNULL,
+                    bufsize=frame_size * 10,
+                    start_new_session=True,
+                )
+        else:
+                process = sp.Popen(
+                    ffmpeg_cmd,
+                    stdout=sp.PIPE,
+                    stderr=cast(IO[Any], logpipe),
+                    stdin=sp.DEVNULL,
+                    bufsize=frame_size * 10,
+                )
     return process
 
 

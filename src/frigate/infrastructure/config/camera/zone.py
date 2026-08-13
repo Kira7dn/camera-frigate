@@ -67,7 +67,7 @@ class ZoneConfig(BaseModel):
 
     @property
     def color(self) -> tuple[int, int, int]:
-        return self._color
+        return self._color or (0, 0, 0)
 
     @property
     def contour(self) -> np.ndarray:
@@ -108,7 +108,8 @@ class ZoneConfig(BaseModel):
     @model_validator(mode="after")
     def check_loitering_time_constraints(self):
         if self.loitering_time > 0 and (
-            self.speed_threshold is not None or len(self.distances) > 0
+            self.speed_threshold is not None
+            or (self.distances is not None and len(self.distances) > 0)
         ):
             logger.warning(
                 "loitering_time should not be set on a zone if speed_threshold or distances is set."

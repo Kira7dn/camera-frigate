@@ -5,7 +5,7 @@ import queue
 import subprocess as sp
 import threading
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 from frigate.infrastructure.config import CameraConfig, FfmpegConfig, FrigateConfig
 from frigate.infrastructure.output.ws_auth import ws_has_camera_access
@@ -72,7 +72,10 @@ class FFMpegConverter(threading.Thread):
 
     def read(self, length: int) -> Any:
         try:
-            return self.process.stdout.read1(length)  # type: ignore[union-attr]
+            stdout = self.process.stdout
+            if stdout is None:
+                return False
+            return cast(Any, stdout).read1(length)
         except ValueError:
             return False
 

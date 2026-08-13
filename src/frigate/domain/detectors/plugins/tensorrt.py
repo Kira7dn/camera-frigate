@@ -1,12 +1,13 @@
 import ctypes
 import logging
 import platform
+import importlib
 
 import numpy as np
 
 try:
-    import tensorrt as trt
-    from cuda import cuda
+    trt = importlib.import_module("tensorrt")
+    cuda = importlib.import_module("cuda")
 
     TRT_VERSION = int(trt.__version__[0 : trt.__version__.find(".")])
 
@@ -53,7 +54,7 @@ class TensorRTDetectorConfig(BaseDetectorConfig):
         title="TensorRT",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["tensorrt"]
     device: int = Field(
         default=0, title="GPU Device Index", description="The GPU device index to use."
     )

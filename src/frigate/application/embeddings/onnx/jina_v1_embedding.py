@@ -81,6 +81,10 @@ class JinaV1TextEmbedding(BaseEmbedding):
             logger.debug(f"models are already downloaded for {self.model_name}")
 
     def _download_model(self, path: str):
+        downloader = self.downloader
+        if downloader is None:
+            return
+
         try:
             file_name = os.path.basename(path)
 
@@ -98,7 +102,7 @@ class JinaV1TextEmbedding(BaseEmbedding):
                 )
                 tokenizer.save_pretrained(path)
 
-            self.downloader.requestor.send_data(
+            downloader.requestor.send_data(
                 UPDATE_MODEL_STATE,
                 {
                     "model": f"{self.model_name}-{file_name}",
@@ -106,7 +110,7 @@ class JinaV1TextEmbedding(BaseEmbedding):
                 },
             )
         except Exception:
-            self.downloader.requestor.send_data(
+            downloader.requestor.send_data(
                 UPDATE_MODEL_STATE,
                 {
                     "model": f"{self.model_name}-{file_name}",
@@ -136,10 +140,14 @@ class JinaV1TextEmbedding(BaseEmbedding):
             )
 
     def _preprocess_inputs(self, raw_inputs):
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("Tokenizer is not initialized")
+
         with self._lock:
-            max_length = max(len(self.tokenizer.encode(text)) for text in raw_inputs)
+            max_length = max(len(tokenizer.encode(text)) for text in raw_inputs)
             return [
-                self.tokenizer(
+                tokenizer(
                     text,
                     padding="max_length",
                     truncation=True,
@@ -221,8 +229,12 @@ class JinaV1ImageEmbedding(BaseEmbedding):
 
     def _preprocess_inputs(self, raw_inputs):
         with self._lock:
+            feature_extractor = self.feature_extractor
+            if feature_extractor is None:
+                raise RuntimeError("Feature extractor is not initialized")
+
             processed_images = [self._process_image(img) for img in raw_inputs]
             return [
-                self.feature_extractor(images=image, return_tensors="np")
+                feature_extractor(images=image, return_tensors="np")
                 for image in processed_images
             ]

@@ -1,6 +1,7 @@
 import logging
 import re
 from typing import Any
+from typing import cast
 
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from prometheus_client.core import (
@@ -15,11 +16,11 @@ from frigate.application.notifications.metrics import snapshot as notification_m
 
 class CustomCollector:
     def __init__(self, _url):
-        self.complete_stats = {}  # Store complete stats data
-        self.process_stats = {}  # Keep for CPU processing
+        self.complete_stats: dict[str, Any] = {}  # Store complete stats data
+        self.process_stats: dict[str, Any] = {}  # Keep for CPU processing
         self.previous_event_id = None
         self.previous_event_start_time = None
-        self.all_events = {}
+        self.all_events: list[dict[str, Any]] = []
 
     def add_metric(self, metric, label, stats, key, multiplier=1.0):  # Now a method
         try:
@@ -524,7 +525,7 @@ class CustomCollector:
 
 
 collector = CustomCollector(None)
-REGISTRY.register(collector)
+REGISTRY.register(cast(Any, collector))
 
 
 def update_metrics(stats: dict[str, Any], event_counts: list[dict[str, Any]]):

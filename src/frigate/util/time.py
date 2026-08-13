@@ -11,9 +11,8 @@ logger = logging.getLogger(__name__)
 
 
 def get_tz_modifiers(tz_name: str) -> tuple[str, str, float]:
-    seconds_offset = (
-        datetime.datetime.now(pytz.timezone(tz_name)).utcoffset().total_seconds()
-    )
+    offset = datetime.datetime.now(pytz.timezone(tz_name)).utcoffset()
+    seconds_offset = offset.total_seconds() if offset is not None else 0.0
     hours_offset = int(seconds_offset / 60 / 60)
     minutes_offset = int(seconds_offset / 60 - hours_offset * 60)
     hour_modifier = f"{hours_offset} hour"
@@ -45,7 +44,7 @@ def is_current_hour(timestamp: int) -> bool:
 
 def get_dst_transitions(
     tz_name: str, start_time: float, end_time: float
-) -> list[tuple[float, float, int]]:
+) -> list[tuple[float, float, float]]:
     """
     Find DST transition points and return time periods with consistent offsets.
 
@@ -68,16 +67,18 @@ def get_dst_transitions(
     current = start_time
 
     # Get initial offset
-    dt = datetime.datetime.utcfromtimestamp(current).replace(tzinfo=pytz.UTC)
+    dt = datetime.datetime.fromtimestamp(current, datetime.UTC)
     local_dt = dt.astimezone(tz)
-    prev_offset = local_dt.utcoffset().total_seconds()
+    offset = local_dt.utcoffset()
+    prev_offset = offset.total_seconds() if offset is not None else 0.0
     period_start = start_time
 
     # Check each day for offset changes
     while current <= end_time:
-        dt = datetime.datetime.utcfromtimestamp(current).replace(tzinfo=pytz.UTC)
+        dt = datetime.datetime.fromtimestamp(current, datetime.UTC)
         local_dt = dt.astimezone(tz)
-        current_offset = local_dt.utcoffset().total_seconds()
+        offset = local_dt.utcoffset()
+        current_offset = offset.total_seconds() if offset is not None else 0.0
 
         if current_offset != prev_offset:
             # Found a transition - close previous period

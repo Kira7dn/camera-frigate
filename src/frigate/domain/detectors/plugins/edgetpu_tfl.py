@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import importlib
 from typing import Literal
 
 import cv2
@@ -12,9 +13,13 @@ from frigate.domain.detectors.detector_config import BaseDetectorConfig, ModelTy
 from frigate.util.model import xyxy_to_xywh_for_nms
 
 try:
-    from tflite_runtime.interpreter import Interpreter, load_delegate
+    interpreter_module = importlib.import_module("tflite_runtime.interpreter")
+    Interpreter = interpreter_module.Interpreter
+    load_delegate = interpreter_module.load_delegate
 except ModuleNotFoundError:
-    from ai_edge_litert.interpreter import Interpreter, load_delegate
+    interpreter_module = importlib.import_module("ai_edge_litert.interpreter")
+    Interpreter = interpreter_module.Interpreter
+    load_delegate = interpreter_module.load_delegate
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +33,8 @@ class EdgeTpuDetectorConfig(BaseDetectorConfig):
         title="EdgeTPU",
     )
 
-    type: Literal[DETECTOR_KEY]
-    device: str = Field(
+    type: Literal["edgetpu"]
+    device: str | None = Field(
         default=None,
         title="Device Type",
         description="The device to use for EdgeTPU inference (e.g. 'usb', 'pci').",
@@ -298,7 +303,7 @@ class EdgeTpuTfl(DetectionApi):
             # until after filtering out redundant boxes
             # Shift the logit scores to be non-negative (required by cv2)
             indices = cv2.dnn.NMSBoxes(
-                bboxes=xyxy_to_xywh_for_nms(boxes_filtered_decoded),
+                bboxes=xyxy_to_xywh_for_nms(boxes_filtered_decoded).tolist(),
                 scores=max_scores_filtered_shiftedpositive,
                 score_threshold=(
                     self.min_logit_value + self.logit_shift_to_positive_values

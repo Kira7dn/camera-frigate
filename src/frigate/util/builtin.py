@@ -15,7 +15,7 @@ from collections import deque
 from collections.abc import Mapping
 from multiprocessing.managers import ValueProxy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 from ruamel.yaml import YAML
@@ -120,7 +120,10 @@ def escape_special_characters(path: str) -> str:
         raise ValueError("Input too long to check")
 
     try:
-        found = re.search(REGEX_RTSP_CAMERA_USER_PASS, path).group(0)[3:-1]
+        match = re.search(REGEX_RTSP_CAMERA_USER_PASS, path)
+        if match is None:
+            return path
+        found = match.group(0)[3:-1]
         pw = found[(found.index(":") + 1) :]
         return path.replace(pw, urllib.parse.quote_plus(pw))
     except AttributeError:
@@ -276,7 +279,7 @@ def update_yaml_file_bulk(file_path: str, updates: dict[str, Any]):
 
     # Apply all updates
     for key_path_str, new_value in updates.items():
-        key_path = split_config_key_path(key_path_str)
+        key_path: list[Any] = split_config_key_path(key_path_str)
         for i in range(len(key_path)):
             try:
                 index = int(key_path[i])
@@ -440,12 +443,15 @@ def generate_color_palette(n):
 
 def serialize(vector: list[float] | np.ndarray | float, pack: bool = True) -> bytes:
     """Serializes a list of floats, numpy array, or single float into a compact "raw bytes" format"""
+    values: list[float]
     if isinstance(vector, np.ndarray):
         # Convert numpy array to list of floats
-        vector = vector.flatten().tolist()
+        values = [float(value) for value in cast(Any, vector).flatten().tolist()]
     elif isinstance(vector, (float, np.float32, np.float64)):
         # Handle single float values
-        vector = [vector]
+        values = [float(cast(Any, vector))]
+    elif isinstance(vector, list):
+        values = [float(value) for value in vector]
     elif not isinstance(vector, list):
         raise TypeError(
             f"Input must be a list of floats, a numpy array, or a single float. Got {type(vector)}"
@@ -453,9 +459,9 @@ def serialize(vector: list[float] | np.ndarray | float, pack: bool = True) -> by
 
     try:
         if pack:
-            return struct.pack("%sf" % len(vector), *vector)
+            return struct.pack("%sf" % len(values), *values)
         else:
-            return vector
+            return cast(bytes, values)
     except struct.error as e:
         raise ValueError(f"Failed to pack vector: {e}. Vector: {vector}") from e
 

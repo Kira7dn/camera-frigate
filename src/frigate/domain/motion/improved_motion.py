@@ -143,7 +143,9 @@ class ImprovedMotionDetector(MotionDetector):
 
         # dilate the thresholded image to fill in holes, then find contours
         # on thresholded image
-        thresh_dilated = cv2.dilate(thresh, None, iterations=1)  # type: ignore[call-overload]
+        thresh_dilated = cv2.dilate(
+            thresh, np.ones((3, 3), dtype=np.uint8), iterations=1
+        )
         contours = cv2.findContours(
             thresh_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -266,8 +268,11 @@ class ImprovedMotionDetector(MotionDetector):
         return motion_boxes
 
     def update_mask(self) -> None:
+        rasterized_mask = self.config.rasterized_mask
+        if rasterized_mask is None:
+            rasterized_mask = np.full(self.frame_shape[:2], 255, dtype=np.uint8)
         resized_mask = cv2.resize(
-            self.config.rasterized_mask,
+            rasterized_mask,
             dsize=(self.motion_frame_size[1], self.motion_frame_size[0]),
             interpolation=cv2.INTER_AREA,
         )

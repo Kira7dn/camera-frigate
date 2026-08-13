@@ -1,12 +1,15 @@
 """Util for classification models."""
 
 import datetime
+import importlib
 import json
 import logging
 import os
 import random
 import shutil
 from collections import defaultdict
+from typing import Any, cast
+from multiprocessing import Event as MpEvent
 
 import cv2
 import numpy as np
@@ -66,7 +69,7 @@ def write_training_metadata(model_name: str, image_count: int) -> None:
         logger.error(f"Failed to write training metadata for {model_name}: {e}")
 
 
-def read_training_metadata(model_name: str) -> dict[str, any] | None:
+def read_training_metadata(model_name: str) -> dict[str, Any] | None:
     """
     Read training metadata from the hidden file in the model's clips directory.
 
@@ -136,7 +139,7 @@ class ClassificationTrainingProcess(FrigateProcess):
         )
         model_name = model_name.strip()
         super().__init__(
-            stop_event=None,
+            stop_event=MpEvent(),
             priority=PROCESS_PRIORITY_LOW,
             name=f"model_training:{model_name}",
         )
@@ -170,10 +173,17 @@ class ClassificationTrainingProcess(FrigateProcess):
         """Train a classification model."""
         try:
             # import in the function so that tensorflow is not initialized multiple times
-            import tensorflow as tf
-            from tensorflow.keras import layers, models, optimizers
-            from tensorflow.keras.applications import MobileNetV2
-            from tensorflow.keras.preprocessing.image import ImageDataGenerator
+            tf = importlib.import_module("tensorflow")
+            keras = importlib.import_module("tensorflow.keras")
+            layers = keras.layers
+            models = keras.models
+            optimizers = keras.optimizers
+            MobileNetV2 = importlib.import_module(
+                "tensorflow.keras.applications"
+            ).MobileNetV2
+            ImageDataGenerator = importlib.import_module(
+                "tensorflow.keras.preprocessing.image"
+            ).ImageDataGenerator
 
             dataset_dir = os.path.join(CLIPS_DIR, self.model_name, "dataset")
             model_dir = os.path.join(MODEL_CACHE_DIR, self.model_name)
@@ -444,7 +454,7 @@ def _select_balanced_timestamps(
     for item in review_items:
         camera = item.camera
         # Group by 6-hour blocks for temporal diversity
-        hour_block = int(item.start_time // (6 * 3600))
+        hour_block = int(cast(float, item.start_time) // (6 * 3600))
         key = f"{camera}_{hour_block}"
         grouped[key].append(item)
 
@@ -799,7 +809,7 @@ def _select_balanced_events(
 
     for event in events:
         camera = event.camera
-        hour_block = int(event.start_time // (6 * 3600))
+        hour_block = int(cast(float, event.start_time) // (6 * 3600))
         key = f"{camera}_{hour_block}"
         grouped[key].append(event)
 
@@ -876,10 +886,11 @@ def _extract_event_thumbnails(events: list[Event], output_dir: str) -> list[str]
 
 def _load_event_classification_crop(event: Event) -> np.ndarray | None:
     """Prefer a snapshot-based object crop; fall back to a center-cropped thumbnail."""
-    if event.data and "box" in event.data:
+    event_data = cast(dict[str, Any], event.data)
+    if event.data and "box" in event_data:
         snapshot, _ = load_event_snapshot_image(event, clean_only=True)
         if snapshot is not None:
-            abs_box = relative_box_to_absolute(snapshot.shape, event.data["box"])
+            abs_box = relative_box_to_absolute(snapshot.shape, event_data["box"])
             if abs_box is not None:
                 xmin, ymin, xmax, ymax = abs_box
                 box_w = xmax - xmin
@@ -910,9 +921,9 @@ def _load_event_classification_crop(event: Event) -> np.ndarray | None:
     height, width = img.shape[:2]
     crop_size = 1.0
 
-    if event.data and "box" in event.data and "region" in event.data:
-        box = event.data["box"]
-        region = event.data["region"]
+    if event.data and "box" in event_data and "region" in event_data:
+        box = event_data["box"]
+        region = event_data["region"]
 
         if len(box) == 4 and len(region) == 4:
             box_w, box_h = box[2], box[3]

@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
+from contextlib import suppress
+from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -78,9 +81,24 @@ def create_fastapi_app(
     config_holder: ConfigHolder | None = None,
     tracker_maintainer=None,
 ):
-    logger.info("Starting FastAPI app")
+    @asynccontextmanager
+    async def app_lifespan(app: FastAPI):
+        logger.info("FastAPI starting")
+        watchdog_task = asyncio.create_task(
+            debug_replay_auto_stop_watchdog(
+                replay_manager, frigate_config, config_publisher
+            )
+        )
+        try:
+            yield
+        finally:
+            watchdog_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await watchdog_task
+
     app = FastAPI(
         debug=False,
+        lifespan=app_lifespan,
         swagger_ui_parameters={"apisSorter": "alpha", "operationsSorter": "alpha"},
         dependencies=[Depends(require_admin_by_default())]
         if enforce_default_admin
@@ -116,15 +134,6 @@ def create_fastapi_app(
             database.close()
         return response
 
-    @app.on_event("startup")
-    async def startup():
-        logger.info("FastAPI started")
-        asyncio.create_task(
-            debug_replay_auto_stop_watchdog(
-                replay_manager, frigate_config, config_publisher
-            )
-        )
-
     # Rate limiter (used for login endpoint)
     if frigate_config.auth.failed_login_rate_limit is None:
         limiter.enabled = False
@@ -132,7 +141,9 @@ def create_fastapi_app(
         auth.rateLimiter.set_limit(frigate_config.auth.failed_login_rate_limit)
 
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(
+        RateLimitExceeded, cast(Any, _rate_limit_exceeded_handler)
+    )
     app.add_middleware(SlowAPIMiddleware)
 
     # Routes
@@ -152,21 +163,22 @@ def create_fastapi_app(
     app.include_router(record.router)
     app.include_router(debug_replay.router)
     # App Properties
-    app.frigate_config = frigate_config
-    app.genai_manager = GenAIClientManager(frigate_config)
-    app.embeddings = embeddings
-    app.detected_frames_processor = detected_frames_processor
-    app.storage_maintainer = storage_maintainer
-    app.camera_error_image = None
-    app.onvif = onvif
-    app.stats_emitter = stats_emitter
-    app.event_metadata_updater = event_metadata_updater
-    app.config_publisher = config_publisher
-    app.replay_manager = replay_manager
-    app.dispatcher = dispatcher
-    app.profile_manager = profile_manager
-    app.config_holder = config_holder
-    app.tracker_maintainer = tracker_maintainer
+    app_state = cast(Any, app)
+    app_state.frigate_config = frigate_config
+    app_state.genai_manager = GenAIClientManager(frigate_config)
+    app_state.embeddings = embeddings
+    app_state.detected_frames_processor = detected_frames_processor
+    app_state.storage_maintainer = storage_maintainer
+    app_state.camera_error_image = None
+    app_state.onvif = onvif
+    app_state.stats_emitter = stats_emitter
+    app_state.event_metadata_updater = event_metadata_updater
+    app_state.config_publisher = config_publisher
+    app_state.replay_manager = replay_manager
+    app_state.dispatcher = dispatcher
+    app_state.profile_manager = profile_manager
+    app_state.config_holder = config_holder
+    app_state.tracker_maintainer = tracker_maintainer
 
     if frigate_config.auth.enabled:
         secret = get_jwt_secret()
@@ -185,8 +197,8 @@ def create_fastapi_app(
         else:
             key_bytes = str(secret).encode("utf-8")
 
-        app.jwt_token = OctKey.import_key(key_bytes)
+        app_state.jwt_token = OctKey.import_key(key_bytes)
     else:
-        app.jwt_token = None
+        app_state.jwt_token = None
 
     return app

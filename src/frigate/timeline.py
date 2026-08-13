@@ -5,7 +5,7 @@ import queue
 import threading
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 from frigate.infrastructure.config import FrigateConfig
 from frigate.application.events.types import EventStateEnum, EventTypeEnum
@@ -151,8 +151,8 @@ class TimelineProcessor(threading.Thread):
             ):
                 zone_entry = base_entry.copy()
                 zone_entry[Timeline.class_type] = "entered_zone"
-                zone_entry[Timeline.data] = base_entry[Timeline.data].copy()
-                zone_entry[Timeline.data]["zones"] = event_data["current_zones"]
+                zone_entry[Timeline.data] = cast(dict[str, Any], base_entry[Timeline.data]).copy()
+                cast(dict[str, Any], zone_entry[Timeline.data])["zones"] = event_data["current_zones"]
                 entries_to_save.append(zone_entry)
 
             # Check for stationary status change
@@ -161,20 +161,20 @@ class TimelineProcessor(threading.Thread):
                 stationary_entry[Timeline.class_type] = (
                     "stationary" if event_data["stationary"] else "active"
                 )
-                stationary_entry[Timeline.data] = base_entry[Timeline.data].copy()
+                stationary_entry[Timeline.data] = cast(dict[str, Any], base_entry[Timeline.data]).copy()
                 entries_to_save.append(stationary_entry)
 
             # Check for new attributes
             if prev_event_data["attributes"] == {} and event_data["attributes"] != {}:
                 attribute_entry = base_entry.copy()
                 attribute_entry[Timeline.class_type] = "attribute"
-                attribute_entry[Timeline.data] = base_entry[Timeline.data].copy()
-                attribute_entry[Timeline.data]["attribute"] = list(
+                attribute_entry[Timeline.data] = cast(dict[str, Any], base_entry[Timeline.data]).copy()
+                cast(dict[str, Any], attribute_entry[Timeline.data])["attribute"] = list(
                     event_data["attributes"].keys()
                 )[0]
 
                 if len(event_data["current_attributes"]) > 0:
-                    attribute_entry[Timeline.data]["attribute_box"] = to_relative_box(
+                    cast(dict[str, Any], attribute_entry[Timeline.data])["attribute_box"] = to_relative_box(
                         camera_config.detect.width,
                         camera_config.detect.height,
                         event_data["current_attributes"][0]["box"],

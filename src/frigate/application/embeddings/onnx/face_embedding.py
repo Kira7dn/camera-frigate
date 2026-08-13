@@ -2,6 +2,7 @@
 
 import logging
 import os
+from typing import Any
 
 import numpy as np
 import onnxruntime as ort
@@ -37,7 +38,7 @@ class FaceNetEmbedding(BaseEmbedding):
         self.download_path = os.path.join(MODEL_CACHE_DIR, self.model_name)
         self.tokenizer = None
         self.feature_extractor = None
-        self.runner = None
+        self.runner: Any | None = None
         files_names = list(self.download_urls.keys())
 
         if not all(
@@ -59,9 +60,17 @@ class FaceNetEmbedding(BaseEmbedding):
     def _load_model_and_utils(self):
         if self.runner is None:
             try:
-                from tflite_runtime.interpreter import Interpreter
+                interpreter_module = __import__(
+                    "tflite_runtime.interpreter", fromlist=["Interpreter"]
+                )
             except ModuleNotFoundError:
-                from ai_edge_litert.interpreter import Interpreter
+                interpreter_module = __import__(
+                    "ai_edge_litert.interpreter", fromlist=["Interpreter"]
+                )
+
+            Interpreter = getattr(interpreter_module, "Interpreter", None)
+            if Interpreter is None:
+                raise RuntimeError("TFLite interpreter module is unavailable")
 
             if self.downloader:
                 self.downloader.wait_for_download()
@@ -73,6 +82,8 @@ class FaceNetEmbedding(BaseEmbedding):
                     num_threads=2,
                 )
                 self.runner.allocate_tensors()
+            if self.runner is None:
+                raise RuntimeError("Failed to initialize TFLite interpreter")
             self.tensor_input_details = self.runner.get_input_details()
             self.tensor_output_details = self.runner.get_output_details()
 
@@ -113,6 +124,8 @@ class FaceNetEmbedding(BaseEmbedding):
     def __call__(self, inputs):
         self._load_model_and_utils()
         processed = self._preprocess_inputs(inputs)
+        if self.runner is None:
+            raise RuntimeError("FaceNet interpreter is not initialized")
         self.runner.set_tensor(self.tensor_input_details[0]["index"], processed)
         self.runner.invoke()
         return self.runner.get_tensor(self.tensor_output_details[0]["index"])
@@ -203,6 +216,8 @@ class ArcfaceEmbedding(BaseEmbedding):
     def embed_preprocessed(self, inputs: list[np.ndarray]) -> list[np.ndarray]:
         """Run one dynamic GPU batch from worker-prepared CHW tensors."""
         self._load_model_and_utils()
+        if self.runner is None:
+            raise RuntimeError("ArcFace runner is not initialized")
         input_names = self.runner.get_input_names()
         if len(input_names) != 1:
             raise ValueError("ArcFace must expose exactly one tensor input")

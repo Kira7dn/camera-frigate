@@ -7,12 +7,12 @@ __all__ = ["ProxyConfig", "HeaderMappingConfig"]
 
 
 class HeaderMappingConfig(FrigateBaseModel):
-    user: str = Field(
+    user: str | None = Field(
         default=None,
         title="User header",
         description="Header containing the authenticated username provided by the upstream proxy.",
     )
-    role: str = Field(
+    role: str | None = Field(
         default=None,
         title="Role header",
         description="Header containing the authenticated user's role or groups from the upstream proxy.",

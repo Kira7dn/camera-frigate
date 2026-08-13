@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from typing import Mapping
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -482,7 +483,7 @@ def require_role(required_roles: list[str]):
 
 
 def resolve_role(
-    headers: dict, proxy_config: ProxyConfig, config_roles: set[str]
+    headers: Mapping[str, str], proxy_config: ProxyConfig, config_roles: set[str]
 ) -> str:
     """
     Determine the effective role for a request based on proxy headers and configuration.
@@ -630,7 +631,7 @@ def auth(request: Request):
 
     # dont require auth if the request is on the internal port
     # this header is set by Frigate's nginx proxy, so it cant be spoofed
-    if int(request.headers.get("x-server-port", default=0)) == internal_port:
+    if int(request.headers.get("x-server-port", "0")) == internal_port:
         success_response.headers["remote-user"] = "anonymous"
         success_response.headers["remote-role"] = "admin"
         return success_response
@@ -654,9 +655,7 @@ def auth(request: Request):
         # or use viewer if none are specified
         user_header = proxy_config.header_map.user
         success_response.headers["remote-user"] = (
-            request.headers.get(user_header, default="viewer")
-            if user_header
-            else "viewer"
+            request.headers.get(user_header, "viewer") if user_header else "viewer"
         )
 
         # parse header and resolve a valid role
@@ -714,10 +713,20 @@ def auth(request: Request):
 
         user = token.claims.get("sub")
         role = token.claims.get("role")
+        if not isinstance(user, str):
+            logger.debug("user not set as string in jwt token")
+            return fail_response
+        if not isinstance(role, str):
+            logger.debug("role not set as string in jwt token")
+            return fail_response
         current_time = int(time.time())
 
         # if the jwt is expired
-        expiration = int(token.claims.get("exp"))
+        exp = token.claims.get("exp")
+        if not isinstance(exp, int):
+            logger.debug("exp not set as int in jwt token")
+            return fail_response
+        expiration = exp
         logger.debug(
             f"current time:   {datetime.fromtimestamp(current_time).strftime('%c')}"
         )
@@ -740,7 +749,10 @@ def auth(request: Request):
             try:
                 user_obj = User.get_by_id(user)
                 if user_obj.password_changed_at is not None:
-                    token_iat = int(token.claims.get("iat", 0))
+                    token_iat = token.claims.get("iat", 0)
+                    if not isinstance(token_iat, int):
+                        logger.debug("iat not set as int in jwt token")
+                        return fail_response
                     password_changed_timestamp = int(
                         user_obj.password_changed_at.timestamp()
                     )
@@ -804,9 +816,7 @@ def profile(request: Request):
         try:
             remote_addr = get_remote_addr(request)
         except Exception:
-            remote_addr = (
-                request.client.host if hasattr(request, "client") else "unknown"
-            )
+            remote_addr = request.client.host if request.client is not None else "unknown"
 
         ua = request.headers.get("user-agent", "")
         key_material = f"{remote_addr}|{ua}"
@@ -1090,9 +1100,11 @@ async def update_role(
 
 async def require_camera_access(
     camera_name: str | None = None,
-    request: Request = None,
+    request: Request | None = None,
 ):
     """Dependency to enforce camera access based on user role."""
+    if request is None:
+        raise RuntimeError("Request dependency was not provided")
     if camera_name is None:
         return  # For lists, filter later
 
@@ -1201,9 +1213,11 @@ def deny_response_for_go2rtc_stream(
 
 async def require_go2rtc_stream_access(
     stream_name: str | None = None,
-    request: Request = None,
+    request: Request | None = None,
 ):
     """Dependency to enforce go2rtc stream access based on owning camera access."""
+    if request is None:
+        raise RuntimeError("Request dependency was not provided")
     if stream_name is None:
         return
 

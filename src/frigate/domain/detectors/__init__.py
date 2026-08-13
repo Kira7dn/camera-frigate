@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_detector(detector_config):
-    if detector_config.type == DetectorTypeEnum.cpu:
+    if detector_config.type == "cpu":
         logger.warning(
             "CPU detectors are not recommended and should only be used for testing or for trial purposes."
         )

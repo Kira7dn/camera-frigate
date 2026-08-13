@@ -10,7 +10,7 @@ import subprocess as sp
 import threading
 import traceback
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -205,7 +205,10 @@ class FFMpegConverter(threading.Thread):
 
     def read(self, length: int) -> Any:
         try:
-            return self.process.stdout.read1(length)  # type: ignore[union-attr]
+            stdout = self.process.stdout
+            if stdout is None:
+                return False
+            return cast(Any, stdout).read1(length)
         except ValueError:
             return False
 

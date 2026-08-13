@@ -1,5 +1,5 @@
 import logging
-from typing import Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import openvino as ov
@@ -26,8 +26,8 @@ class OvDetectorConfig(BaseDetectorConfig):
         title="OpenVINO",
     )
 
-    type: Literal[DETECTOR_KEY]
-    device: str = Field(
+    type: Literal["openvino"]
+    device: str | None = Field(
         default=None,
         title="Device Type",
         description="The device to use for OpenVINO inference (e.g. 'CPU', 'GPU', 'NPU').",
@@ -52,15 +52,19 @@ class OvDetector(DetectionApi):
         self.h = detector_config.model.height
         self.w = detector_config.model.width
 
+        if detector_config.model.path is None:
+            raise ValueError("OpenVINO detector requires a model path")
+
         logger.info(
             "Loading OpenVINO model %s on device %s",
             detector_config.model.path,
             detector_config.device,
         )
 
+        device = detector_config.device or "CPU"
         self.runner = OpenVINOModelRunner(
             model_path=detector_config.model.path,
-            device=detector_config.device,
+            device=device,
             model_type=detector_config.model.model_type,
         )
 
@@ -94,7 +98,13 @@ class OvDetector(DetectionApi):
                 self.model_invalid = True
 
             output_shape = model_outputs[0].get_shape()
-            if output_shape[0] != 1 or output_shape[1] != 1 or output_shape[3] != 7:
+            if (
+                not output_shape
+                or len(output_shape) < 4
+                or output_shape[0] != 1
+                or output_shape[1] != 1
+                or output_shape[3] != 7
+            ):
                 logger.error(f"SSD model output doesn't match. Found {output_shape}.")
                 self.model_invalid = True
 
@@ -113,7 +123,7 @@ class OvDetector(DetectionApi):
                 )
                 self.model_invalid = True
             output_shape = model_outputs[0].partial_shape
-            if output_shape[-1] != 7:
+            if not output_shape or output_shape[-1] != 7:
                 logger.error(
                     f"YoloNAS models must be exported in flat format. Model output doesn't match. Found {output_shape}."
                 )
@@ -159,22 +169,28 @@ class OvDetector(DetectionApi):
                 "images": tensor_input,
                 "orig_target_sizes": np.array([[self.h, self.w]], dtype=np.int64),
             }
-            outputs = self.runner.run(inputs)
+            outputs_raw = self.runner.run(inputs)
+            if outputs_raw is None:
+                raise RuntimeError("OpenVINO runner returned None")
+            outputs = cast(list[np.ndarray], outputs_raw)
             tensor_output = (
                 outputs[0],
                 outputs[1],
                 outputs[2],
             )
-            return post_process_dfine(tensor_output, self.w, self.h)
+            return post_process_dfine(np.stack(tensor_output), self.w, self.h)
 
         # Run inference using the runner
         input_name = self.runner.get_input_names()[0]
-        outputs = self.runner.run({input_name: tensor_input})
+        runner_outputs = self.runner.run({input_name: tensor_input})
+        if runner_outputs is None:
+            raise RuntimeError("OpenVINO runner returned None")
+        outputs = cast(list[np.ndarray], runner_outputs)
 
         detections = np.zeros((20, 6), np.float32)
 
         if self.ov_model_type == ModelTypeEnum.rfdetr:
-            return post_process_rfdetr(outputs)
+            return post_process_rfdetr((outputs[0], outputs[1]))
         elif self.ov_model_type == ModelTypeEnum.ssd:
             results = outputs[0][0][0]
 
@@ -210,6 +226,8 @@ class OvDetector(DetectionApi):
                 ]
             return detections
         elif self.ov_model_type == ModelTypeEnum.yologeneric:
+            if not isinstance(outputs, list):
+                raise RuntimeError("Unexpected OpenVINO output type")
             return post_process_yolo(outputs, self.w, self.h)
         elif self.ov_model_type == ModelTypeEnum.yolox:
             # [x, y, h, w, box_score, class_no_1, ..., class_no_80],

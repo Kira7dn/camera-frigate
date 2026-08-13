@@ -887,7 +887,9 @@ class Dispatcher:
                     if operation == "preset"
                     else {"command": command.value, "param": param}
                 )
-                if not self.edge_control(camera_name, operation, control_payload):
+                if not self.edge_control(
+                    camera_name, operation, cast(dict[str, object], control_payload)
+                ):
                     logger.error("Tracker rejected PTZ command for %s", camera_name)
                     return
             else:

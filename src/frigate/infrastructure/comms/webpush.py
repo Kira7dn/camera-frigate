@@ -9,7 +9,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 from py_vapid import Vapid01
 from pywebpush import WebPusher
@@ -59,13 +59,15 @@ class WebPushClient(Communicator):
         self.web_pushers: dict[str, list[WebPusher]] = {}
         self.expired_subs: dict[str, list[str]] = {}
         self.suspended_cameras: dict[str, int] = {
-            c.name: 0  # type: ignore[misc]
+            c.name: 0
             for c in self.config.cameras.values()
+            if c.name is not None
         }
         self.suspension_broadcaster: Callable[[str, Any, bool], None] | None = None
         self.last_camera_notification_time: dict[str, float] = {
-            c.name: 0  # type: ignore[misc]
+            c.name: 0
             for c in self.config.cameras.values()
+            if c.name is not None
         }
         self.last_notification_time: float = 0
         self.user_cameras: dict[str, set[str]] = {}
@@ -92,7 +94,7 @@ class WebPushClient(Communicator):
         )
         for user in users:
             self.web_pushers[user["username"]] = []
-            for sub in user["notification_tokens"]:
+            for sub in cast(list[dict[str, Any]], user["notification_tokens"]):
                 self.web_pushers[user["username"]].append(WebPusher(sub))
 
         # notification and auth config updater
@@ -138,7 +140,9 @@ class WebPushClient(Communicator):
 
                 # get all subscriptions, removing ones that are expired
                 stored_user: User = User.get_by_id(user)
-                for token in stored_user.notification_tokens:
+                for token in cast(
+                    list[dict[str, Any]], stored_user.notification_tokens
+                ):
                     if token["endpoint"] in expired:
                         continue
 
@@ -360,6 +364,9 @@ class WebPushClient(Communicator):
                         timeout=10,
                     )
 
+                    if not hasattr(resp, "status_code"):
+                        logger.warning("Web push provider returned an invalid response")
+                        continue
                     if resp.status_code in (404, 410):
                         self.expired_subs.setdefault(notification.user, []).append(
                             endpoint
@@ -404,11 +411,6 @@ class WebPushClient(Communicator):
 
     def _within_cooldown(self, camera: str) -> bool:
         now = datetime.datetime.now().timestamp()
-        if now - self.last_notification_time < self.config.notifications.cooldown:
-            logger.debug(
-                f"Skipping notification for {camera} - in global cooldown period"
-            )
-            return True
         if (
             now - self.last_camera_notification_time[camera]
             < self.config.cameras[camera].notifications.cooldown

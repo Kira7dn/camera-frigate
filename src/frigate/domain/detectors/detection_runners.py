@@ -5,7 +5,7 @@ import os
 import platform
 import threading
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import onnxruntime as ort
@@ -48,9 +48,13 @@ def get_ort_session_options(
 
 # Import OpenVINO only when needed to avoid circular dependencies
 try:
-    import openvino as ov
-except ImportError:
+    import importlib
+
+    ov = importlib.import_module("openvino")
+except Exception:
     ov = None
+
+ov: Any | None
 
 
 def get_openvino_available_devices() -> list[str]:
@@ -229,13 +233,13 @@ class CudaGraphRunner(BaseModelRunner):
         """Get the input width of the model."""
         return self._session.get_inputs()[0].shape[3]
 
-    def run(self, input: dict[str, Any]):
+    def run(self, input: dict[str, Any]) -> Any | None:
         # Extract the single tensor input (assuming one input)
         input_name = list(input.keys())[0]
         tensor_input = input[input_name]
         tensor_input = np.ascontiguousarray(tensor_input)
 
-        if not self._captured:
+        if self._captured is False:
             # Prepare IOBinding with CUDA buffers and let ORT allocate outputs on device
             self._io_binding = self._session.io_binding()
             self._input_name = input_name
@@ -257,9 +261,13 @@ class CudaGraphRunner(BaseModelRunner):
             return self._io_binding.copy_outputs_to_cpu()
 
         # Replay using updated input, copy results to CPU
+        if self._input_ortvalue is None:
+            raise RuntimeError("CUDA Graph runner input OrtValue is not initialized")
         self._input_ortvalue.update_inplace(tensor_input)
         ro = ort.RunOptions()
         self._session.run_with_iobinding(self._io_binding, ro)
+        if self._io_binding is None:
+            raise RuntimeError("CUDA Graph runner io binding is not initialized")
         return self._io_binding.copy_outputs_to_cpu()
 
 
@@ -341,7 +349,7 @@ class OpenVINOModelRunner(BaseModelRunner):
             # Create reusable inference request
             self.infer_request = self.compiled_model.create_infer_request()
 
-        self.input_tensor: ov.Tensor | None = None
+        self.input_tensor: Any | None = None
 
         if not self.complex_model:
             try:
@@ -377,7 +385,7 @@ class OpenVINOModelRunner(BaseModelRunner):
             except Exception:
                 return -1
 
-    def run(self, inputs: dict[str, Any]) -> list[np.ndarray]:
+    def run(self, input: dict[str, Any]) -> Any | None:
         """Run inference with the model.
 
         Args:
@@ -400,12 +408,12 @@ class OpenVINOModelRunner(BaseModelRunner):
 
             # Handle single input case for backward compatibility
             if (
-                len(inputs) == 1
+                len(input) == 1
                 and len(self.compiled_model.inputs) == 1
                 and self.input_tensor is not None
             ):
                 # Single input case - use the pre-allocated tensor for efficiency
-                input_data = list(inputs.values())[0]
+                input_data = list(input.values())[0]
                 np.copyto(self.input_tensor.data, input_data)
                 self.infer_request.infer(self.input_tensor)
             else:
@@ -417,9 +425,8 @@ class OpenVINOModelRunner(BaseModelRunner):
                     except Exception:
                         # this will raise an exception for models with AUTO set as the device
                         pass
-
                 # Multiple inputs case - set each input by name
-                for input_name, input_data in inputs.items():
+                for input_name, input_data in input.items():
                     # Find the input by name and its index
                     input_port = None
                     input_index = None
@@ -429,7 +436,7 @@ class OpenVINOModelRunner(BaseModelRunner):
                             input_index = idx
                             break
 
-                    if input_port is None:
+                    if input_port is None or input_index is None:
                         raise ValueError(f"Input '{input_name}' not found in model")
 
                     # Create tensor with the correct element type
@@ -444,10 +451,13 @@ class OpenVINOModelRunner(BaseModelRunner):
                         )
                         input_data = input_data.astype(expected_dtype)
 
-                    input_tensor = ov.Tensor(input_element_type, input_data.shape)
+                    ov_module = cast(Any, ov)
+                    input_tensor = ov_module.Tensor(input_element_type, input_data.shape)
                     np.copyto(input_tensor.data, input_data)
 
                     # Set the input tensor for the specific port index
+                    if input_index is None:
+                        raise RuntimeError(f"Input '{input_name}' index is invalid")
                     self.infer_request.set_input_tensor(input_index, input_tensor)
 
                 # Run inference
@@ -468,17 +478,18 @@ class OpenVINOModelRunner(BaseModelRunner):
 class RKNNModelRunner(BaseModelRunner):
     """Run RKNN models for embeddings."""
 
-    def __init__(self, model_path: str, model_type: str = None, core_mask: int = 0):
+    def __init__(self, model_path: str, model_type: str | None = None, core_mask: int = 0):
         self.model_path = model_path
         self.model_type = model_type
         self.core_mask = core_mask
-        self.rknn = None
+        self.rknn: Any | None = None
         self._load_model()
 
     def _load_model(self):
         """Load the RKNN model."""
         try:
-            from rknnlite.api import RKNNLite
+            rknn_api = __import__("rknnlite.api", fromlist=["RKNNLite"])
+            RKNNLite = getattr(rknn_api, "RKNNLite")
 
             self.rknn = RKNNLite(verbose=False)
 
@@ -530,7 +541,7 @@ class RKNNModelRunner(BaseModelRunner):
         # The calling code should provide this information
         return -1
 
-    def run(self, inputs: dict[str, Any]) -> Any:
+    def run(self, input: dict[str, Any]) -> Any | None:
         """Run inference with the RKNN model."""
         if not self.rknn:
             raise RuntimeError("RKNN model not loaded")
@@ -540,11 +551,11 @@ class RKNNModelRunner(BaseModelRunner):
             rknn_inputs = []
 
             for name in input_names:
-                if name in inputs:
+                if name in input:
                     if name == "pixel_values":
                         # RKNN expects NHWC format, but ONNX typically provides NCHW
                         # Transpose from [batch, channels, height, width] to [batch, height, width, channels]
-                        pixel_data = inputs[name]
+                        pixel_data = input[name]
                         if len(pixel_data.shape) == 4 and pixel_data.shape[1] == 3:
                             # Transpose from NCHW to NHWC
                             pixel_data = np.transpose(pixel_data, (0, 2, 3, 1))
@@ -552,7 +563,7 @@ class RKNNModelRunner(BaseModelRunner):
                     elif name == "data":
                         # ArcFace: undo Python normalisation to uint8 [0,255]
                         # RKNN runtime applies mean=127.5/std=127.5 internally before first layer
-                        face_data = inputs[name]
+                        face_data = input[name]
                         if len(face_data.shape) == 4 and face_data.shape[1] == 3:
                             # Transpose from NCHW to NHWC
                             face_data = np.transpose(face_data, (0, 2, 3, 1))
@@ -561,7 +572,7 @@ class RKNNModelRunner(BaseModelRunner):
                         )
                         rknn_inputs.append(face_data)
                     else:
-                        rknn_inputs.append(inputs[name])
+                        rknn_inputs.append(input[name])
 
             outputs = self.rknn.inference(inputs=rknn_inputs)
             return outputs

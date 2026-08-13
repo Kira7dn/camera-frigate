@@ -2,6 +2,7 @@ import logging
 import os.path
 import re
 import urllib.request
+import importlib
 from typing import Literal
 
 from pydantic import ConfigDict
@@ -29,7 +30,7 @@ class AxengineDetectorConfig(BaseDetectorConfig):
         title="AXEngine NPU",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["axengine"]
 
 
 class Axengine(DetectionApi):
@@ -37,7 +38,7 @@ class Axengine(DetectionApi):
 
     def __init__(self, config: AxengineDetectorConfig):
         try:
-            import axengine as axe
+            axe = importlib.import_module("axengine")
         except ModuleNotFoundError:
             raise ImportError("AXEngine is not installed.") from None
 

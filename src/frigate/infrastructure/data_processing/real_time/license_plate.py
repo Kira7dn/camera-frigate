@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from frigate.infrastructure.comms.event_metadata_updater import EventMetadataPublisher
@@ -61,7 +61,7 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
             return next(
                 (
                     label
-                    for label, patterns in self.lpr_config.known_plates.items()
+                    for label, patterns in (self.lpr_config.known_plates or {}).items()
                     if any(
                         re.match(f"^{pattern}$", plate)
                         or Levenshtein.distance(pattern, plate)
@@ -125,8 +125,10 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
         """Run preprocessing, plate detection and OCR for one core observation."""
         if task is not RecognitionTask.LPR:
             return None
+        if not isinstance(evidence, tuple) or len(evidence) != 2:
+            return None
         obj_data, frame = evidence
-        result = self.lpr_process(obj_data, frame, False)
+        result = self.lpr_process(cast(Any, obj_data), cast(Any, frame), False)
         return result if isinstance(result, RawRecognition) else None
 
     def update_config(self, topic: str, payload: Any) -> None:
@@ -145,9 +147,10 @@ class LicensePlateRealTimeProcessor(LicensePlateProcessingMixin, RealTimeProcess
 
     def process_frame(
         self,
-        obj_data: dict[str, Any] | str,
-        frame: np.ndarray,
+        obj_data: Any,
+        frame: Any,
         dedicated_lpr: bool = False,
+        **kwargs: Any,
     ) -> None:
         """Recognize LPR only from canonical caller-owned track IDs."""
         if dedicated_lpr:

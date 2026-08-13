@@ -31,7 +31,7 @@ class JinaV2Embedding(BaseEmbedding):
         model_size: str,
         requestor: InterProcessRequestor,
         device: str = "AUTO",
-        embedding_type: str = None,
+        embedding_type: str | None = None,
     ):
         model_file = (
             "model_fp16.onnx" if model_size == "large" else "model_quantized.onnx"
@@ -86,6 +86,10 @@ class JinaV2Embedding(BaseEmbedding):
             logger.debug(f"models are already downloaded for {self.model_name}")
 
     def _download_model(self, path: str):
+        downloader = self.downloader
+        if downloader is None:
+            return
+
         try:
             file_name = os.path.basename(path)
 
@@ -104,7 +108,7 @@ class JinaV2Embedding(BaseEmbedding):
                     clean_up_tokenization_spaces=True,
                 )
                 tokenizer.save_pretrained(path)
-            self.requestor.send_data(
+            downloader.requestor.send_data(
                 UPDATE_MODEL_STATE,
                 {
                     "model": f"{self.model_name}-{file_name}",
@@ -112,7 +116,7 @@ class JinaV2Embedding(BaseEmbedding):
                 },
             )
         except Exception:
-            self.requestor.send_data(
+            downloader.requestor.send_data(
                 UPDATE_MODEL_STATE,
                 {
                     "model": f"{self.model_name}-{file_name}",
@@ -172,8 +176,11 @@ class JinaV2Embedding(BaseEmbedding):
 
         processed = []
         if self.embedding_type == "text":
+            tokenizer = self.tokenizer
+            if tokenizer is None:
+                raise RuntimeError("Tokenizer is not initialized")
             for text in raw_inputs:
-                input_ids = self.tokenizer([text], return_tensors="np")["input_ids"]
+                input_ids = tokenizer([text], return_tensors="np")["input_ids"]
                 processed.append(input_ids)
         elif self.embedding_type == "vision":
             for img in raw_inputs:
@@ -204,7 +211,9 @@ class JinaV2Embedding(BaseEmbedding):
         return outputs
 
     def __call__(
-        self, inputs: list[str] | list[Image.Image] | list[str], embedding_type=None
+        self,
+        inputs: list[str] | list[Image.Image] | list[bytes],
+        embedding_type: str | None = None,
     ) -> list[np.ndarray]:
         # Lock the entire call to prevent race conditions when text and vision
         # embeddings are called concurrently from different threads
@@ -216,6 +225,9 @@ class JinaV2Embedding(BaseEmbedding):
                 )
 
             self._load_model_and_utils()
+            if self.runner is None:
+                raise RuntimeError("JinaV2 runner is not initialized")
+
             processed = self._preprocess_inputs(inputs)
             batch_size = len(processed)
 

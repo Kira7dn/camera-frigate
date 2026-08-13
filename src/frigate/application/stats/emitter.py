@@ -125,7 +125,7 @@ class StatsEmitter(threading.Thread):
             "processes": processes,
         }
         # Update Prometheus metrics with initial stats
-        update_metrics(stats)
+        update_metrics(stats, [])
         return stats
 
     def run(self) -> None:

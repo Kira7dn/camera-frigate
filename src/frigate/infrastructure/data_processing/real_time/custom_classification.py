@@ -1,6 +1,7 @@
 """Real time processor that works with classification tflite models."""
 
 import datetime
+import importlib
 import logging
 import os
 from typing import Any
@@ -23,9 +24,9 @@ from ..types import DataProcessorMetrics
 from .api import DeferredRealtimeProcessorApi
 
 try:
-    from tflite_runtime.interpreter import Interpreter
+    Interpreter = importlib.import_module("tflite_runtime.interpreter").Interpreter
 except ModuleNotFoundError:
-    from ai_edge_litert.interpreter import Interpreter
+    Interpreter = importlib.import_module("ai_edge_litert.interpreter").Interpreter
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,8 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
 
         return None
 
-    def process_frame(self, frame_data: dict[str, Any], frame: np.ndarray) -> None:
+    def process_frame(self, obj_data: Any, frame: Any, **kwargs: Any) -> None:
+        frame_data = obj_data
         if (
             not self.model_config.name
             or not self.model_config.state_config
@@ -188,11 +190,13 @@ class CustomStateClassificationProcessor(DeferredRealtimeProcessorApi):
             return
 
         camera_config = self.model_config.state_config.cameras[camera]
+        frame_width = self.config.cameras[camera].detect.width or 0
+        frame_height = self.config.cameras[camera].detect.height or 0
         crop = [
-            camera_config.crop[0] * self.config.cameras[camera].detect.width,
-            camera_config.crop[1] * self.config.cameras[camera].detect.height,
-            camera_config.crop[2] * self.config.cameras[camera].detect.width,
-            camera_config.crop[3] * self.config.cameras[camera].detect.height,
+            camera_config.crop[0] * frame_width,
+            camera_config.crop[1] * frame_height,
+            camera_config.crop[2] * frame_width,
+            camera_config.crop[3] * frame_height,
         ]
         should_run = False
 
@@ -514,7 +518,7 @@ class CustomObjectClassificationProcessor(DeferredRealtimeProcessorApi):
         )
         return best_label, avg_score
 
-    def process_frame(self, obj_data: dict[str, Any], frame: np.ndarray) -> None:
+    def process_frame(self, obj_data: Any, frame: Any, **kwargs: Any) -> None:
         if (
             not self.model_config.name
             or not self.model_config.object_config

@@ -5,7 +5,7 @@ import binascii
 import json
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 from httpx import RemoteProtocolError, TimeoutException
 from ollama import AsyncClient as OllamaAsyncClient
@@ -227,7 +227,7 @@ class OllamaClient(GenAIClient):
                 self.genai_config.model,
                 prompt,
                 images=images if images else None,
-                **ollama_options,
+                **cast(Any, ollama_options),
             )
             logger.debug(
                 "Ollama generate response: done=%s, done_reason=%s, eval_count=%s, "

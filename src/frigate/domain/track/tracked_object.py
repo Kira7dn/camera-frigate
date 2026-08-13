@@ -316,7 +316,9 @@ class TrackedObject:
                 k: self.attributes[k] for k in self.logos if k in self.attributes
             }
             if len(recognized_logos) > 0:
-                max_logo = max(recognized_logos, key=recognized_logos.get)  # type: ignore[arg-type]
+                max_logo = max(
+                    recognized_logos, key=lambda key: recognized_logos[key] or 0.0
+                )
 
                 # don't overwrite sub label if it is already set
                 if (

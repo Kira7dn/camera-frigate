@@ -1,11 +1,12 @@
 import glob
 import logging
 import os
+import importlib
 import shutil
 import urllib.request
 import zipfile
 from queue import Queue
-from typing import Literal
+from typing import Any, Literal, cast
 
 import cv2
 import numpy as np
@@ -26,8 +27,8 @@ DETECTOR_KEY = "memryx"
 
 # Configuration class for model settings
 class ModelConfig(BaseModel):
-    path: str = Field(default=None, title="Model Path")  # Path to the DFP file
-    labelmap_path: str = Field(default=None, title="Path to Label Map")
+    path: str | None = Field(default=None, title="Model Path")  # Path to the DFP file
+    labelmap_path: str | None = Field(default=None, title="Path to Label Map")
 
 
 class MemryXDetectorConfig(BaseDetectorConfig):
@@ -37,7 +38,7 @@ class MemryXDetectorConfig(BaseDetectorConfig):
         title="MemryX",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["memryx"]
     device: str = Field(
         default="PCIe",
         title="Device Path",
@@ -57,18 +58,19 @@ class MemryXDetector(DetectionApi):
     def __init__(self, detector_config):
         """Initialize MemryX detector with the provided configuration."""
         try:
-            # Import MemryX SDK
-            from memryx import AsyncAccl
-        except ModuleNotFoundError:
+            memryx_module = importlib.import_module("memryx")
+            AsyncAccl = memryx_module.AsyncAccl
+        except (ImportError, ModuleNotFoundError):
             raise ImportError(
                 "MemryX SDK is not installed. Install it and set up MIX environment."
             ) from None
-            return
 
         # Initialize stop_event as None, will be set later by set_stop_event()
         self.stop_event = None
 
-        model_cfg = getattr(detector_config, "model", None)
+        model_cfg = cast(Any, getattr(detector_config, "model", None))
+        if model_cfg is None:
+            raise RuntimeError("Detector config is missing model config")
 
         # Check if model_type was explicitly set by the user
         if "model_type" in getattr(model_cfg, "__fields_set__", set()):
@@ -599,10 +601,10 @@ class MemryXDetector(DetectionApi):
         bboxes = xyxy_to_xywh_for_nms(detections[:, 2:6])
         scores = detections[:, 1].tolist()  # Confidence scores
 
-        indices = cv2.dnn.NMSBoxes(bboxes, scores, 0.45, 0.5)
+        indices = cv2.dnn.NMSBoxes(bboxes.tolist(), scores, 0.45, 0.5)
 
         if len(indices) > 0:
-            indices = indices.flatten()[:20]  # Keep only the top 20 detections
+            indices = np.array(indices).flatten()[:20]  # Keep only the top 20 detections
             selected_detections = detections[indices]
 
             # Normalize coordinates AFTER NMS
@@ -809,12 +811,10 @@ class MemryXDetector(DetectionApi):
         )
 
         if len(indices) > 0:
-            # Flatten indices if they are returned as a list of arrays
-            if isinstance(indices[0], list) or isinstance(indices[0], np.ndarray):
-                indices = [i[0] for i in indices]
-
-            # Limit to top 20 detections
-            indices = indices[:20]
+            index_values = np.array(indices).flatten()[:20].tolist()
+            if not isinstance(index_values, list):
+                index_values = list(index_values)
+            indices = [int(i) for i in index_values]
 
             # Convert to Frigate format: [class_id, confidence, y_min, x_min, y_max, x_max] (normalized)
             for i, idx in enumerate(indices):

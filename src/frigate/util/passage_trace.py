@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from frigate.application.recognition.writer import BoundedTraceWriter
 
@@ -49,7 +49,7 @@ def _writer(
                 base,
                 capacity=int(os.environ.get("PASSAGE_WRITER_QUEUE_CAPACITY", "64")),
                 manifest_name=path.relative_to(base).as_posix(),
-                copy_image=lambda image: image.copy(),
+                copy_image=lambda image: cast(Any, image).copy(),
                 encode_jpeg=_encode_jpeg if images else None,
                 max_artifact_bytes=(
                     int(

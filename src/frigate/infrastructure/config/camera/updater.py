@@ -90,6 +90,8 @@ class CameraConfigUpdateSubscriber:
     def __update_config(
         self, camera: str, update_type: CameraConfigUpdateEnum, updated_config: Any
     ) -> None:
+        if self.config is None:
+            raise RuntimeError("Camera configuration is unavailable")
         if update_type == CameraConfigUpdateEnum.add:
             shared = self.config.cameras.setdefault(camera, updated_config)
             self.camera_configs[camera] = shared

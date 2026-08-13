@@ -22,7 +22,7 @@ class ZmqDetectorConfig(BaseDetectorConfig):
         title="ZMQ IPC",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["zmq"]
     endpoint: str = Field(
         default="ipc:///tmp/cache/zmq_detector",
         title="ZMQ IPC endpoint",
@@ -73,10 +73,10 @@ class ZmqIpcDetector(DetectionApi):
         super().__init__(detector_config)
 
         self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.REQ)
         self._endpoint = detector_config.endpoint
         self._request_timeout_ms = detector_config.request_timeout_ms
         self._linger_ms = detector_config.linger_ms
-        self._socket = None
         self._create_socket()
 
         # Model management
@@ -90,11 +90,10 @@ class ZmqIpcDetector(DetectionApi):
         self._zero_result = np.zeros((20, 6), np.float32)
 
     def _create_socket(self) -> None:
-        if self._socket is not None:
-            try:
-                self._socket.close(linger=self._linger_ms)
-            except Exception:
-                pass
+        try:
+            self._socket.close(linger=self._linger_ms)
+        except Exception:
+            pass
         self._socket = self._context.socket(zmq.REQ)
         # Apply timeouts and linger so calls don't block indefinitely
         self._socket.setsockopt(zmq.RCVTIMEO, self._request_timeout_ms)
@@ -273,6 +272,11 @@ class ZmqIpcDetector(DetectionApi):
         }
         return json.dumps(header).encode("utf-8")
 
+    def _assert_socket(self) -> zmq.Socket:
+        if self._socket is None:
+            raise RuntimeError("ZMQ socket is not initialized")
+        return self._socket
+
     def _decode_response(self, frames: list[bytes]) -> np.ndarray:
         try:
             if len(frames) == 1:
@@ -302,15 +306,17 @@ class ZmqIpcDetector(DetectionApi):
             logger.warning("Model not ready, returning zero detections")
             return self._zero_result
 
+        socket = self._assert_socket()
+
         try:
             header_bytes = self._build_header(tensor_input)
             payload_bytes = memoryview(tensor_input.tobytes(order="C"))
 
             # Send request
-            self._socket.send_multipart([header_bytes, payload_bytes])
+            socket.send_multipart([header_bytes, payload_bytes])
 
             # Receive reply
-            reply_frames = self._socket.recv_multipart()
+            reply_frames = socket.recv_multipart()
             detections = self._decode_response(reply_frames)
 
             # Ensure output shape and dtype are exactly as expected
@@ -339,6 +345,6 @@ class ZmqIpcDetector(DetectionApi):
     def __del__(self) -> None:  # pragma: no cover - best-effort cleanup
         try:
             if self._socket is not None:
-                self._socket.close(linger=self.detector_config.linger_ms)
+                self._socket.close(linger=self._linger_ms)
         except Exception:
             pass

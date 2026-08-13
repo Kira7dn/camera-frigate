@@ -27,7 +27,7 @@ from frigate.infrastructure.comms.zmq_proxy import ZmqProxy
 from frigate.infrastructure.config import FrigateConfig
 from frigate.domain.object_detection.base import ObjectDetectProcess
 from frigate.infrastructure.output.output import OutputProcess
-from frigate.domain.ptz.autotrack import PtzAutoTrackerThread
+from frigate.domain.ptz.autotrack import DispatcherProtocol, PtzAutoTrackerThread
 from frigate.domain.ptz.onvif import OnvifController
 from frigate.domain.record.record import RecordProcess
 from extension.topology.compiler import compile_topology
@@ -43,7 +43,7 @@ from .producer import ProducerContext, TrackerProducerCore
 logger = logging.getLogger(__name__)
 
 
-class _EdgeDispatcher:
+class _EdgeDispatcher(DispatcherProtocol):
     """PTZ status sink; edge telemetry is carried by TrackerService health."""
 
     def publish(self, topic: str, payload: Any, retain: bool = False) -> None:
@@ -165,7 +165,7 @@ class TrackerNodeRuntime:
             self.config,
             self.onvif,
             self.ptz_metrics,
-            self.dispatcher,  # type: ignore[arg-type]
+            self.dispatcher,
             stop_event,
             self._capture_config_patch,
         )

@@ -10,7 +10,7 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any
+from typing import Any, cast
 
 from frigate.domain.camera import CameraMetrics
 from frigate.infrastructure.comms.inter_process import InterProcessRequestor
@@ -96,10 +96,10 @@ def capture_frames(
     frame_index: int,
     frame_shape: tuple[int, int],
     frame_manager: FrameManager,
-    frame_queue,
-    fps: Value,
-    skipped_fps: Value,
-    current_frame: Value,
+    frame_queue: Queue[Any],
+    fps: Any,
+    skipped_fps: Any,
+    current_frame: Any,
     stop_event: MpEvent,
 ) -> None:
     frame_size = frame_shape[0] * frame_shape[1]
@@ -108,8 +108,9 @@ def capture_frames(
     skipped_eps = EventsPerSecond()
     skipped_eps.start()
 
+    camera_name = str(config.name)
     config_subscriber = CameraConfigUpdateSubscriber(
-        None, {config.name: config}, [CameraConfigUpdateEnum.enabled]
+        None, {camera_name: config}, [CameraConfigUpdateEnum.enabled]
     )
     source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
     source_start_written = False
@@ -137,8 +138,15 @@ def capture_frames(
             skipped_fps.value = skipped_eps.eps()
             frame_name = f"{config.name}_frame{frame_index}"
             frame_buffer = frame_manager.write(frame_name)
+            if frame_buffer is None:
+                logger.error(f"{config.name}: SharedMemoryFrameManager write returned None.")
+                break
             try:
-                frame_bytes = ffmpeg_process.stdout.read(frame_size)
+                process_stdout = ffmpeg_process.stdout
+                if process_stdout is None:
+                    logger.error(f"{config.name}: ffmpeg stdout is unavailable.")
+                    break
+                frame_bytes = cast(bytes, process_stdout.read(frame_size))
                 if len(frame_bytes) != frame_size:
                     frame_manager.close(frame_name)
                     source_eof = preserve_source_order and not stop_event.is_set()
@@ -223,21 +231,21 @@ class CameraWatchdog(threading.Thread):
         self,
         config: CameraConfig,
         shm_frame_count: int,
-        frame_queue: Queue,
-        camera_fps,
-        skipped_fps,
-        ffmpeg_pid,
-        stalls,
-        reconnects,
-        detection_frame,
+        frame_queue: Any,
+        camera_fps: Any,
+        skipped_fps: Any,
+        ffmpeg_pid: Any,
+        stalls: Any | None,
+        reconnects: Any | None,
+        detection_frame: Any,
         stop_event,
     ):
         threading.Thread.__init__(self)
         self.logger = logging.getLogger(f"watchdog.{config.name}")
         self.config = config
         self.shm_frame_count = shm_frame_count
-        self.capture_thread = None
-        self.ffmpeg_detect_process = None
+        self.capture_thread: CameraCaptureRunner | None = None
+        self.ffmpeg_detect_process: sp.Popen[Any] | None = None
         self.logpipe = LogPipe(f"ffmpeg.{self.config.name}.detect")
         self.ffmpeg_other_processes: list[dict[str, Any]] = []
         self.camera_fps = camera_fps
@@ -257,7 +265,7 @@ class CameraWatchdog(threading.Thread):
 
         self.config_subscriber = CameraConfigUpdateSubscriber(
             None,
-            {config.name: config},
+            {str(config.name): config},
             [
                 CameraConfigUpdateEnum.enabled,
                 CameraConfigUpdateEnum.ffmpeg,
@@ -345,6 +353,8 @@ class CameraWatchdog(threading.Thread):
     def reset_capture_thread(
         self, terminate: bool = True, drain_output: bool = True
     ) -> None:
+        if self.ffmpeg_detect_process is None:
+            return
         if terminate:
             self.ffmpeg_detect_process.terminate()
             try:
@@ -465,29 +475,34 @@ class CameraWatchdog(threading.Thread):
                 if update == (None, None):
                     break
 
-                raw_topic, payload = update
-                if raw_topic and payload:
-                    topic = str(raw_topic)
-                    camera, segment_time, _ = payload
+                raw_topic, payload = cast(tuple[object | None, object | None], update)
+                if raw_topic is None or payload is None:
+                    break
+                if not isinstance(payload, tuple):
+                    logger.debug("Ignoring malformed recording update payload.")
+                    continue
+                topic = str(raw_topic)
+                payload_tuple = cast(tuple[str, float | int | None, object], payload)
+                camera, segment_time, _ = payload_tuple
+                segment_time_value = (
+                    float(segment_time) if isinstance(segment_time, (int, float)) else 0.0
+                )
 
-                    if camera != self.config.name:
-                        continue
+                if camera != self.config.name:
+                    continue
 
-                    if topic.endswith(RecordingsDataTypeEnum.invalid.value):
-                        self.logger.warning(
-                            f"Invalid recording segment detected for {camera} at {segment_time}"
-                        )
-                        self.latest_invalid_segment_time = segment_time
-                    elif topic.endswith(RecordingsDataTypeEnum.valid.value):
-                        self.logger.debug(
-                            f"Latest valid recording segment time on {camera}: {segment_time}"
-                        )
-                        self.latest_valid_segment_time = segment_time
-                    elif topic.endswith(RecordingsDataTypeEnum.latest.value):
-                        if segment_time is not None:
-                            self.latest_cache_segment_time = segment_time
-                        else:
-                            self.latest_cache_segment_time = 0
+                if topic.endswith(RecordingsDataTypeEnum.invalid.value):
+                    self.logger.warning(
+                        f"Invalid recording segment detected for {camera} at {segment_time}"
+                    )
+                    self.latest_invalid_segment_time = segment_time_value
+                elif topic.endswith(RecordingsDataTypeEnum.valid.value):
+                    self.logger.debug(
+                        f"Latest valid recording segment time on {camera}: {segment_time}"
+                    )
+                    self.latest_valid_segment_time = segment_time_value
+                elif topic.endswith(RecordingsDataTypeEnum.latest.value):
+                    self.latest_cache_segment_time = segment_time_value
 
             now = datetime.now().timestamp()
 
@@ -495,6 +510,14 @@ class CameraWatchdog(threading.Thread):
             time_since_last_restart = now - last_restart_time
             can_restart = time_since_last_restart >= self.sleeptime
 
+            if self.capture_thread is None:
+                self._send_detect_status("offline", now)
+                self.camera_fps.value = 0
+                self.logger.error(
+                    f"Capture thread for {self.config.name} was not initialized."
+                )
+                self.stop_all_ffmpeg()
+                continue
             if not self.capture_thread.is_alive():
                 if self._finite_source_has_ended():
                     self._mark_finite_source_exhausted(now)
@@ -713,14 +736,19 @@ class CameraWatchdog(threading.Thread):
         # PASSAGE_SOURCE_START_DIR and retain the normal parallel startup.
         if os.environ.get("PASSAGE_SOURCE_START_DIR"):
             deadline = time.monotonic() + 30.0
+            capture_thread = self.capture_thread
+            if capture_thread is None:
+                raise RuntimeError(
+                    f"{self.config.name}: capture thread did not initialize."
+                )
             while (
-                self.capture_thread.current_frame.value <= 0
-                and self.capture_thread.is_alive()
+                capture_thread.current_frame.value <= 0
+                and capture_thread.is_alive()
                 and not self.stop_event.is_set()
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.01)
-            if self.capture_thread.current_frame.value <= 0:
+            if capture_thread.current_frame.value <= 0:
                 raise RuntimeError(
                     f"{self.config.name}: direct source produced no detect frame; "
                     "recording was not started"
@@ -765,11 +793,11 @@ class CameraCaptureRunner(threading.Thread):
         config: CameraConfig,
         shm_frame_count: int,
         frame_index: int,
-        ffmpeg_process,
+        ffmpeg_process: sp.Popen[Any],
         frame_shape: tuple[int, int],
-        frame_queue: Queue,
-        fps: Value,
-        skipped_fps: Value,
+        frame_queue: Queue[Any],
+        fps: Any,
+        skipped_fps: Any,
         stop_event: MpEvent,
     ):
         threading.Thread.__init__(self)

@@ -294,19 +294,16 @@ def ffprobe(request: Request, paths: str = "", detailed: bool = False):
                 status_code=404,
             )
 
-        paths = map(
-            lambda input: input.path,
-            request.app.frigate_config.cameras[camera].ffmpeg.inputs,
-        )
+        paths_list = [input.path for input in request.app.frigate_config.cameras[camera].ffmpeg.inputs]
     elif "," in clean_camera_user_pass(path_param):
-        paths = path_param.split(",")
+        paths_list = path_param.split(",")
     else:
-        paths = [path_param]
+        paths_list = [path_param]
 
     # user has multiple streams
     output = []
 
-    for path in paths:
+    for path in paths_list:
         ffprobe = ffprobe_stream(
             request.app.frigate_config.ffmpeg, path.strip(), detailed=detailed
         )
@@ -324,13 +321,13 @@ def ffprobe(request: Request, paths: str = "", detailed: bool = False):
                 line.strip() for line in stderr_decoded.split("\n") if line.strip()
             ]
 
-            result = {
+            result: dict[str, object] = {
                 "return_code": ffprobe.returncode,
                 "stderr": stderr_lines,
                 "stdout": "",
             }
         else:
-            result = {
+            result: dict[str, object] = {
                 "return_code": ffprobe.returncode,
                 "stderr": [],
                 "stdout": json.loads(ffprobe.stdout.decode("unicode_escape").strip()),
@@ -340,7 +337,7 @@ def ffprobe(request: Request, paths: str = "", detailed: bool = False):
         if detailed and ffprobe.returncode == 0 and result["stdout"]:
             try:
                 probe_data = result["stdout"]
-                metadata = {}
+                metadata: dict[str, object] = {}
 
                 # Extract video stream information
                 video_stream = None
@@ -742,7 +739,9 @@ async def onvif_probe(
             wsdl_base = None
             spec = find_spec("onvif")
             if spec and getattr(spec, "origin", None):
-                wsdl_base = str(Path(spec.origin).parent / "wsdl")
+                spec_origin = spec.origin
+                if spec_origin is not None:
+                    wsdl_base = str(Path(spec_origin).parent / "wsdl")
         except Exception:
             wsdl_base = None
 
@@ -1164,12 +1163,13 @@ async def onvif_probe(
     finally:
         # Best-effort cleanup of ONVIF camera client session
         if onvif_camera is not None:
-            try:
-                # Check if the camera has a close method and call it
-                if hasattr(onvif_camera, "close"):
-                    await onvif_camera.close()
-            except Exception as e:
-                logger.debug(f"Error closing ONVIF camera session: {e}")
+            close_fn = getattr(onvif_camera, "close", None)
+            if callable(close_fn):
+                try:
+                    # Check if the camera has a close method and call it
+                    await close_fn()
+                except Exception as e:
+                    logger.debug(f"Error closing ONVIF camera session: {e}")
 
 
 @router.delete(

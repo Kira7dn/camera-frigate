@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -103,7 +103,7 @@ def prepare_face_attempt(
         values = best["box"]
         if len(values) != 4:
             raise ValueError("face bbox must contain exactly four coordinates")
-        detector_box = tuple(int(value) for value in values)
+        detector_box = cast(BBox, tuple(int(value) for value in values))
     if area(detector_box) < min_area:
         return None, "too_small"
     effective_box = clamp_box(detector_box, bgr)
@@ -171,7 +171,7 @@ def emit_face_attempt_evidence(
         "raw_identity": raw_identity,
         "raw_score": raw_score,
     }
-    passage_evidence("recognition_attempt", image=attempt.bgr, **common)
+    passage_evidence("recognition_attempt", image=attempt.bgr, **cast(Any, common))
     passage_evidence(
         "recognition_attempt_bbox",
         image=render_recognition_boxes(
@@ -179,6 +179,6 @@ def emit_face_attempt_evidence(
             object_box=person_box,
             detail_box=attempt.effective_crop_box,
         ),
-        **common,
+        **cast(Any, common),
     )
-    passage_evidence("face_crop", image=attempt.crop, **common)
+    passage_evidence("face_crop", image=attempt.crop, **cast(Any, common))

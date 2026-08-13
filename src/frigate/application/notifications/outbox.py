@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from multiprocessing.synchronize import Event as MpEvent
+from typing import Any, cast
 
 import httpx
 from peewee import IntegrityError
@@ -139,31 +140,33 @@ class NotificationOutbox:
     async def _process(
         self, client: httpx.AsyncClient, delivery: NotificationDelivery
     ) -> None:
-        envelope = NotificationEnvelope.from_dict(delivery.payload)
+        envelope = NotificationEnvelope.from_dict(
+            cast(dict[str, Any], delivery.payload)
+        )
+        provider = cast(str, delivery.provider)
+        recipient_id = cast(str, delivery.recipient_id)
         if not self.recipient_enabled(
-            delivery.provider, delivery.recipient_id, envelope.camera, envelope.rule_id
+            provider, recipient_id, envelope.camera, envelope.rule_id
         ):
             self._complete(delivery, "cancelled", "Provider or recipient disabled")
-            increment(delivery.provider, "cancelled")
-            self._update_depth(delivery.provider)
+            increment(provider, "cancelled")
+            self._update_depth(provider)
             return
         started = time.monotonic()
-        result = await self.deliver(
-            client, delivery.provider, delivery.recipient_id, envelope
-        )
-        observe_latency(delivery.provider, time.monotonic() - started)
+        result = await self.deliver(client, provider, recipient_id, envelope)
+        observe_latency(provider, time.monotonic() - started)
         if result.sent:
             self._complete(delivery, "sent", None)
-            increment(delivery.provider, "sent")
-            self._update_depth(delivery.provider)
+            increment(provider, "sent")
+            self._update_depth(provider)
             return
         attempts = delivery.attempts + 1
         config = self.delivery_config()
         if not result.retryable or attempts >= config.max_attempts:
             delivery.attempts = attempts
             self._complete(delivery, "failed", result.error)
-            increment(delivery.provider, "failed")
-            self._update_depth(delivery.provider)
+            increment(provider, "failed")
+            self._update_depth(provider)
             return
         delay = result.retry_after
         if delay is None:
@@ -183,7 +186,7 @@ class NotificationOutbox:
             .where(NotificationDelivery.id == delivery.id)
             .execute()
         )
-        increment(delivery.provider, "retry")
+        increment(provider, "retry")
 
     @staticmethod
     def _complete(

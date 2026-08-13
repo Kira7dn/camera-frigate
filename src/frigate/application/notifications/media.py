@@ -70,4 +70,4 @@ def load_snapshot(artifact_id: str) -> bytes | None:
     """Load immutable artifact bytes; never derive presentation from delivery."""
     from frigate.application.events.canonical import CanonicalMediaStore
 
-    return CanonicalMediaStore().bytes(artifact_id)
+    return CanonicalMediaStore().read_bytes(artifact_id)

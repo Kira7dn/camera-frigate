@@ -66,7 +66,7 @@ def all_recordings_summary(
 ):
     """Returns true/false by day indicating if recordings exist"""
 
-    cameras = params.cameras
+    cameras = params.cameras or "all"
     if cameras != "all":
         requested = set(unquote(cameras).split(","))
         filtered = requested.intersection(allowed_cameras)
@@ -265,7 +265,7 @@ async def no_recordings(
     allowed_cameras: list[str] = Depends(get_allowed_cameras_for_filter),
 ):
     """Get time ranges with no recordings."""
-    cameras = params.cameras
+    cameras = params.cameras or "all"
     if cameras != "all":
         requested = set(unquote(cameras).split(","))
         camera_list = list(requested.intersection(allowed_cameras))
@@ -275,11 +275,8 @@ async def no_recordings(
     if not camera_list:
         return JSONResponse(content=[])
 
-    before = params.before or datetime.datetime.now().timestamp()
-    after = (
-        params.after
-        or (datetime.datetime.now() - datetime.timedelta(hours=1)).timestamp()
-    )
+    before = params.before or datetime.now().timestamp()
+    after = params.after or (datetime.now() - timedelta(hours=1)).timestamp()
     scale = params.scale
 
     clauses = [
@@ -376,7 +373,7 @@ async def delete_recordings(
             status_code=400,
         )
 
-    cameras = params.cameras
+    cameras = params.cameras or "all"
 
     if cameras != "all":
         requested = set(cameras.split(","))

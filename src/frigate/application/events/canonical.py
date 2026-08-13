@@ -7,15 +7,16 @@ Tracking continues to populate the legacy columns during the shadow rollout.
 from __future__ import annotations
 
 import datetime
+import builtins
 import hashlib
 import logging
 import os
 import threading
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import cv2
 from peewee import IntegrityError
@@ -34,6 +35,55 @@ OBSERVATION_RETENTION_DAYS = 2
 DEFAULT_ARTIFACT_RETENTION_DAYS = 30
 
 logger = logging.getLogger(__name__)
+
+
+CanonicalRole = str
+
+
+def _is_str_number_sequence(value: Any) -> bool:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return False
+    return True
+
+
+def _coerce_float_sequence(value: Any) -> list[float] | None:
+    if not _is_str_number_sequence(value):
+        return None
+    try:
+        floats = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    if len(floats) != 4:
+        return None
+    return floats
+
+
+def _as_path(value: Any) -> Path:
+    return Path(str(value))
+
+
+def _coerce_role(value: Any) -> CanonicalRole | None:
+    return value if isinstance(value, str) else None
+
+
+def _select_object_box(
+    boxes: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for box in boxes:
+        role = _coerce_role(box.get("role"))
+        if role == "object":
+            return box
+    return None
+
+
+def _coerce_box_list(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("evidence boxes must be a list")
+    if not all(isinstance(box, dict) for box in value):
+        raise ValueError("evidence boxes must be dictionaries")
+    return cast(list[dict[str, Any]], value)
 
 
 class EvidenceMismatch(ValueError):
@@ -132,8 +182,9 @@ class CanonicalMediaStore:
     def _artifact_valid(artifact: MediaArtifact | None) -> bool:
         if artifact is None:
             return False
-        path = Path(artifact.path)
-        if not path.is_file() or path.stat().st_size != artifact.byte_size:
+        path = _as_path(artifact.path)
+        expected_size = int(cast(int, artifact.byte_size))
+        if not path.is_file() or path.stat().st_size != expected_size:
             return False
         return hashlib.sha256(path.read_bytes()).hexdigest() == artifact.sha256
 
@@ -155,29 +206,37 @@ class CanonicalMediaStore:
         )
         return artifact if self._artifact_valid(artifact) else None
 
-    def bytes(self, artifact_id: str | None) -> bytes | None:
+    def read_bytes(self, artifact_id: str | None) -> bytes | None:
         artifact = self.get(artifact_id)
-        return Path(artifact.path).read_bytes() if artifact else None
+        return _as_path(artifact.path).read_bytes() if artifact else None
 
     def _render(self, evidence: EventEvidence, label: str) -> bytes:
-        image = cv2.imread(evidence.frame_ref, cv2.IMREAD_COLOR)
+        image = cv2.imread(str(evidence.frame_ref), cv2.IMREAD_COLOR)
         if image is None:
             raise FileNotFoundError(evidence.frame_ref)
-        if image.shape[1] != evidence.width or image.shape[0] != evidence.height:
+        frame_width = int(cast(int, evidence.width))
+        frame_height = int(cast(int, evidence.height))
+        if image.shape[1] != frame_width or image.shape[0] != frame_height:
             raise ValueError("evidence dimensions do not match the full frame")
-        boxes = list(evidence.boxes or [])
-        object_boxes = [box for box in boxes if box.get("role") == "object"]
-        if not object_boxes:
+        boxes = _coerce_box_list(evidence.boxes)
+        object_box = _select_object_box(boxes)
+        if object_box is None:
             raise ValueError("canonical evidence requires one object bbox")
-        box = object_boxes[0]
+        box = object_box
         if box.get("evidence_id", evidence.id) != evidence.id:
             raise EvidenceMismatch("bbox belongs to another evidence frame")
-        x1, y1, x2, y2 = box["normalized_xyxy"]
+        normalized_bbox = box.get("normalized_xyxy")
+        if not isinstance(normalized_bbox, (list, tuple)) or len(normalized_bbox) != 4:
+            raise ValueError("canonical evidence requires normalized bbox")
+        try:
+            x1, y1, x2, y2 = [float(value) for value in normalized_bbox]
+        except (TypeError, ValueError) as error:
+            raise ValueError("canonical bbox contains non-numeric coordinates") from error
         pixels = (
-            round(x1 * evidence.width),
-            round(y1 * evidence.height),
-            round(x2 * evidence.width),
-            round(y2 * evidence.height),
+            round(x1 * frame_width),
+            round(y1 * frame_height),
+            round(x2 * frame_width),
+            round(y2 * frame_height),
         )
         # Canonical profile always has exactly one white object rectangle.
         cv2.rectangle(image, pixels[:2], pixels[2:], (255, 255, 255), 2)
@@ -191,7 +250,7 @@ class CanonicalMediaStore:
         cv2.rectangle(
             image,
             (text_x, text_y - text_height - baseline - 2),
-            (min(evidence.width - 1, text_x + text_width + 4), text_y + 2),
+                    (min(frame_width - 1, text_x + text_width + 4), text_y + 2),
             (255, 255, 255),
             -1,
         )
@@ -232,6 +291,16 @@ class CanonicalMediaStore:
             temporary.write_bytes(content)
             os.replace(temporary, target)
             now = utcnow()
+            object_bbox: list[float] | None = None
+            for raw_box in _coerce_box_list(evidence.boxes):
+                if not isinstance(raw_box, Mapping) or raw_box.get("role") != "object":
+                    continue
+                normalized_bbox = _coerce_float_sequence(raw_box.get("normalized_xyxy"))
+                if normalized_bbox is not None:
+                    object_bbox = normalized_bbox
+                    break
+            if object_bbox is None:
+                raise ValueError("canonical evidence requires an object bbox")
             manifest = {
                 "render_spec": {
                     "event_id": spec.event_id,
@@ -241,11 +310,7 @@ class CanonicalMediaStore:
                     "render_version": spec.render_version,
                 },
                 "display_label": label,
-                "object_bbox": next(
-                    box["normalized_xyxy"]
-                    for box in evidence.boxes
-                    if box.get("role") == "object"
-                ),
+                "object_bbox": object_bbox,
                 "sha256": checksum,
             }
             try:
@@ -321,16 +386,20 @@ class EventAggregator:
     ) -> EventEvidence:
         normalized = []
         for box in boxes:
+            if not isinstance(box, dict):
+                raise TypeError("evidence boxes must be dictionaries")
             owner = box.get("evidence_id", evidence_id)
             if owner != evidence_id:
                 raise EvidenceMismatch("all evidence boxes must belong to the same frame")
+            raw_bbox = box.get("normalized_xyxy") or box.get("box")
+            normalized_bbox = _coerce_float_sequence(raw_bbox)
+            if normalized_bbox is None:
+                raise ValueError("evidence box requires normalized_xyxy or box")
             normalized.append(
                 {
                     **box,
                     "evidence_id": evidence_id,
-                    "normalized_xyxy": normalized_xyxy(
-                        box.get("normalized_xyxy") or box.get("box"), width, height
-                    ),
+                    "normalized_xyxy": normalized_xyxy(normalized_bbox, width, height),
                 }
             )
         EventEvidence.insert(

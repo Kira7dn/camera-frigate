@@ -65,6 +65,10 @@ class BaseLocalDetector(ObjectDetector):
         if hasattr(self.detect_api, "set_stop_event") and stop_event:
             self.detect_api.set_stop_event(stop_event)
 
+    def detect_raw(self, tensor_input: np.ndarray) -> np.ndarray:
+        """Run the detector backend and return raw detections."""
+        raise NotImplementedError
+
     def _transform_input(self, tensor_input: np.ndarray) -> np.ndarray:
         if self.input_transform:
             tensor_input = np.transpose(tensor_input, self.input_transform)

@@ -212,7 +212,8 @@ def detect_motion_scaled(
             diff = cv2.absdiff(prev, masked)
             diff_blurred = cv2.GaussianBlur(diff, (3, 3), 0)
             _, thresh = cv2.threshold(diff_blurred, threshold, 255, cv2.THRESH_BINARY)
-            thresh_dilated = cv2.dilate(thresh, None, iterations=1)  # type: ignore[call-overload]
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            thresh_dilated = cv2.dilate(thresh, kernel, iterations=1)
             thresh_masked = cv2.bitwise_and(thresh_dilated, thresh_dilated, mask=mask)
             change_pixels = cv2.countNonZero(thresh_masked)
             if change_pixels > min_area_pixels:
@@ -646,8 +647,10 @@ class MotionSearchRunner(threading.Thread):
         stream is corrupt) this run re-runs in the fixed-cadence fallback.
         Returns ``(results, frame_count)``.
         """
-        run_start: float = run[0].start_time  # type: ignore[assignment]
-        run_end: float = run[-1].end_time  # type: ignore[assignment]
+        run_start_time = cast(datetime, run[0].start_time)
+        run_end_time = cast(datetime, run[-1].end_time)
+        run_start = run_start_time.timestamp()
+        run_end = run_end_time.timestamp()
         vod_url = build_vod_url(self.internal_port, self.job.camera, run_start, run_end)
         time_map = build_segment_time_map(run)
 

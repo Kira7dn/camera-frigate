@@ -423,7 +423,9 @@ class NotificationClient(Communicator):
             title=title,
             message=message,
             snapshot_ref=None,
-            media_artifact_id=(artifact.id if artifact else edge_artifact.media_id),
+            media_artifact_id=(
+                artifact.id if artifact else edge_artifact.media_id if edge_artifact else None
+            ),
             revision=(artifact.revision if artifact else event.revision),
             direct_url=(
                 f"{str(self.config.notifications.public_base_url).rstrip('/')}"
@@ -435,12 +437,14 @@ class NotificationClient(Communicator):
             facts={
                 **envelope.facts,
                 "event_id": event.id,
-                "revision": artifact.revision,
+                "revision": artifact.revision if artifact else event.revision,
                 "display_label": label,
                 "identity": identity if is_face else None,
                 "license_plate": envelope.lpr_plate,
                 "confidence": confidence,
-                "artifact_id": artifact.id if artifact else edge_artifact.media_id,
+                "artifact_id": (
+                    artifact.id if artifact else edge_artifact.media_id if edge_artifact else None
+                ),
             },
         )
 

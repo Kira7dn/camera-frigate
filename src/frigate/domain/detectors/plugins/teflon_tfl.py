@@ -25,7 +25,7 @@ class TeflonDetectorConfig(BaseDetectorConfig):
         title="Teflon",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["teflon_tfl"]
 
 
 class TeflonTfl(DetectionApi):

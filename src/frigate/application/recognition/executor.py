@@ -239,8 +239,13 @@ class AsyncRecognitionExecutor:
             )
             return
         try:
+            if job.observation is None:
+                self._record_and_emit(
+                    job, RecognitionOutcomeStatus.FAILED, reason="invalid_observation"
+                )
+                return
             updates, artifacts, execution_reason = core.observe_guarded_with_artifacts(
-                job.observation,  # type: ignore[arg-type]
+                job.observation,
                 lambda: not self._is_cancelled(job.job_id) and not self._expired(job),
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:

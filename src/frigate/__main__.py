@@ -6,6 +6,7 @@ import sys
 import threading
 
 import ruamel.yaml
+import ruamel.yaml.comments
 from pydantic import ValidationError
 
 from frigate.app import FrigateApp

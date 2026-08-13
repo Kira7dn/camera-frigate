@@ -821,7 +821,7 @@ async def event_snapshot(
             return edge_response
         artifact = CanonicalMediaStore().get(cast(str | None, event.canonical_artifact_id))
         if artifact is not None:
-            jpg_bytes = CanonicalMediaStore().bytes(cast(str | None, artifact.id))
+            jpg_bytes = CanonicalMediaStore().read_bytes(cast(str | None, artifact.id))
             frame_time = EventEvidence.get_by_id(artifact.evidence_id).frame_time
         else:
             return JSONResponse(
@@ -907,7 +907,7 @@ async def event_thumbnail(
             event_complete = True
             artifact = CanonicalMediaStore().get(cast(str | None, event.canonical_artifact_id))
             if artifact is not None:
-                thumbnail_bytes = CanonicalMediaStore().bytes(cast(str | None, artifact.id))
+                thumbnail_bytes = CanonicalMediaStore().read_bytes(cast(str | None, artifact.id))
                 return Response(
                     thumbnail_bytes,
                     media_type="image/jpeg",

@@ -1,6 +1,7 @@
 """Facilitates communication between processes."""
 
 import logging
+from typing import Any
 
 from .zmq_proxy import Publisher, Subscriber
 
@@ -17,7 +18,7 @@ class ReviewDataPublisher(
     def __init__(self, topic: str) -> None:
         super().__init__(topic)
 
-    def publish(self, payload: tuple[str, float], sub_topic: str = "") -> None:
+    def publish(self, payload: dict[str, Any], sub_topic: str = "") -> None:
         super().publish(payload, sub_topic)
 
 

@@ -489,6 +489,7 @@ class LicensePlateProcessingMixin:
                         )
 
             if combined_plate != original_combined:
+                min_initialized = self.config.cameras[camera].detect.min_initialized or 0
                 logger.debug(
                     f"{camera}: All rules applied: '{original_combined}' -> '{combined_plate}'"
                 )
@@ -1515,8 +1516,9 @@ class LicensePlateProcessingMixin:
             if object_data.get("position_changes", 0) == 0 and not object_data.get(
                 "stationary", False
             ):
+                min_initialized = self.config.cameras[camera].detect.min_initialized or 0
                 logger.debug(
-                    f"{camera}: Skipping LPR for non-stationary {object_data['label']} object {id} with no position changes.  (Detected in {self.config.cameras[camera].detect.min_initialized + 1} concurrent frames, threshold to run is {self.config.cameras[camera].detect.min_initialized + 2} frames)"
+                    f"{camera}: Skipping LPR for non-stationary {object_data['label']} object {id} with no position changes.  (Detected in {min_initialized + 1} concurrent frames, threshold to run is {min_initialized + 2} frames)"
                 )
                 save_evidence(
                     "eligibility_decision",

@@ -1,21 +1,22 @@
 # imported to Frigate from https://github.com/ufal/whisper_streaming
 # with only minor modifications
 import io
+import importlib
 import logging
 import math
 import sys
 import time
 from functools import lru_cache
+from typing import Any, cast
 
-import librosa
 import numpy as np
-import soundfile as sf
 
 logger = logging.getLogger(__name__)
 
 
 @lru_cache(10**6)
 def load_audio(fname):
+    librosa = importlib.import_module("librosa")
     a, _ = librosa.load(fname, sr=16000, dtype=np.float32)
     return a
 
@@ -53,7 +54,7 @@ class ASRBase:
 
         self.model = self.load_model(modelsize, cache_dir, model_dir, device)
 
-    def load_model(self, modelsize, cache_dir):
+    def load_model(self, modelsize, cache_dir, model_dir=None, device="cpu"):
         raise NotImplementedError("must be implemented in the child class")
 
     def transcribe(self, audio, init_prompt=""):
@@ -70,9 +71,11 @@ class WhisperTimestampedASR(ASRBase):
 
     sep = " "
 
-    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
-        import whisper
-        from whisper_timestamped import transcribe_timestamped
+    def load_model(self, modelsize=None, cache_dir=None, model_dir=None, device="cpu"):
+        whisper = importlib.import_module("whisper")
+        transcribe_timestamped = importlib.import_module(
+            "whisper_timestamped"
+        ).transcribe_timestamped
 
         self.transcribe_timestamped = transcribe_timestamped
         if model_dir is not None:
@@ -116,7 +119,7 @@ class FasterWhisperASR(ASRBase):
     sep = ""
 
     def load_model(self, modelsize=None, cache_dir=None, model_dir=None, device="cpu"):
-        from faster_whisper import WhisperModel
+        WhisperModel = importlib.import_module("faster_whisper").WhisperModel
 
         logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
@@ -139,7 +142,9 @@ class FasterWhisperASR(ASRBase):
         return model
 
     def transcribe(self, audio, init_prompt=""):
-        from faster_whisper import BatchedInferencePipeline
+        BatchedInferencePipeline = importlib.import_module(
+            "faster_whisper"
+        ).BatchedInferencePipeline
 
         logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
@@ -189,7 +194,7 @@ class MLXWhisper(ASRBase):
 
     sep = " "
 
-    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
+    def load_model(self, modelsize=None, cache_dir=None, model_dir=None, device="cpu"):
         """
         Loads the MLX-compatible Whisper model.
 
@@ -202,8 +207,10 @@ class MLXWhisper(ASRBase):
             model_dir (str, optional): Direct path to a custom model directory.
                 If specified, it overrides the `modelsize` parameter.
         """
-        import mlx.core as mx  # Is installed with mlx-whisper
-        from mlx_whisper.transcribe import ModelHolder, transcribe
+        mx = importlib.import_module("mlx.core")
+        mlx_transcribe = importlib.import_module("mlx_whisper.transcribe")
+        ModelHolder = mlx_transcribe.ModelHolder
+        transcribe = mlx_transcribe.transcribe
 
         if model_dir is not None:
             logger.debug(
@@ -356,7 +363,9 @@ class OpenaiApiASR(ASRBase):
         # Write the audio data to a buffer
         buffer = io.BytesIO()
         buffer.name = "temp.wav"
-        sf.write(buffer, audio_data, samplerate=16000, format="WAV", subtype="PCM_16")
+        importlib.import_module("soundfile").write(
+            buffer, audio_data, samplerate=16000, format="WAV", subtype="PCM_16"
+        )
         buffer.seek(0)  # Reset buffer's position to the beginning
 
         self.transcribed_seconds += math.ceil(
@@ -381,7 +390,7 @@ class OpenaiApiASR(ASRBase):
             proc = self.client.audio.transcriptions
 
         # Process transcription/translation
-        transcript = proc.create(**params)
+        transcript = cast(Any, proc).create(**params)
         logger.debug(
             f"OpenAI API processed accumulated {self.transcribed_seconds} seconds"
         )
@@ -628,7 +637,7 @@ class OnlineASRProcessor:
 
         cwords = [w for w in words]
         t = " ".join(o[2] for o in cwords)
-        s = self.tokenizer.split(t)
+        s = (self.tokenizer or "").split(t)
         out = []
         while s:
             beg = None
@@ -695,7 +704,9 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
         import torch
 
         model, _ = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad")
-        from silero_vad_iterator import FixedVADIterator
+        FixedVADIterator = importlib.import_module(
+            "silero_vad_iterator"
+        ).FixedVADIterator
 
         self.vac = FixedVADIterator(
             model
@@ -704,7 +715,7 @@ class VACOnlineASRProcessor(OnlineASRProcessor):
         self.logfile = self.online.logfile
         self.init()
 
-    def init(self):
+    def init(self, offset=None):
         self.online.init()
         self.vac.reset_states()
         self.current_online_chunk_buffer_size = 0
@@ -799,7 +810,7 @@ def create_tokenizer(lan):
     )
 
     if lan == "uk":
-        import tokenize_uk
+        tokenize_uk = importlib.import_module("tokenize_uk")
 
         class UkrainianTokenizer:
             def split(self, text):
@@ -812,7 +823,7 @@ def create_tokenizer(lan):
         lan
         in "as bn ca cs de el en es et fi fr ga gu hi hu is it kn lt lv ml mni mr nl or pa pl pt ro ru sk sl sv ta te yue zh".split()
     ):
-        from mosestokenizer import MosesTokenizer
+        MosesTokenizer = importlib.import_module("mosestokenizer").MosesTokenizer
 
         return MosesTokenizer(lan)
 
@@ -826,7 +837,7 @@ def create_tokenizer(lan):
         )
         lan = None
 
-    from wtpsplit import WtP
+    WtP = importlib.import_module("wtpsplit").WtP
 
     # downloads the model from huggingface on the first use
     wtp = WtP("wtp-canine-s-12l-no-adapters")

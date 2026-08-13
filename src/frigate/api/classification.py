@@ -1,12 +1,13 @@
 """Object classification APIs."""
 
 import datetime
+import json as json_lib
 import logging
 import os
 import random
 import shutil
 import string
-from typing import Any
+from typing import Any, cast
 
 import cv2
 from fastapi import APIRouter, Depends, Request, UploadFile
@@ -139,7 +140,7 @@ def get_faces():
     must exist in the faces/train directory. Returns a success response or an error
     message if face recognition is not enabled or the training file is invalid.""",
 )
-def reclassify_face(request: Request, body: dict = None):
+def reclassify_face(request: Request, body: dict[str, Any] | None = None):
     if not request.app.frigate_config.face_recognition.enabled:
         return JSONResponse(
             status_code=400,
@@ -192,7 +193,7 @@ def reclassify_face(request: Request, body: dict = None):
     the new filename or an error if face recognition is not enabled, the file/event
     is invalid, or the face cannot be extracted.""",
 )
-def train_face(request: Request, name: str, body: dict = None):
+def train_face(request: Request, name: str, body: dict[str, Any] | None = None):
     if not request.app.frigate_config.face_recognition.enabled:
         return JSONResponse(
             status_code=400,
@@ -255,10 +256,27 @@ def train_face(request: Request, name: str, body: dict = None):
             )
 
         snapshot = get_event_snapshot(event)
-        data = event.data or {}
+        if isinstance(event.data, dict):
+            data = cast(dict[str, Any], event.data)
+        elif isinstance(event.data, str):
+            try:
+                parsed = json_lib.loads(event.data)
+            except (TypeError, ValueError):
+                parsed = {}
+            data = cast(dict[str, Any], parsed if isinstance(parsed, dict) else {})
+        else:
+            data: dict[str, Any] = {}
         face_box = data.get("face_box")
         if not face_box:
-            attributes = data.get("attributes") or []
+            attributes_raw = data.get("attributes")
+            attributes: list[dict[str, Any]] = (
+                attributes_raw
+                if (
+                    isinstance(attributes_raw, list)
+                    and all(isinstance(item, dict) for item in attributes_raw)
+                )
+                else []
+            )
             face_box = attributes[0].get("box") if attributes else None
 
         success = False
@@ -426,7 +444,7 @@ def recognize_face(request: Request, file: UploadFile):
     incorporate the change. Returns a success message or an error if the
     image or target name is invalid.""",
 )
-def reclassify_face_image(request: Request, name: str, body: dict = None):
+def reclassify_face_image(request: Request, name: str, body: dict[str, Any] | None = None):
     if not request.app.frigate_config.face_recognition.enabled:
         return JSONResponse(
             status_code=400,
@@ -509,7 +527,10 @@ def deregister_faces(request: Request, name: str, body: DeleteFaceImagesBody):
         )
 
     context: EmbeddingsContext = request.app.embeddings
-    context.delete_face_ids(name, map(lambda file: sanitize_filename(file), body.ids))
+    context.delete_face_ids(
+        name,
+        [sanitize_filename(file) for file in body.ids],
+    )
     return JSONResponse(
         content=({"success": True, "message": "Successfully deleted faces."}),
         status_code=200,
@@ -787,9 +808,9 @@ def get_classification_dataset(name: str):
     If group_by_model is true, returns attributes grouped by model name.""",
 )
 def get_custom_attributes(
-    request: Request, object_type: str = None, group_by_model: bool = False
+    request: Request, object_type: str | None = None, group_by_model: bool = False
 ):
-    models_with_attributes = {}
+    models_with_attributes: dict[str, list[str]] = {}
 
     for (
         model_key,
@@ -892,7 +913,7 @@ async def train_configured_model(request: Request, name: str):
     The image IDs must belong to the specified category. Returns a success message or an error if the name or category is invalid.""",
 )
 def delete_classification_dataset_images(
-    request: Request, name: str, category: str, body: dict = None
+    request: Request, name: str, category: str, body: dict[str, Any] | None = None
 ):
     config: FrigateConfig = request.app.frigate_config
 
@@ -950,7 +971,7 @@ def delete_classification_dataset_images(
     The image is re-saved as PNG in the target category and removed from the source.""",
 )
 def reclassify_classification_image(
-    request: Request, name: str, category: str, body: dict = None
+    request: Request, name: str, category: str, body: dict[str, Any] | None = None
 ):
     config: FrigateConfig = request.app.frigate_config
 
@@ -1045,7 +1066,7 @@ def reclassify_classification_image(
     The old category must exist and the new name must be valid. Returns a success message or an error if the name is invalid.""",
 )
 def rename_classification_category(
-    request: Request, name: str, old_category: str, body: dict = None
+    request: Request, name: str, old_category: str, body: dict[str, Any] | None = None
 ):
     config: FrigateConfig = request.app.frigate_config
 
@@ -1141,7 +1162,9 @@ def rename_classification_category(
     description="""Categorizes a specific classification image for a given classification model and category.
     The image must exist in the specified category. Returns a success message or an error if the name or category is invalid.""",
 )
-def categorize_classification_image(request: Request, name: str, body: dict = None):
+def categorize_classification_image(
+    request: Request, name: str, body: dict[str, Any] | None = None
+):
     config: FrigateConfig = request.app.frigate_config
 
     if name not in config.classification.custom:
@@ -1241,7 +1264,9 @@ def create_classification_category(request: Request, name: str, category: str):
     description="""Deletes specific train images for a given classification model.
     The image IDs must belong to the specified train folder. Returns a success message or an error if the name is invalid.""",
 )
-def delete_classification_train_images(request: Request, name: str, body: dict = None):
+def delete_classification_train_images(
+    request: Request, name: str, body: dict[str, Any] | None = None
+):
     config: FrigateConfig = request.app.frigate_config
 
     if name not in config.classification.custom:

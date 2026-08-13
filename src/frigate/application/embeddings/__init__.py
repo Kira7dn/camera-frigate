@@ -106,9 +106,9 @@ class EmbeddingsContext:
         self.requestor.stop()
 
     def search_thumbnail(
-        self, query: Event | str, event_ids: list[str] = None
+        self, query: Event | str, event_ids: list[str] | None = None
     ) -> list[tuple[str, float]]:
-        if query.__class__ == Event:
+        if isinstance(query, Event):
             cursor = self.db.execute_sql(
                 """
                 SELECT thumbnail_embedding FROM vec_thumbnails WHERE id = ?
@@ -167,7 +167,7 @@ class EmbeddingsContext:
         return results
 
     def search_description(
-        self, query_text: str, event_ids: list[str] = None
+        self, query_text: str, event_ids: list[str] | None = None
     ) -> list[tuple[str, float]]:
         data = self.requestor.send_data(
             EmbeddingsRequestEnum.generate_search.value, query_text
@@ -314,7 +314,7 @@ class EmbeddingsContext:
         ).start()
         return {"success": True, "message": f"Began training {model_name} model."}
 
-    def transcribe_audio(self, event: dict[str, any]) -> dict[str, any]:
+    def transcribe_audio(self, event: dict[str, Any]) -> dict[str, Any]:
         return self.requestor.send_data(
             EmbeddingsRequestEnum.transcribe_audio.value, {"event": event}
         )

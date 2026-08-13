@@ -22,7 +22,7 @@ class DeepstackDetectorConfig(BaseDetectorConfig):
         title="DeepStack",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["deepstack"]
     api_url: str = Field(
         default="http://localhost:80/v1/vision/detection",
         title="DeepStack API URL",

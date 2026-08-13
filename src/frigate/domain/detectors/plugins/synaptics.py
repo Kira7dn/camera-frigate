@@ -1,6 +1,7 @@
+import importlib
 import logging
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import ConfigDict
@@ -13,13 +14,22 @@ from frigate.domain.detectors.detector_config import (
 )
 
 try:
-    from synap import Network
-    from synap.postprocessor import Detector
-    from synap.preprocessor import Preprocessor
-    from synap.types import Layout, Shape
-
+    _synap = importlib.import_module("synap")
+    postprocessor = importlib.import_module("synap.postprocessor")
+    preprocessor = importlib.import_module("synap.preprocessor")
+    types_module = importlib.import_module("synap.types")
+    Network: Any = _synap.Network
+    Detector: Any = postprocessor.Detector
+    Preprocessor: Any = preprocessor.Preprocessor
+    Layout: Any = types_module.Layout
+    Shape: Any = types_module.Shape
     SYNAP_SUPPORT = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
+    Network: Any = None
+    Detector: Any = None
+    Preprocessor: Any = None
+    Layout: Any = None
+    Shape: Any = None
     SYNAP_SUPPORT = False
 
 logger = logging.getLogger(__name__)
@@ -34,7 +44,7 @@ class SynapDetectorConfig(BaseDetectorConfig):
         title="Synaptics",
     )
 
-    type: Literal[DETECTOR_KEY]
+    type: Literal["synaptics"]
 
 
 class SynapDetector(DetectionApi):
@@ -45,17 +55,19 @@ class SynapDetector(DetectionApi):
             logger.error(
                 "Error importing Synaptics SDK modules. You must use the -synaptics Docker image variant for Synaptics detector support."
             )
-            return
+            raise ImportError(
+                "Synaptics SDK modules are not available. Use synaptics image variant."
+            )
 
         try:
             _, ext = os.path.splitext(detector_config.model.path)
             if ext and ext != ".synap":
-                raise ValueError("Model path config for Synap1680 is incorrect.")
+                raise ValueError("Model path config for Synaptics is incorrect.")
 
             synap_network = Network(detector_config.model.path)
             logger.info(f"Synap NPU loaded model: {detector_config.model.path}")
         except ValueError as ve:
-            logger.error(f"Synap1680 setup has failed: {ve}")
+            logger.error(f"Synap setup has failed: {ve}")
             raise
         except Exception as e:
             logger.error(f"Failed to init Synap NPU: {e}")
@@ -69,12 +81,12 @@ class SynapDetector(DetectionApi):
         self.input_tensor_layout = detector_config.model.input_tensor
 
         # Create Inference Engine
-        self.preprocessor = Preprocessor()
-        self.detector = Detector(score_threshold=0.4, iou_threshold=0.4)
+        self.preprocessor: Any = Preprocessor()
+        self.detector: Any = Detector(score_threshold=0.4, iou_threshold=0.4)
 
     def detect_raw(self, tensor_input: np.ndarray):
         # It has only been testing for pre-converted mobilenet80 .tflite -> .synap model currently
-        layout = Layout.nhwc  # default layout
+        layout = Layout.nhwc
         detections = np.zeros((20, 6), np.float32)
 
         if self.input_tensor_layout == InputTensorEnum.nhwc:
@@ -93,10 +105,10 @@ class SynapDetector(DetectionApi):
 
                 bb = item.bounding_box
                 # Convert corner coordinates to normalized [0,1] range
-                x1 = bb.origin.x / self.width  # Top-left X
-                y1 = bb.origin.y / self.height  # Top-left Y
-                x2 = (bb.origin.x + bb.size.x) / self.width  # Bottom-right X
-                y2 = (bb.origin.y + bb.size.y) / self.height  # Bottom-right Y
+                x1 = bb.origin.x / self.width
+                y1 = bb.origin.y / self.height
+                x2 = (bb.origin.x + bb.size.x) / self.width
+                y2 = (bb.origin.y + bb.size.y) / self.height
                 detections[i] = [
                     item.class_index,
                     float(item.confidence),

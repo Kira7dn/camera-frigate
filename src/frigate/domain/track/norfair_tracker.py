@@ -252,21 +252,17 @@ class NorfairTracker(ObjectTracker):
         self.default_tracker = {
             "static": Tracker(
                 distance_function=frigate_distance,
-                distance_threshold=self.default_tracker_config[  # type: ignore[arg-type]
-                    "distance_threshold"
-                ],
-                initialization_delay=self.detect_config.min_initialized,
-                hit_counter_max=self.detect_config.max_disappeared,  # type: ignore[arg-type]
-                filter_factory=self.default_tracker_config["filter_factory"],  # type: ignore[arg-type]
+                distance_threshold=float(self.default_tracker_config["distance_threshold"]),
+                initialization_delay=self.detect_config.min_initialized or 0,
+                hit_counter_max=self.detect_config.max_disappeared or 0,
+                filter_factory=self.default_tracker_config["filter_factory"],
             ),
             "ptz": Tracker(
                 distance_function=frigate_distance,
-                distance_threshold=self.default_ptz_tracker_config[
-                    "distance_threshold"
-                ],  # type: ignore[arg-type]
-                initialization_delay=self.detect_config.min_initialized,
-                hit_counter_max=self.detect_config.max_disappeared,  # type: ignore[arg-type]
-                filter_factory=self.default_ptz_tracker_config["filter_factory"],  # type: ignore[arg-type]
+                distance_threshold=float(self.default_ptz_tracker_config["distance_threshold"]),
+                initialization_delay=self.detect_config.min_initialized or 0,
+                hit_counter_max=self.detect_config.max_disappeared or 0,
+                filter_factory=self.default_ptz_tracker_config["filter_factory"],
             ),
         }
 
@@ -280,8 +276,8 @@ class NorfairTracker(ObjectTracker):
         tracker_params = {
             "distance_function": tracker_config["distance_function"],
             "distance_threshold": tracker_config["distance_threshold"],
-            "initialization_delay": self.detect_config.min_initialized,
-            "hit_counter_max": self.detect_config.max_disappeared,
+            "initialization_delay": self.detect_config.min_initialized or 0,
+            "hit_counter_max": self.detect_config.max_disappeared or 0,
             "filter_factory": tracker_config["filter_factory"],
         }
 
@@ -302,7 +298,7 @@ class NorfairTracker(ObjectTracker):
                 {key: tracker_config[key] for key in reid_keys if key in tracker_config}
             )
 
-        return Tracker(**tracker_params)
+        return Tracker(**cast(Any, tracker_params))
 
     def get_tracker(self, object_type: str) -> Tracker:
         """Get the appropriate tracker based on object type and camera mode."""
@@ -654,11 +650,13 @@ class NorfairTracker(ObjectTracker):
         for t in all_tracked_objects:
             estimate = tuple(t.estimate.flatten().astype(int))
             # keep the estimate within the bounds of the image
+            frame_width = self.detect_config.width or 0
+            frame_height = self.detect_config.height or 0
             estimate = (
                 max(0, estimate[0]),
                 max(0, estimate[1]),
-                min(self.detect_config.width - 1, estimate[2]),  # type: ignore[operator]
-                min(self.detect_config.height - 1, estimate[3]),  # type: ignore[operator]
+                min(frame_width - 1, estimate[2]),
+                min(frame_height - 1, estimate[3]),
             )
             new_obj = {
                 **t.last_detection.data,
@@ -678,7 +676,7 @@ class NorfairTracker(ObjectTracker):
                     self.tracked_objects[id]["estimate"] = new_obj["estimate"]
             # else update it
             else:
-                thresholds = get_stationary_threshold(new_obj["label"])
+                thresholds = get_stationary_threshold(str(new_obj["label"]))
                 self.update(
                     str(t.global_id),
                     new_obj,
@@ -752,9 +750,9 @@ class NorfairTracker(ObjectTracker):
         # draw the estimated bounding box
         draw_boxes(frame, all_tracked_objects, color="green", draw_ids=True)
         # draw the detections that were detected in the current frame
-        draw_boxes(frame, active_detections, color="blue", draw_ids=True)  # type: ignore[arg-type]
+        draw_boxes(frame, cast(Any, active_detections), color="blue", draw_ids=True)
         # draw the detections that are missing in the current frame
-        draw_boxes(frame, missing_detections, color="red", draw_ids=True)  # type: ignore[arg-type]
+        draw_boxes(frame, cast(Any, missing_detections), color="red", draw_ids=True)
 
         # draw the distance calculation for the last detection
         # estimate vs detection

@@ -4,7 +4,7 @@ import datetime
 import logging
 import math
 from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -46,7 +46,7 @@ def get_camera_regions_grid(
     # get grid from db if available
     try:
         regions: Regions = Regions.select().where(Regions.camera == name).get()
-        grid = regions.grid
+        grid = cast(list[list[dict[str, Any]]], regions.grid)
         last_update = regions.last_update
     except DoesNotExist:
         grid = []
@@ -128,8 +128,8 @@ def get_camera_regions_grid(
             std_dev = np.std(cell["sizes"])
             mean = np.mean(cell["sizes"])
             logger.debug(f"std dev: {std_dev} mean: {mean}")
-            cell["x"] = x
-            cell["y"] = y
+            cast(dict[str, Any], cell)["x"] = x
+            cast(dict[str, Any], cell)["y"] = y
             cell["std_dev"] = std_dev
             cell["mean"] = mean
 
@@ -339,7 +339,7 @@ def reduce_boxes(boxes, iou_threshold=0.0):
     return [tuple(c) for c in clusters]
 
 
-def average_boxes(boxes: list[list[int, int, int, int]]) -> list[int, int, int, int]:
+def average_boxes(boxes: list[list[int]]) -> list[float]:
     """Return a box that is the average of a list of boxes."""
     n = len(boxes)
     return [
@@ -350,7 +350,7 @@ def average_boxes(boxes: list[list[int, int, int, int]]) -> list[int, int, int, 
     ]
 
 
-def median_of_boxes(boxes: list[list[int, int, int, int]]) -> list[int, int, int, int]:
+def median_of_boxes(boxes: list[list[int]]) -> list[int]:
     """Return a box that is the median of a list of boxes."""
     sorted_boxes = sorted(boxes, key=lambda x: area(x))
     return sorted_boxes[int(len(sorted_boxes) / 2.0)]
@@ -510,7 +510,7 @@ def get_startup_regions(
 ) -> list[list[int]]:
     """Get a list of regions to run on startup."""
     # return 8 most popular regions for the camera
-    all_cells = np.concatenate(region_grid).flat
+    all_cells = cast(Any, np.concatenate(cast(Any, region_grid)).flat)
     startup_cells = sorted(all_cells, key=lambda c: len(c["sizes"]), reverse=True)[0:8]
     regions = []
 
@@ -577,7 +577,7 @@ def reduce_detections(
 
             # add objects
             for index in indices:
-                index = index if isinstance(index, np.int32) else index[0]
+                index = int(index) if isinstance(index, np.int32) else int(cast(Any, index)[0])
                 obj = group[index]
                 selected_objects.append(obj)
 

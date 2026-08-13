@@ -1,6 +1,7 @@
 """Export apis."""
 
 import datetime
+import io
 import logging
 import random
 import string
@@ -186,7 +187,7 @@ def _validate_export_source(
         .count()
     )
 
-    if not is_current_hour(start_time) and previews_count <= 0:
+    if not is_current_hour(int(start_time)) and previews_count <= 0:
         return "No previews found for time range"
 
     return None
@@ -378,39 +379,15 @@ def get_export_case(case_id: str):
 _ZIP_STREAM_CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
 
-class _StreamingZipBuffer:
-    """File-like sink for ZipFile that exposes written bytes via drain().
-
-    ZipFile writes synchronously into this buffer; the generator drains the
-    queue between writes so StreamingResponse can yield bytes without
-    materializing the whole archive in memory.
-    """
-
-    def __init__(self) -> None:
-        self._queue: deque[bytes] = deque()
-        self._offset = 0
-
-    def write(self, data: bytes) -> int:
-        if data:
-            self._queue.append(bytes(data))
-            self._offset += len(data)
-        return len(data)
-
-    def tell(self) -> int:
-        return self._offset
-
-    def flush(self) -> None:
-        pass
-
-    def drain(self) -> Iterator[bytes]:
-        while self._queue:
-            yield self._queue.popleft()
-
-
 def _unique_archive_name(export: Export, used: set[str]) -> str:
-    base = sanitize_filename(export.name) if export.name else None
+    base = sanitize_filename(str(export.name)) if export.name else None
     if not base:
-        base = f"{export.camera}_{int(export.date)}"
+        export_date = getattr(export, "date", 0)
+        base = (
+            f"{export.camera}_{int(export_date)}"
+            if isinstance(export_date, (int, float))
+            else f"{export.camera}_{int(export_date.timestamp())}"
+        )
 
     candidate = f"{base}.mp4"
     counter = 1
@@ -424,7 +401,8 @@ def _unique_archive_name(export: Export, used: set[str]) -> str:
 
 def _stream_case_archive(exports: list[Export]) -> Iterator[bytes]:
     """Yield bytes of a zip archive built from the given exports' mp4 files."""
-    buffer = _StreamingZipBuffer()
+    buffer = io.BytesIO()
+    bytes_offset = 0
     used_names: set[str] = set()
 
     # ZIP_STORED: mp4 is already compressed, recompressing wastes CPU for ~0% size win.
@@ -435,7 +413,7 @@ def _stream_case_archive(exports: list[Export]) -> Iterator[bytes]:
         allowZip64=True,
     ) as archive:
         for export in exports:
-            source = Path(export.video_path)
+            source = Path(str(export.video_path))
             if not source.exists():
                 continue
 
@@ -449,13 +427,20 @@ def _stream_case_archive(exports: list[Export]) -> Iterator[bytes]:
                     chunk = src.read(_ZIP_STREAM_CHUNK_SIZE)
                     if not chunk:
                         break
-
                     entry.write(chunk)
-                    yield from buffer.drain()
+                    new_offset = buffer.tell()
+                    if new_offset > bytes_offset:
+                        yield buffer.getvalue()[bytes_offset:new_offset]
+                        bytes_offset = new_offset
 
-            yield from buffer.drain()
+                new_offset = buffer.tell()
+                if new_offset > bytes_offset:
+                    yield buffer.getvalue()[bytes_offset:new_offset]
+                    bytes_offset = new_offset
 
-    yield from buffer.drain()
+    final_offset = buffer.tell()
+    if final_offset > bytes_offset:
+        yield buffer.getvalue()[bytes_offset:final_offset]
 
 
 @router.get(
@@ -556,9 +541,9 @@ def delete_export_case(case_id: str, request: Request, delete_exports: bool = Fa
 
         exports = list(Export.select().where(Export.export_case == case_id))
         for export in exports:
-            Path(export.video_path).unlink(missing_ok=True)
+            Path(str(export.video_path)).unlink(missing_ok=True)
             if export.thumb_path:
-                Path(export.thumb_path).unlink(missing_ok=True)
+                Path(str(export.thumb_path)).unlink(missing_ok=True)
             export.delete_instance()
     else:
         # Unassign exports from this case but keep the exports themselves
@@ -602,8 +587,7 @@ async def get_export_job_status(export_id: str, request: Request):
             content={"success": False, "message": "Job not found"},
             status_code=404,
         )
-
-    await require_camera_access(job.camera, request=request)
+    await require_camera_access(str(job.camera), request=request)
 
     return JSONResponse(content=job.to_dict())
 
@@ -730,15 +714,15 @@ def export_recordings_batch(
             continue
 
         export_job = _build_export_job(
-            item.camera,
+            str(item.camera),
             item.start_time,
             item.end_time,
-            item.friendly_name,
+            str(item.friendly_name) if item.friendly_name else None,
             sanitized_images[index],
             PlaybackSourceEnum.recordings,
-            export_case_id,
+            str(export_case_id) if export_case_id is not None else None,
             chapters=request.app.frigate_config.cameras[
-                item.camera
+                str(item.camera)
             ].record.export.chapters,
         )
         try:
@@ -858,7 +842,7 @@ def export_recording(
         camera_name,
         start_time,
         end_time,
-        friendly_name,
+        str(friendly_name) if friendly_name else None,
         existing_image,
         playback_source,
         export_case_id,
@@ -901,7 +885,7 @@ def export_recording(
 async def export_rename(event_id: str, body: ExportRenameBody, request: Request):
     try:
         export: Export = Export.get(Export.id == event_id)
-        await require_camera_access(export.camera, request=request)
+        await require_camera_access(str(export.camera), request=request)
     except DoesNotExist:
         return JSONResponse(
             content=(
@@ -913,8 +897,7 @@ async def export_rename(event_id: str, body: ExportRenameBody, request: Request)
             status_code=404,
         )
 
-    export.name = body.name
-    export.save()
+    Export.update(name=body.name).where(Export.id == event_id).execute()
     return JSONResponse(
         content=(
             {
@@ -1007,7 +990,7 @@ def export_recording_custom(
         camera_name,
         start_time,
         end_time,
-        friendly_name,
+        str(friendly_name) if friendly_name else None,
         existing_image,
         playback_source,
         export_case_id,
@@ -1051,7 +1034,7 @@ def export_recording_custom(
 async def get_export(export_id: str, request: Request):
     try:
         export = Export.get(Export.id == export_id)
-        await require_camera_access(export.camera, request=request)
+        await require_camera_access(str(export.camera), request=request)
         return JSONResponse(content=model_to_dict(export))
     except DoesNotExist:
         return JSONResponse(
@@ -1106,9 +1089,9 @@ def bulk_delete_exports(body: ExportBulkDeleteBody):
             )
 
     for export in exports:
-        Path(export.video_path).unlink(missing_ok=True)
+        Path(str(export.video_path)).unlink(missing_ok=True)
         if export.thumb_path:
-            Path(export.thumb_path).unlink(missing_ok=True)
+            Path(str(export.thumb_path)).unlink(missing_ok=True)
 
     Export.delete().where(Export.id << body.ids).execute()
 

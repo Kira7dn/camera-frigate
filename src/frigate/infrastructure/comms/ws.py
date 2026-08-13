@@ -477,7 +477,7 @@ class WebSocketClient(Communicator):
             roles_config = self.config.auth.roles
             camera_names = set(self.config.cameras.keys())
 
-            def received_message(self, message: WebSocket.received_message) -> None:  # type: ignore[name-defined]
+            def received_message(self, message: Any) -> None:
                 try:
                     json_message = json.loads(message.data.decode("utf-8"))
                     json_message = {
@@ -531,7 +531,7 @@ class WebSocketClient(Communicator):
         )
         self.websocket_thread.start()
 
-    def publish(self, topic: str, payload: Any, _: bool = False) -> None:
+    def publish(self, topic: str, payload: Any, retain: bool = False) -> None:
         if self.websocket_server is None:
             logger.debug("Skipping message, websocket not connected yet")
             return

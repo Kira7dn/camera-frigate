@@ -4,7 +4,7 @@ import base64
 import json
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 from httpx import TimeoutException
 from openai import OpenAI
@@ -104,7 +104,7 @@ class OpenAIClient(GenAIClient):
                         schema["additionalProperties"] = False
                 request_params["response_format"] = response_format
 
-            result = self.provider.chat.completions.create(**request_params)
+            result = self.provider.chat.completions.create(**cast(Any, request_params))
 
             if (
                 result is not None
@@ -150,7 +150,13 @@ class OpenAIClient(GenAIClient):
         # This is necessary for llama.cpp and other OpenAI-compatible servers
         # that don't expose the configured runtime context size in the API response
         if "context_size" in self.genai_config.provider_options:
-            self.context_size = self.genai_config.provider_options["context_size"]
+            value = self.genai_config.provider_options["context_size"]
+            if isinstance(value, int):
+                self.context_size = value
+            elif isinstance(value, str) and value.isdigit():
+                self.context_size = int(value)
+            else:
+                self.context_size = 8192
             logger.debug(
                 f"Using context size {self.context_size} from provider_options for model {self.genai_config.model}"
             )
@@ -160,8 +166,17 @@ class OpenAIClient(GenAIClient):
             models = self.provider.models.list()
             for model in models.data:
                 if model.id == self.genai_config.model:
-                    if hasattr(model, "max_model_len") and model.max_model_len:
-                        self.context_size = model.max_model_len
+                    raw_context_size = getattr(model, "max_model_len", None)
+                    if isinstance(raw_context_size, int):
+                        self.context_size = raw_context_size
+                    elif isinstance(raw_context_size, str) and raw_context_size.isdigit():
+                        self.context_size = int(raw_context_size)
+                    elif isinstance(raw_context_size, float):
+                        self.context_size = int(raw_context_size)
+                    elif isinstance(raw_context_size, bool):
+                        self.context_size = int(raw_context_size)
+
+                    if self.context_size is not None:
                         logger.debug(
                             f"Retrieved context size {self.context_size} for model {self.genai_config.model}"
                         )
@@ -229,7 +244,7 @@ class OpenAIClient(GenAIClient):
                 }
                 request_params.update(provider_opts)
 
-            result = self.provider.chat.completions.create(**request_params)
+            result = self.provider.chat.completions.create(**cast(Any, request_params))
 
             if (
                 result is None
@@ -360,7 +375,7 @@ class OpenAIClient(GenAIClient):
             finish_reason = "stop"
             usage_stats: dict[str, Any] | None = None
 
-            stream = self.provider.chat.completions.create(**request_params)
+            stream = self.provider.chat.completions.create(**cast(Any, request_params))
 
             for chunk in stream:
                 chunk_usage = getattr(chunk, "usage", None)
