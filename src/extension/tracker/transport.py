@@ -74,6 +74,7 @@ class TrackerService:
         config_hash: str,
         camera_health: Callable[[], tuple[dict[str, object], ...]],
         allowed_clients: frozenset[str] = frozenset(),
+        media_reader: Callable[[str, int, int | None], bytes] | None = None,
     ) -> None:
         self.node_id = node_id
         self.node_epoch = node_epoch
@@ -81,7 +82,9 @@ class TrackerService:
         self.config_hash = config_hash
         self.camera_health = camera_health
         self.allowed_clients = allowed_clients
+        self.media_reader = media_reader
         self.degraded = False
+        self.active_lifecycles: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
         self._subscribers: set[
             tuple[asyncio.AbstractEventLoop, asyncio.Queue[TrackerUpdate]]
@@ -91,6 +94,11 @@ class TrackerService:
         """Persist then notify connected main runtimes."""
         persisted = self.journal.append(update)
         with self._lock:
+            identity = (update.camera_id, update.stream_epoch, update.track_id)
+            if update.operation is TrackerOperation.START:
+                self.active_lifecycles.add(identity)
+            elif update.operation is TrackerOperation.END:
+                self.active_lifecycles.discard(identity)
             subscribers = tuple(self._subscribers)
         for loop, updates in subscribers:
             loop.call_soon_threadsafe(self._offer, updates, persisted)
@@ -132,6 +140,8 @@ class TrackerService:
                     "ready": True,
                     "degraded": self.degraded,
                     "pending_ack": self.journal.pending_count,
+                    "pinned_evidence": 0,
+                    "active_lifecycles": len(self.active_lifecycles),
                 },
                 "cameras": list(cameras),
             }
@@ -202,6 +212,28 @@ class TrackerService:
             with self._lock:
                 self._subscribers.discard(subscriber)
 
+    async def fetch_media(
+        self, request: bytes, context: aio.ServicerContext
+    ) -> AsyncIterator[bytes]:
+        """Stream a bounded range of edge-owned media."""
+        await self._authorize(context)
+        if self.media_reader is None:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "tracker_media_unavailable")
+        value = _decode(request)
+        try:
+            data = await asyncio.to_thread(
+                self.media_reader,
+                str(value["media_id"]),
+                int(value.get("offset", 0)),
+                None if value.get("length") is None else int(value["length"]),
+            )
+        except FileNotFoundError:
+            await context.abort(grpc.StatusCode.NOT_FOUND, "tracker_media_not_found")
+        except (KeyError, TypeError, ValueError):
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid_media_range")
+        for offset in range(0, len(data), 64 * 1024):
+            yield data[offset : offset + 64 * 1024]
+
     def handler(self) -> grpc.GenericRpcHandler:
         return grpc.method_handlers_generic_handler(
             SERVICE,
@@ -213,6 +245,11 @@ class TrackerService:
                 ),
                 "Connect": grpc.stream_stream_rpc_method_handler(
                     self.connect,
+                    request_deserializer=lambda value: value,
+                    response_serializer=lambda value: value,
+                ),
+                "FetchMedia": grpc.unary_stream_rpc_method_handler(
+                    self.fetch_media,
                     request_deserializer=lambda value: value,
                     response_serializer=lambda value: value,
                 ),
@@ -344,6 +381,32 @@ class TrackerCanonicalStore:
                 payload=payload,
                 expires_at=now + datetime.timedelta(days=2),
             )
+            for manifest in update.media:
+                existing_media = EdgeMediaManifest.get_or_none(
+                    EdgeMediaManifest.media_id == manifest.media_id
+                )
+                if existing_media is not None:
+                    if (
+                        existing_media.event_id != update.event_id
+                        or existing_media.sha256 != manifest.sha256
+                    ):
+                        raise TrackerIngestError("durable_media_conflict")
+                    continue
+                EdgeMediaManifest.create(
+                    media_id=manifest.media_id,
+                    node_id=update.node_id,
+                    camera_id=manifest.camera_id,
+                    event_id=manifest.event_id,
+                    media_type=manifest.media_type,
+                    codec=manifest.codec,
+                    start_time=manifest.start_time,
+                    end_time=manifest.end_time,
+                    byte_size=manifest.byte_size,
+                    sha256=manifest.sha256,
+                    expires_at=datetime.datetime.fromtimestamp(
+                        manifest.expiry_unix_ms / 1000, datetime.UTC
+                    ),
+                )
 
     def last_sequence(self, node_id: str) -> int:
         row = (
@@ -353,6 +416,30 @@ class TrackerCanonicalStore:
             .first()
         )
         return 0 if row is None else int(row.journal_sequence)
+
+    def active_lifecycles(
+        self, node_id: str
+    ) -> dict[tuple[str, str, str, str], str]:
+        """Rebuild active tracks after a Frigate-main restart."""
+        active: dict[tuple[str, str, str, str], str] = {}
+        rows = (
+            TrackerJournalEntry.select()
+            .where(TrackerJournalEntry.node_id == node_id)
+            .order_by(TrackerJournalEntry.journal_sequence.asc())
+        )
+        for row in rows:
+            payload = row.payload
+            key = (
+                row.node_id,
+                row.camera_id,
+                row.stream_epoch,
+                str(payload["track_id"]),
+            )
+            if row.operation == TrackerOperation.START.value:
+                active[key] = row.event_id
+            elif row.operation == TrackerOperation.END.value:
+                active.pop(key, None)
+        return active
 
 
 class TrackerMaintainer(threading.Thread):
@@ -494,6 +581,7 @@ class TrackerMaintainer(threading.Thread):
                     raise TrackerIngestError("tracker_config_hash_mismatch")
                 durable_sequence = self.store.last_sequence(node_id)
                 ingest.seed(node_id, durable_sequence)
+                ingest.active = self.store.active_lifecycles(node_id)
                 await call.write(
                     _encode(
                         {
@@ -509,7 +597,10 @@ class TrackerMaintainer(threading.Thread):
                         await call.write(_encode({"type": "health"}))
 
                 heartbeat = asyncio.create_task(send_heartbeat())
-                async for raw in call:
+                while True:
+                    raw = await call.read()
+                    if raw is aio.EOF:
+                        break
                     message = _decode(raw)
                     if message.get("type") != "update":
                         continue
@@ -567,7 +658,29 @@ class TrackerMaintainer(threading.Thread):
         offset: int = 0,
         length: int | None = None,
     ) -> bytes:
-        raise RuntimeError("tracker_media_unavailable")
+        async def fetch() -> bytes:
+            channel = self.channels.get(node_id)
+            if channel is None:
+                raise RuntimeError("tracker_media_unavailable")
+            method = channel.unary_stream(
+                f"/{SERVICE}/FetchMedia",
+                request_serializer=lambda value: value,
+                response_deserializer=lambda value: value,
+            )
+            call = method(
+                _encode({"media_id": media_id, "offset": offset, "length": length})
+            )
+            chunks = bytearray()
+            async for chunk in call:
+                chunks.extend(chunk)
+            return bytes(chunks)
+
+        if self.loop is None:
+            raise RuntimeError("tracker_media_unavailable")
+        if asyncio.get_running_loop() is self.loop:
+            return await fetch()
+        future = asyncio.run_coroutine_threadsafe(fetch(), self.loop)
+        return await asyncio.wrap_future(future)
 
     def close(self) -> None:
         self.publisher.stop()

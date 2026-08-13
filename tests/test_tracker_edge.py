@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from playhouse.sqlite_ext import SqliteExtDatabase
 from extension.tracker.runtime import (
     BoundingBox,
+    MediaManifest,
     TrackerJournal,
     TrackerOperation,
     TrackerUpdate,
 )
-from extension.tracker.transport import TrackerHostIngest, TrackerIngestError
+from extension.tracker.transport import (
+    TrackerCanonicalStore,
+    TrackerHostIngest,
+    TrackerIngestError,
+)
+from frigate.models import EdgeMediaManifest, EventObservation, TrackerJournalEntry
 
 
 def _update(
@@ -61,6 +69,50 @@ def test_update_json_preserves_producer_trace_and_native_track_id() -> None:
     assert restored.track_id == "native-track-id"
 
 
+def test_update_json_accepts_native_defaultdict_state() -> None:
+    update = _update()
+    update.state["attributes"] = defaultdict(list, {"face": [{"score": 0.9}]})
+    restored = TrackerUpdate.from_json(update.to_json())
+    assert restored.state["attributes"] == {"face": [{"score": 0.9}]}
+
+
+def test_media_manifest_roundtrip_and_canonical_persistence() -> None:
+    database = SqliteExtDatabase(":memory:")
+    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest)
+    database.bind(models)
+    database.create_tables(models)
+    update = _update()
+    update = TrackerUpdate.from_json(
+        update.to_json().replace(
+            '"media":[]',
+            '"media":[{"byte_size":3,"camera_id":"face_camera",'
+            '"codec":"jpeg","end_time":1.0,"event_id":"producer-trace-id",'
+            '"expiry_unix_ms":4102444800000,"media_id":"abc",'
+            '"media_type":"snapshot","sha256":"abc","start_time":1.0}]',
+        )
+    )
+    TrackerCanonicalStore(database).accept(update)
+    row = EdgeMediaManifest.get_by_id("abc")
+    assert row.event_id == update.event_id
+    assert row.byte_size == 3
+    database.close()
+
+
+def test_canonical_store_reconstructs_active_lifecycle() -> None:
+    database = SqliteExtDatabase(":memory:")
+    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest)
+    database.bind(models)
+    database.create_tables(models)
+    store = TrackerCanonicalStore(database)
+    store.accept(_update(TrackerOperation.START, sequence=1))
+    assert list(store.active_lifecycles("edge-local").values()) == [
+        "producer-trace-id"
+    ]
+    store.accept(_update(TrackerOperation.END, sequence=2))
+    assert store.active_lifecycles("edge-local") == {}
+    database.close()
+
+
 def test_journal_replay_and_exact_ack(tmp_path: Path) -> None:
     journal = TrackerJournal(tmp_path / "journal.db")
     persisted = journal.append(_update(sequence=0))
@@ -102,3 +154,11 @@ def test_entrypoint_only_delegates_to_runtime_main() -> None:
     source = Path("src/extension/tracker/app.py").read_text(encoding="utf-8")
     assert source.count("from extension.tracker.runtime import main") == 1
     assert "CameraMaintainer" not in source
+
+
+def test_tracker_maintainer_uses_one_grpc_response_api() -> None:
+    """Prevent grpc.aio UsageError from mixing read and iterator styles."""
+    source = Path("src/extension/tracker/transport.py").read_text(encoding="utf-8")
+    assert "async for raw in call" not in source
+    assert "raw = await call.read()" in source
+    assert "if raw is aio.EOF" in source

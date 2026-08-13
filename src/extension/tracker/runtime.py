@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import multiprocessing as mp
@@ -11,9 +12,11 @@ import queue
 import signal
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, fields, replace
 from enum import StrEnum
 from multiprocessing import Queue
 from multiprocessing.managers import SyncManager
@@ -37,6 +40,7 @@ from frigate.domain.camera.state import CameraState
 from frigate.domain.ptz.autotrack import DispatcherProtocol, PtzAutoTrackerThread
 from frigate.domain.ptz.onvif import OnvifController
 from frigate.domain.record.record import RecordProcess
+from frigate.domain.record.clip import materialize_recording_clip
 from frigate.domain.track.tracked_object import TrackedObject
 from frigate.infrastructure.comms.detections_updater import (
     DetectionPublisher,
@@ -68,6 +72,22 @@ class BoundingBox:
 
 
 @dataclass(frozen=True, slots=True)
+class MediaManifest:
+    """Describe edge-owned media without transferring bytes through events."""
+
+    media_id: str
+    event_id: str
+    camera_id: str
+    media_type: str
+    codec: str
+    start_time: float
+    end_time: float
+    byte_size: int
+    sha256: str
+    expiry_unix_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class TrackerUpdate:
     node_id: str
     node_epoch: str
@@ -92,6 +112,7 @@ class TrackerUpdate:
     speed: float | None = None
     motion: dict[str, Any] = field(default_factory=dict)
     region: dict[str, Any] = field(default_factory=dict)
+    media: tuple[MediaManifest, ...] = ()
 
     @property
     def trace_id(self) -> str:
@@ -99,8 +120,14 @@ class TrackerUpdate:
         return self.event_id
 
     def to_json(self) -> str:
-        value = asdict(self)
+        # Avoid dataclasses.asdict(): native tracker state may contain defaultdicts.
+        value = {item.name: getattr(self, item.name) for item in fields(self)}
         value["operation"] = self.operation.value
+        value["bbox"] = {item.name: getattr(self.bbox, item.name) for item in fields(self.bbox)}
+        value["media"] = [
+            {item.name: getattr(manifest, item.name) for item in fields(manifest)}
+            for manifest in self.media
+        ]
         return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
     @classmethod
@@ -108,10 +135,126 @@ class TrackerUpdate:
         data = json.loads(value)
         data["operation"] = TrackerOperation(data["operation"])
         data["bbox"] = BoundingBox(**data["bbox"])
+        data["media"] = tuple(
+            MediaManifest(**manifest) for manifest in data.get("media", ())
+        )
         for key in ("score_history", "current_zones", "entered_zones"):
             data[key] = tuple(data.get(key, ()))
         data["path"] = tuple(tuple(item) for item in data.get("path", ()))
         return cls(**data)
+
+
+class EdgeMediaStore:
+    """Materialize and serve tracker-owned evidence outside Frigate main."""
+
+    def __init__(self, root: str | Path, config: FrigateConfig) -> None:
+        self.root = Path(root) / "edge-media"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.config = config
+        self._paths: dict[str, Path] = {}
+        self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tracker_media")
+        self._futures: set[Future[MediaManifest | None]] = set()
+
+    def _register(
+        self,
+        path: Path,
+        update: TrackerUpdate,
+        media_type: str,
+        codec: str,
+        start_time: float,
+        end_time: float,
+    ) -> MediaManifest:
+        media_id = uuid.uuid4().hex
+        content = path.read_bytes()
+        manifest = MediaManifest(
+            media_id=media_id,
+            event_id=update.event_id,
+            camera_id=update.camera_id,
+            media_type=media_type,
+            codec=codec,
+            start_time=start_time,
+            end_time=end_time,
+            byte_size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            expiry_unix_ms=int((time.time() + 3600) * 1000),
+        )
+        with self._lock:
+            self._paths[media_id] = path
+        return manifest
+
+    def snapshot(self, update: TrackerUpdate, obj: TrackedObject) -> MediaManifest | None:
+        if not should_save_snapshot(self.config, update.camera_id, obj):
+            return None
+        image, frame_time = obj.get_img_bytes(
+            ext="jpg",
+            timestamp=True,
+            bounding_box=True,
+            quality=self.config.cameras[update.camera_id].snapshots.quality,
+        )
+        if image is None:
+            return None
+        path = self.root / "snapshots" / f"{uuid.uuid4().hex}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(image)
+        timestamp = update.frame_time if frame_time is None else frame_time
+        return self._register(path, update, "snapshot", "jpeg", timestamp, timestamp)
+
+    def publish_end(
+        self,
+        update: TrackerUpdate,
+        obj: TrackedObject,
+        publish: Callable[[TrackerUpdate], TrackerUpdate],
+    ) -> None:
+        manifests = tuple(
+            manifest for manifest in (self.snapshot(update, obj),) if manifest is not None
+        )
+        start_time = float(obj.obj_data.get("start_time", update.frame_time))
+        path = self.root / "clips" / f"{uuid.uuid4().hex}.mp4"
+
+        def materialize() -> MediaManifest | None:
+            if not materialize_recording_clip(
+                self.config, update.camera_id, start_time, update.frame_time, path
+            ):
+                return None
+            return self._register(
+                path, update, "clip", "h264", start_time, update.frame_time
+            )
+
+        future = self._executor.submit(materialize)
+        with self._lock:
+            self._futures.add(future)
+
+        def complete(result: Future[MediaManifest | None]) -> None:
+            try:
+                clip = result.result()
+                media = manifests + ((clip,) if clip is not None else ())
+                publish(replace(update, media=media))
+            except (OSError, RuntimeError, ValueError):
+                logger.exception("Tracker media materialization failed event_id=%s", update.event_id)
+                publish(replace(update, media=manifests))
+            finally:
+                with self._lock:
+                    self._futures.discard(result)
+
+        future.add_done_callback(complete)
+
+    def read(self, media_id: str, offset: int, length: int | None) -> bytes:
+        if not media_id or any(character not in "0123456789abcdef" for character in media_id):
+            raise ValueError("invalid_media_id")
+        with self._lock:
+            path = self._paths.get(media_id)
+        if path is None:
+            raise FileNotFoundError(media_id)
+        size = path.stat().st_size
+        if offset < 0 or offset > size or (length is not None and length < 0):
+            raise ValueError("invalid_media_range")
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            return handle.read() if length is None else handle.read(length)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=True, cancel_futures=False)
 
 
 def should_save_snapshot(
@@ -276,6 +419,7 @@ class CameraTrackAdapter:
         camera: str,
         ptz: PtzAutoTrackerThread,
         publish: Callable[[TrackerUpdate], TrackerUpdate],
+        media: EdgeMediaStore | None = None,
     ) -> None:
         self.config = config
         self.node_id = node_id
@@ -283,6 +427,7 @@ class CameraTrackAdapter:
         self.camera = camera
         self.stream_epoch = uuid.uuid4().hex
         self.publish = publish
+        self.media = media
         self.frame_manager = SharedMemoryFrameManager()
         self.publisher = DetectionPublisher(DetectionTypeEnum.all.value)
         self.frame_seq = 0
@@ -329,7 +474,11 @@ class CameraTrackAdapter:
 
     def _end(self, camera: str, obj: TrackedObject, *_: object) -> None:
         apply_media_policy(self.config, camera, obj)
-        self._emit(TrackerOperation.END, obj)
+        update = self._update_value(TrackerOperation.END, obj)
+        if self.media is None:
+            self.publish(update)
+        else:
+            self.media.publish_end(update, obj, self.publish)
         self.event_ids.pop(str(obj.obj_data["id"]), None)
         if not obj.false_positive:
             self.ptz.end_object(camera, obj)
@@ -338,6 +487,11 @@ class CameraTrackAdapter:
         self.ptz.autotrack_object(camera, obj)
 
     def _emit(self, operation: TrackerOperation, obj: TrackedObject) -> None:
+        self.publish(self._update_value(operation, obj))
+
+    def _update_value(
+        self, operation: TrackerOperation, obj: TrackedObject
+    ) -> TrackerUpdate:
         data = obj.to_dict()
         track_id = str(obj.obj_data["id"])
         box = tuple(int(value) for value in data["box"])
@@ -354,8 +508,7 @@ class CameraTrackAdapter:
                 "region": {"boxes": tuple(self.regions)},
             }
         )
-        self.publish(
-            TrackerUpdate(
+        return TrackerUpdate(
                 self.node_id,
                 self.node_epoch,
                 self.camera,
@@ -379,7 +532,6 @@ class CameraTrackAdapter:
                 state["speed"],
                 state["motion"],
                 state["region"],
-            )
         )
 
     def close(self) -> None:
@@ -396,6 +548,7 @@ class TrackerRuntime:
         manager: SyncManager,
         stop_event: MpEvent,
         spool_dir: str | Path,
+        media_dir: str | Path = "/media/tracker",
     ) -> None:
         if (
             config.runtime.topology_role != "tracker"
@@ -422,6 +575,7 @@ class TrackerRuntime:
         database.create_tables(models, safe=True)
         database.close()
         self.journal = TrackerJournal(spool_root / "journal.db")
+        self.media = EdgeMediaStore(media_dir, config)
         for camera, camera_config in config.cameras.items():
             self.camera_metrics[camera] = CameraMetrics(manager)
             self.ptz_metrics[camera] = PTZMetrics(
@@ -471,6 +625,7 @@ class TrackerRuntime:
                 camera,
                 self.ptz,
                 publish,
+                self.media,
             )
         self.ptz.start()
         self.consumer.start()
@@ -528,6 +683,7 @@ class TrackerRuntime:
         self.recording.join(timeout=timeout)
         for adapter in self.adapters.values():
             adapter.close()
+        self.media.close()
         for detector in self.detectors.values():
             detector.stop()
         if self.detector_proxy is not None:
@@ -570,7 +726,7 @@ async def _run(args: argparse.Namespace) -> None:
     setup_logging(manager)
     stop_event = mp.Event()
     runtime = TrackerRuntime(
-        config, args.node_id, manager, stop_event, args.spool_dir
+        config, args.node_id, manager, stop_event, args.spool_dir, args.media_dir
     )
     loop = asyncio.get_running_loop()
     for signal_name in (signal.SIGINT, signal.SIGTERM):
@@ -582,6 +738,7 @@ async def _run(args: argparse.Namespace) -> None:
         tracker_config_fingerprint(config, args.node_id),
         runtime.camera_health,
         frozenset(args.allow_client),
+        runtime.media.read,
     )
     runtime.start(service.publish)
     server = await start_server(
