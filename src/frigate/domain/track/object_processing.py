@@ -15,17 +15,37 @@ from typing import Any, cast
 
 import cv2
 import numpy as np
+from extension.tracker.runtime import (
+    apply_media_policy,
+    publish_video_detection,
+    should_retain_recording,
+    should_save_snapshot,
+)
 from peewee import SQL, DoesNotExist
 
+from frigate.application.events.types import EventStateEnum, EventTypeEnum
+from frigate.const import (
+    FAST_QUEUE_TIMEOUT,
+    UPDATE_CAMERA_ACTIVITY,
+    UPSERT_REVIEW_SEGMENT,
+)
 from frigate.domain.camera.state import CameraState
-from frigate.infrastructure.comms.detections_updater import DetectionPublisher, DetectionTypeEnum
+from frigate.domain.ptz.autotrack import PtzAutoTrackerThread
+from frigate.domain.track.tracked_object import TrackedObject
+from frigate.infrastructure.comms.detections_updater import (
+    DetectionPublisher,
+    DetectionTypeEnum,
+)
 from frigate.infrastructure.comms.dispatcher import Dispatcher
 from frigate.infrastructure.comms.event_metadata_updater import (
     EventMetadataPublisher,
     EventMetadataSubscriber,
     EventMetadataTypeEnum,
 )
-from frigate.infrastructure.comms.events_updater import EventEndSubscriber, EventUpdatePublisher
+from frigate.infrastructure.comms.events_updater import (
+    EventEndSubscriber,
+    EventUpdatePublisher,
+)
 from frigate.infrastructure.comms.inter_process import InterProcessRequestor
 from frigate.infrastructure.config import (
     CameraMqttConfig,
@@ -35,17 +55,7 @@ from frigate.infrastructure.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
-from frigate.const import (
-    FAST_QUEUE_TIMEOUT,
-    UPDATE_CAMERA_ACTIVITY,
-    UPSERT_REVIEW_SEGMENT,
-)
-from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event, ReviewSegment, Timeline
-from frigate.domain.ptz.autotrack import PtzAutoTrackerThread
-from frigate.domain.track.tracked_object import TrackedObject
-from extension.tracker.domain.lifecycle import apply_media_policy, publish_video_detection
-from extension.tracker.domain.policy import should_retain_recording, should_save_snapshot
 from frigate.util.face_snapshot import (
     FACE_EVENT_STAGING_DIR,
     FaceRecognitionResult,
@@ -1146,7 +1156,8 @@ class TrackedObjectProcessor(threading.Thread):
                 if not update:
                     break
 
-                event_id, camera, _ = update
+                _, _, camera, event_data = update
+                event_id = str(event_data["id"])
                 self.camera_states[camera].finished(event_id)
 
         # shut down camera states

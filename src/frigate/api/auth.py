@@ -1100,7 +1100,7 @@ async def update_role(
 
 async def require_camera_access(
     camera_name: str | None = None,
-    request: Request | None = None,
+    request: Request = None,  # type: ignore[assignment]
 ):
     """Dependency to enforce camera access based on user role."""
     if request is None:
@@ -1213,7 +1213,7 @@ def deny_response_for_go2rtc_stream(
 
 async def require_go2rtc_stream_access(
     stream_name: str | None = None,
-    request: Request | None = None,
+    request: Request = None,  # type: ignore[assignment]
 ):
     """Dependency to enforce go2rtc stream access based on owning camera access."""
     if request is None:

@@ -819,7 +819,7 @@ class FrigateConfig(FrigateBaseModel):
             detector_config: BaseDetectorConfig = adapter.validate_python(model_dict)
 
             # users should not set model themselves
-            if detector_config.model:
+            if isinstance(detector, dict) and "model" in detector and detector_config.model:
                 logger.warning(
                     "The model key should be specified at the root level of the config, not under detectors. The nested model key will be ignored."
                 )

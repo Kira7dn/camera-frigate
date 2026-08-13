@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 
-from frigate.infrastructure.config import FrigateConfig
+from extension.topology.compiler import PlatformTopologyPlan
+
 from frigate.const import (
     CACHE_DIR,
     CLIPS_DIR,
@@ -19,15 +20,18 @@ from frigate.const import (
     THUMB_DIR,
     TRIGGER_DIR,
 )
-from frigate.models import Recordings, Regions, ReviewSegment
 from frigate.domain.object_detection.base import ObjectDetectProcess
-from extension.topology.compiler import PlatformTopologyPlan, compile_topology
+from frigate.infrastructure.config import FrigateConfig
+from frigate.models import Event, Recordings, Regions, ReviewSegment, Timeline
 from frigate.util.image import UntrackedSharedMemory
 
 logger = logging.getLogger(__name__)
 
 # Every process hosting CameraMaintainer/RecordProcess needs these model bindings.
 CAMERA_RUNTIME_MODELS = (Recordings, ReviewSegment, Regions)
+# CameraMaintainer reuses Frigate's historical-region projection, which reads
+# these local history models before processing the first frame.
+CAMERA_HISTORY_MODELS = (Event, Timeline)
 
 
 @dataclass(slots=True)
@@ -40,11 +44,10 @@ def camera_runtime_config(
     config: FrigateConfig,
     *,
     edge_node_id: str | None = None,
-    topology: PlatformTopologyPlan | None = None,
+    topology: PlatformTopologyPlan,
 ) -> FrigateConfig:
-    """Return the compiled camera ownership view consumed by all launchers."""
-    plan = topology or compile_topology(config)
-    return plan.camera_config(config, node_id=edge_node_id)
+    """Return the camera ownership view from the already compiled topology."""
+    return topology.camera_config(config, node_id=edge_node_id)
 
 
 def ensure_runtime_dirs(config: FrigateConfig) -> None:

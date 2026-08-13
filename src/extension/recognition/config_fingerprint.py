@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
+from extension.topology.fingerprint import canonical_json, fingerprint, model_value
 from frigate.infrastructure.config import FrigateConfig
 
 
@@ -13,7 +12,7 @@ def canonical_config_json(config: FrigateConfig) -> str:
     """Serialize only settings that affect recognition decisions or capacity."""
 
     def value(model: Any, *, exclude: Any = None) -> Any:
-        return json.loads(model.model_dump_json(exclude=exclude))
+        return model_value(model, exclude=exclude)
 
     recognition = value(config.recognition, exclude={"tls": {"key"}})
     payload = {
@@ -32,13 +31,8 @@ def canonical_config_json(config: FrigateConfig) -> str:
             for name, camera in sorted(config.cameras.items())
         },
     }
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return canonical_json(payload)
 
 
 def config_fingerprint(config_json: str) -> str:
-    return hashlib.sha256(config_json.encode("utf-8")).hexdigest()
+    return fingerprint(config_json)

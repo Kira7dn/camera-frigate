@@ -16,6 +16,7 @@ import cv2
 import grpc
 import numpy as np
 import pytz
+from extension.tracker.transport import resolve_event_media
 from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pathvalidate import sanitize_filename
@@ -34,16 +35,19 @@ from frigate.api.defs.query.media_query_parameters import (
     MediaMjpegFeedQueryParams,
 )
 from frigate.api.defs.tags import Tags
-from frigate.domain.camera.state import CameraState
-from frigate.infrastructure.config import FrigateConfig
-from frigate.infrastructure.config.camera.snapshots import SnapshotsConfig
+from frigate.application.events.canonical import CanonicalMediaStore
 from frigate.const import (
     CACHE_DIR,
     INSTALL_DIR,
     MAX_SEGMENT_DURATION,
     PREVIEW_FRAME_TYPE,
 )
-from frigate.application.events.canonical import CanonicalMediaStore
+from frigate.domain.camera.state import CameraState
+from frigate.domain.record.clip import prepare_recording_clip
+from frigate.domain.track.object_processing import TrackedObjectProcessor
+from frigate.infrastructure.config import FrigateConfig
+from frigate.infrastructure.config.camera.snapshots import SnapshotsConfig
+from frigate.infrastructure.output.preview import get_most_recent_preview_frame
 from frigate.models import (
     Event,
     EventEvidence,
@@ -52,10 +56,6 @@ from frigate.models import (
     Regions,
     ReviewSegment,
 )
-from frigate.infrastructure.output.preview import get_most_recent_preview_frame
-from frigate.domain.record.clip import prepare_recording_clip
-from frigate.domain.track.object_processing import TrackedObjectProcessor
-from extension.tracker.adapters.media import resolve_event_media
 from frigate.util.file import (
     get_event_snapshot_path,
     get_event_thumbnail_bytes,

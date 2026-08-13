@@ -20,6 +20,7 @@ from frigate.application.recognition.contracts import (
     TrackedObservation,
     TrackKey,
 )
+from extension.recognition import models
 from extension.recognition.models import FaceRecognitionModel
 from extension.recognition.threaded_client import ClientResult
 
@@ -128,6 +129,26 @@ def test_external_face_detector_bbox_matches_synchronous_pipeline() -> None:
     ) == synchronous._FaceRealTimeProcessor__detect_face(  # type: ignore[attr-defined]
         image, 0.5
     )
+
+
+def test_external_face_library_is_built_before_service_readiness(monkeypatch) -> None:
+    class Recognizer:
+        def __init__(self, config) -> None:
+            self.built = False
+
+        def build(self) -> None:
+            self.built = True
+
+    monkeypatch.setattr(models, "ArcFaceRecognizer", Recognizer)
+    monkeypatch.setattr(FaceRecognitionModel, "_build_detector", lambda self: None)
+    fake_config = SimpleNamespace(
+        face_recognition=SimpleNamespace(model_size="large"),
+        objects=SimpleNamespace(all_objects={"face"}),
+    )
+
+    model = FaceRecognitionModel(fake_config)
+
+    assert model.recognizer.built is True
 
 
 def test_external_face_model_matches_synchronous_crop_and_result() -> None:

@@ -9,11 +9,12 @@ import signal
 import uuid
 from pathlib import Path
 
-from frigate.infrastructure.config import FrigateConfig
+from extension.topology.loader import PlatformConfigLoader
 from frigate.application.recognition.core import RecognitionCore
 from frigate.application.recognition.executor import AsyncRecognitionExecutor
 from frigate.application.recognition.face import FacePolicy
 from frigate.application.recognition.lpr import LprPolicy
+from frigate.infrastructure.config import FrigateConfig
 
 from . import health_pb2
 from .config_fingerprint import canonical_config_json, config_fingerprint
@@ -37,8 +38,12 @@ def _arguments() -> argparse.Namespace:
 
 
 def _load_config(path: str) -> FrigateConfig:
-    with Path(path).open("r", encoding="utf-8") as config_file:
-        return FrigateConfig.parse(config_file)
+    config = PlatformConfigLoader.load_runtime(path)
+    # The dedicated service is inference-only. Canonical Event/SQLite ownership
+    # stays in Frigate main, so model construction must never depend on the
+    # main database mount being present or writable.
+    config.database.path = ":memory:"
+    return config
 
 
 async def serve(arguments: argparse.Namespace) -> None:

@@ -13,8 +13,17 @@ from typing import Any, cast
 
 from peewee import DoesNotExist
 
+from frigate.application.events.types import (
+    EventStateEnum,
+    EventTypeEnum,
+    RegenerateDescriptionEnum,
+)
+from frigate.application.genai import GenAIClientManager
 from frigate.infrastructure.comms.config_updater import ConfigSubscriber
-from frigate.infrastructure.comms.detections_updater import DetectionSubscriber, DetectionTypeEnum
+from frigate.infrastructure.comms.detections_updater import (
+    DetectionSubscriber,
+    DetectionTypeEnum,
+)
 from frigate.infrastructure.comms.embeddings_updater import (
     EmbeddingsRequestEnum,
     EmbeddingsResponder,
@@ -24,7 +33,10 @@ from frigate.infrastructure.comms.event_metadata_updater import (
     EventMetadataSubscriber,
     EventMetadataTypeEnum,
 )
-from frigate.infrastructure.comms.events_updater import EventEndSubscriber, EventUpdateSubscriber
+from frigate.infrastructure.comms.events_updater import (
+    EventEndSubscriber,
+    EventUpdateSubscriber,
+)
 from frigate.infrastructure.comms.inter_process import InterProcessRequestor
 from frigate.infrastructure.comms.recordings_updater import (
     RecordingsDataSubscriber,
@@ -37,6 +49,7 @@ from frigate.infrastructure.config.camera.updater import (
     CameraConfigUpdateSubscriber,
 )
 from frigate.infrastructure.config.classification import ObjectClassificationType
+from frigate.infrastructure.config.recognition import RecognitionRuntimeEnum
 from frigate.infrastructure.data_processing.common.license_plate.model import (
     LicensePlateModelRunner,
 )
@@ -44,9 +57,15 @@ from frigate.infrastructure.data_processing.post.api import PostProcessorApi
 from frigate.infrastructure.data_processing.post.audio_transcription import (
     AudioTranscriptionPostProcessor,
 )
-from frigate.infrastructure.data_processing.post.object_descriptions import ObjectDescriptionProcessor
-from frigate.infrastructure.data_processing.post.review_descriptions import ReviewDescriptionProcessor
-from frigate.infrastructure.data_processing.post.semantic_trigger import SemanticTriggerProcessor
+from frigate.infrastructure.data_processing.post.object_descriptions import (
+    ObjectDescriptionProcessor,
+)
+from frigate.infrastructure.data_processing.post.review_descriptions import (
+    ReviewDescriptionProcessor,
+)
+from frigate.infrastructure.data_processing.post.semantic_trigger import (
+    SemanticTriggerProcessor,
+)
 from frigate.infrastructure.data_processing.real_time.api import RealTimeProcessorApi
 from frigate.infrastructure.data_processing.real_time.external_recognition import (
     ExternalRecognitionProcessor,
@@ -55,16 +74,12 @@ from frigate.infrastructure.data_processing.real_time.face import FaceRealTimePr
 from frigate.infrastructure.data_processing.real_time.license_plate import (
     LicensePlateRealTimeProcessor,
 )
-from frigate.infrastructure.data_processing.types import DataProcessorMetrics, PostProcessDataEnum
-from frigate.infrastructure.db.sqlitevecq import SqliteVecQueueDatabase
-from frigate.application.events.types import (
-    EventStateEnum,
-    EventTypeEnum,
-    RegenerateDescriptionEnum,
+from frigate.infrastructure.data_processing.types import (
+    DataProcessorMetrics,
+    PostProcessDataEnum,
 )
-from frigate.application.genai import GenAIClientManager
+from frigate.infrastructure.db.sqlitevecq import SqliteVecQueueDatabase
 from frigate.models import Event, Recordings, ReviewSegment, Trigger
-from extension.topology.compiler import compile_topology
 from frigate.types import TrackedObjectUpdateTypesEnum
 from frigate.util.builtin import serialize
 from frigate.util.file import get_event_thumbnail_bytes
@@ -179,7 +194,9 @@ class EmbeddingMaintainer(threading.Thread):
         self._recognition_stream_epoch = uuid.uuid4().hex
         self._custom_processor_types: tuple[type[Any], type[Any]] | None = None
 
-        external_recognition = compile_topology(self.config).recognition_external
+        external_recognition = (
+            self.config.recognition.runtime is RecognitionRuntimeEnum.EXTERNAL
+        )
 
         # model runners to share between realtime and post processors
         if self.config.lpr.enabled and not external_recognition:
@@ -221,7 +238,9 @@ class EmbeddingMaintainer(threading.Thread):
             logger.debug("FaceRealTimeProcessor initialized successfully")
 
         if self.config.classification.bird.enabled:
-            from frigate.infrastructure.data_processing.real_time.bird import BirdRealTimeProcessor
+            from frigate.infrastructure.data_processing.real_time.bird import (
+                BirdRealTimeProcessor,
+            )
 
             self.realtime_processors.append(
                 BirdRealTimeProcessor(
@@ -675,7 +694,12 @@ class EmbeddingMaintainer(threading.Thread):
             if ended == None:
                 break
 
-            event_id, camera, updated_db = ended
+            if len(ended) == 4:
+                _, _, camera, event_data = ended
+                event_id = str(event_data["id"])
+                updated_db = True
+            else:
+                event_id, camera, updated_db = ended
 
             # expire in realtime processors
             for processor in self.realtime_processors:

@@ -10,6 +10,7 @@ from typing import Any
 
 import grpc
 from cryptography.hazmat.primitives import serialization
+from extension.tracker.transport import resolve_media_id
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response
 from filelock import FileLock, Timeout
@@ -21,15 +22,14 @@ from ruamel.yaml import YAML
 from frigate.api.auth import allow_any_authenticated, allow_public, require_role
 from frigate.api.config_util import swap_runtime_config
 from frigate.api.defs.tags import Tags
+from frigate.application.notifications.media import load_snapshot
+from frigate.const import CONFIG_DIR
 from frigate.infrastructure.config import FrigateConfig
 from frigate.infrastructure.config.camera.notification import (
     NotificationConfig,
     NotificationRuleConfig,
 )
-from frigate.const import CONFIG_DIR
 from frigate.models import User
-from frigate.application.notifications.media import load_snapshot
-from extension.tracker.adapters.media import resolve_media_id
 from frigate.util.config import find_config_file
 
 logger = logging.getLogger(__name__)

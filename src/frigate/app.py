@@ -1,6 +1,7 @@
 ﻿import datetime
 import logging
 import multiprocessing as mp
+import multiprocessing.shared_memory
 import os
 import secrets
 import shutil
@@ -12,12 +13,30 @@ from pathlib import Path
 
 import psutil
 import uvicorn
-import multiprocessing.shared_memory
+from extension.topology.compiler import compile_topology
+from extension.tracker.transport import TrackerMaintainer
 from peewee_migrate import Router
 from playhouse.sqlite_ext import SqliteExtDatabase
 
 from frigate.api.auth import hash_password
 from frigate.api.fastapi_app import create_fastapi_app
+from frigate.application.embeddings import EmbeddingProcess, EmbeddingsContext
+from frigate.application.events.audio import AudioProcessor
+from frigate.application.events.cleanup import EventCleanup
+from frigate.application.events.maintainer import EventProcessor
+from frigate.application.jobs.export import reap_stale_exports
+from frigate.application.jobs.motion_search import stop_all_motion_search_jobs
+from frigate.application.notifications.client import NotificationClient
+from frigate.application.review.review import ReviewProcess
+from frigate.application.stats.emitter import StatsEmitter
+from frigate.application.stats.util import stats_init
+from frigate.const import (
+    CONFIG_DIR,
+)
+from frigate.debug_replay import (
+    DebugReplayManager,
+    cleanup_replay_cameras,
+)
 from frigate.domain.camera import CameraMetrics, PTZMetrics
 from frigate.domain.camera.maintainer import CameraMaintainer
 from frigate.domain.camera.runtime import (
@@ -26,6 +45,13 @@ from frigate.domain.camera.runtime import (
     ensure_runtime_dirs,
     start_detector_runtime,
 )
+from frigate.domain.object_detection.base import ObjectDetectProcess
+from frigate.domain.ptz.autotrack import PtzAutoTrackerThread
+from frigate.domain.ptz.onvif import OnvifController
+from frigate.domain.record.cleanup import RecordingCleanup
+from frigate.domain.record.export import migrate_exports
+from frigate.domain.record.record import RecordProcess
+from frigate.domain.track.object_processing import TrackedObjectProcessor
 from frigate.infrastructure.comms.base_communicator import Communicator
 from frigate.infrastructure.comms.dispatcher import Dispatcher
 from frigate.infrastructure.comms.event_metadata_updater import EventMetadataPublisher
@@ -38,21 +64,9 @@ from frigate.infrastructure.config.camera.updater import CameraConfigUpdatePubli
 from frigate.infrastructure.config.config import FrigateConfig
 from frigate.infrastructure.config.holder import ConfigHolder
 from frigate.infrastructure.config.profile_manager import ProfileManager
-from frigate.const import (
-    CONFIG_DIR,
-)
 from frigate.infrastructure.data_processing.types import DataProcessorMetrics
 from frigate.infrastructure.db.sqlitevecq import SqliteVecQueueDatabase
-from frigate.debug_replay import (
-    DebugReplayManager,
-    cleanup_replay_cameras,
-)
-from frigate.application.embeddings import EmbeddingProcess, EmbeddingsContext
-from frigate.application.events.audio import AudioProcessor
-from frigate.application.events.cleanup import EventCleanup
-from frigate.application.events.maintainer import EventProcessor
-from frigate.application.jobs.export import reap_stale_exports
-from frigate.application.jobs.motion_search import stop_all_motion_search_jobs
+from frigate.infrastructure.output.output import OutputProcess
 from frigate.log import _stop_logging
 from frigate.models import (
     EdgeMediaManifest,
@@ -72,22 +86,8 @@ from frigate.models import (
     Trigger,
     User,
 )
-from frigate.application.notifications.client import NotificationClient
-from frigate.domain.object_detection.base import ObjectDetectProcess
-from frigate.infrastructure.output.output import OutputProcess
-from frigate.domain.ptz.autotrack import PtzAutoTrackerThread
-from frigate.domain.ptz.onvif import OnvifController
-from frigate.domain.record.cleanup import RecordingCleanup
-from frigate.domain.record.export import migrate_exports
-from frigate.domain.record.record import RecordProcess
-from frigate.application.review.review import ReviewProcess
-from extension.topology.compiler import compile_topology
-from frigate.application.stats.emitter import StatsEmitter
-from frigate.application.stats.util import stats_init
 from frigate.storage import StorageMaintainer
 from frigate.timeline import TimelineProcessor
-from frigate.domain.track.object_processing import TrackedObjectProcessor
-from extension.tracker.adapters.frigate import TrackerMaintainer
 from frigate.util.builtin import empty_and_close_queue
 from frigate.util.process import FrigateProcess
 from frigate.util.services import set_file_limit
@@ -729,10 +729,8 @@ class FrigateApp:
         if self.onvif_controller:
             self.onvif_controller.close()
 
-        # ensure the detectors are done
         for detector in self.detectors.values():
             detector.stop()
-
         empty_and_close_queue(self.detection_queue)
         logger.info("Detection queue closed")
 
@@ -783,6 +781,5 @@ class FrigateApp:
             shm = self.detection_shms.pop()
             shm.close()
             shm.unlink()
-
         _stop_logging()
         self.metrics_manager.shutdown()

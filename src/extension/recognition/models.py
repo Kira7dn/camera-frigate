@@ -137,6 +137,9 @@ class FaceRecognitionModel:
             self.recognizer = FaceNetRecognizer(config)
         else:
             self.recognizer = ArcFaceRecognizer(config)
+        # Warm the face library before readiness. Lazy construction starts the
+        # worker on the first frame, which can outlive a finite replay and make
+        # every observation return no result.
         self.recognizer.build()
 
     def recognize(

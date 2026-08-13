@@ -68,4 +68,4 @@ does not synthesize records or draw replacement boxes.
 The repository uses one parameterized runtime harness. Run the normal local topology
 with `tools/tests/e2e/run_platform_runtime_test.py`; the external convenience entrypoint
 `tools/tests/e2e/run_external_recognition_runtime_test.py` calls the same harness with
-`--topology external`.
+`--topology recognition`.
