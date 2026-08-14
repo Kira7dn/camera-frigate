@@ -30,16 +30,16 @@ from extension.tracker.runtime import (
     TrackerUpdate,
     tracker_config_fingerprint,
 )
+from frigate.application.events.canonical import EventAggregator
 from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.infrastructure.comms.events_updater import EventUpdatePublisher
 from frigate.infrastructure.config import FrigateConfig
-from frigate.models import EdgeMediaManifest, EventObservation, TrackerJournalEntry
+from frigate.models import EdgeMediaManifest, TrackerJournalEntry
 from frigate.util.image import SharedMemoryFrameManager
 
 logger = logging.getLogger(__name__)
 SERVICE = "camera.tracker.v1.TrackerService"
 PROTOCOL_VERSION = 2
-MAX_IN_FLIGHT = 64
 
 
 def _encode(value: Mapping[str, Any]) -> bytes:
@@ -80,6 +80,7 @@ class TrackerService:
         camera_health: Callable[[], tuple[dict[str, object], ...]],
         allowed_clients: frozenset[str] = frozenset(),
         media_reader: Callable[[str, int, int | None], bytes] | None = None,
+        active_lifecycles: Callable[[], int] = lambda: 0,
     ) -> None:
         self.node_id = node_id
         self.node_epoch = node_epoch
@@ -88,20 +89,12 @@ class TrackerService:
         self.camera_health = camera_health
         self.allowed_clients = allowed_clients
         self.media_reader = media_reader
+        self.active_lifecycles = active_lifecycles
         self.degraded = False
-        self.active_lifecycles: set[tuple[str, str, str]] = set()
-        self._lock = threading.Lock()
 
     def publish(self, update: TrackerUpdate) -> TrackerUpdate:
         """Persist an update; the connection sender drains the outbox."""
-        persisted = self.journal.append(update)
-        with self._lock:
-            identity = (update.camera_id, update.stream_epoch, update.track_id)
-            if update.operation is TrackerOperation.START:
-                self.active_lifecycles.add(identity)
-            elif update.operation is TrackerOperation.END:
-                self.active_lifecycles.discard(identity)
-        return persisted
+        return self.journal.append(update)
 
     async def _authorize(self, context: aio.ServicerContext) -> None:
         if not self.allowed_clients:
@@ -129,9 +122,9 @@ class TrackerService:
                 "health": {
                     "ready": True,
                     "degraded": self.degraded,
-                    "pending_ack": self.journal.pending_count,
+                    "pending_ack": self.journal.pending_count_for_epoch(self.node_epoch),
                     "pinned_evidence": 0,
-                    "active_lifecycles": len(self.active_lifecycles),
+                    "active_lifecycles": self.active_lifecycles(),
                 },
                 "cameras": list(cameras),
             }
@@ -163,33 +156,28 @@ class TrackerService:
             acknowledged = int(start.get("ack_sequence", 0))
             self.journal.acknowledge_through(self.node_epoch, acknowledged)
             while True:
-                cursor = acknowledged
-                batch: list[TrackerUpdate] = []
-                for _ in range(MAX_IN_FLIGHT):
-                    update = self.journal.next_pending(self.node_epoch, cursor)
-                    if update is None:
-                        break
-                    batch.append(update)
-                    cursor = update.journal_sequence
+                update = self.journal.next_pending(self.node_epoch, acknowledged)
+                if update is not None:
+                    sequence = update.journal_sequence
                     yield _encode({"type": "update", "update": update.to_json()})
-                if batch:
-                    target = batch[-1].journal_sequence
-                    while acknowledged < target:
+                    while acknowledged < sequence:
                         request = _decode(await request_task)
                         request_task = asyncio.ensure_future(anext(requests))
                         if request.get("type") == "ack":
-                            sequence = int(request.get("ack_sequence", -1))
-                            if sequence < acknowledged or sequence > target:
-                                raise TrackerIngestError("tracker_ack_sequence_mismatch")
+                            ack_sequence = int(request.get("ack_sequence", -1))
+                            if ack_sequence != sequence:
+                                raise TrackerIngestError(
+                                    "tracker_ack_sequence_mismatch"
+                                )
                             self.journal.acknowledge_through(
-                                self.node_epoch, sequence
+                                self.node_epoch, ack_sequence
                             )
-                            acknowledged = sequence
+                            acknowledged = ack_sequence
                         elif request.get("type") != "health":
                             raise TrackerIngestError("tracker_ack_without_update")
                     continue
                 done, _ = await asyncio.wait(
-                    (request_task,), return_when=asyncio.FIRST_COMPLETED
+                    (request_task,), timeout=0.1, return_when=asyncio.FIRST_COMPLETED
                 )
                 if request_task in done:
                     try:
@@ -343,6 +331,7 @@ class TrackerCanonicalStore:
 
     def __init__(self, database: Any) -> None:
         self.database = database
+        self.aggregator = EventAggregator()
 
     def accept(self, update: TrackerUpdate) -> None:
         payload = json.loads(update.to_json())
@@ -374,7 +363,7 @@ class TrackerCanonicalStore:
                 accepted_at=now,
             )
             key = f"{update.node_id}:{update.node_epoch}:{update.journal_sequence}"
-            EventObservation.create(
+            self.aggregator.observe(
                 observation_id=hashlib.sha256(key.encode()).hexdigest(),
                 event_id=update.event_id,
                 kind={
@@ -386,7 +375,6 @@ class TrackerCanonicalStore:
                 frame_time=update.frame_time,
                 evidence_id=None,
                 payload=payload,
-                expires_at=now + datetime.timedelta(days=2),
             )
             for manifest in update.media:
                 existing_media = EdgeMediaManifest.get_or_none(
@@ -545,6 +533,10 @@ class TrackerMaintainer(threading.Thread):
         data.setdefault("end_time", None)
         if update.operation is TrackerOperation.END:
             data["end_time"] = update.frame_time
+        if any(item.media_type == "clip" for item in update.media):
+            data["has_clip"] = True
+        if any(item.media_type == "snapshot" for item in update.media):
+            data["has_snapshot"] = True
         return data
 
     @staticmethod
@@ -631,9 +623,11 @@ class TrackerMaintainer(threading.Thread):
     async def _run_node(self, node_id: str) -> None:
         node = self.config.tracker[node_id]
         ingest = self.ingests[node_id]
+        connect_failure_logged = False
         while not self.stop_event.is_set() and not self.shutdown.is_set():
             channel: aio.Channel | None = None
             heartbeat: asyncio.Task[None] | None = None
+            session_started = False
             try:
                 tls = await asyncio.to_thread(self._tls, node)
                 credentials = grpc.ssl_channel_credentials(
@@ -679,6 +673,9 @@ class TrackerMaintainer(threading.Thread):
                         }
                     )
                 )
+                session_started = True
+                connect_failure_logged = False
+                logger.info("Tracker node %s connected", node_id)
 
                 async def send_heartbeat() -> None:
                     while True:
@@ -703,9 +700,25 @@ class TrackerMaintainer(threading.Thread):
                             }
                         )
                     )
-            except (grpc.RpcError, OSError, RuntimeError, ValueError):
+            except (grpc.RpcError, OSError, RuntimeError, ValueError) as error:
                 if not self.stop_event.is_set() and not self.shutdown.is_set():
-                    logger.exception("Tracker node %s disconnected", node_id)
+                    if session_started:
+                        logger.warning(
+                            "Tracker node %s connection interrupted; retrying: %s",
+                            node_id,
+                            error,
+                        )
+                    elif not connect_failure_logged:
+                        logger.warning(
+                            "Tracker node %s is not ready; retrying: %s",
+                            node_id,
+                            error,
+                        )
+                        connect_failure_logged = True
+                    else:
+                        logger.debug(
+                            "Tracker node %s is still unavailable: %s", node_id, error
+                        )
             finally:
                 if heartbeat is not None:
                     heartbeat.cancel()

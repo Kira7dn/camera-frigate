@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,8 +10,10 @@ from types import SimpleNamespace
 import pytest
 from extension.tracker.runtime import (
     BoundingBox,
+    CameraTrackAdapter,
     TrackerJournal,
     TrackerOperation,
+    TrackerRuntime,
     TrackerUpdate,
     tracker_config_fingerprint,
 )
@@ -22,7 +25,12 @@ from extension.tracker.transport import (
 from playhouse.sqlite_ext import SqliteExtDatabase
 from playhouse.sqliteq import SqliteQueueDatabase
 
-from frigate.models import EdgeMediaManifest, EventObservation, TrackerJournalEntry
+from frigate.models import (
+    EdgeMediaManifest,
+    Event,
+    EventObservation,
+    TrackerJournalEntry,
+)
 
 
 def _update(
@@ -81,7 +89,7 @@ def test_update_json_accepts_native_defaultdict_state() -> None:
 
 def test_media_manifest_roundtrip_and_canonical_persistence() -> None:
     database = SqliteExtDatabase(":memory:")
-    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest)
+    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest, Event)
     database.bind(models)
     database.create_tables(models)
     update = _update()
@@ -103,7 +111,7 @@ def test_media_manifest_roundtrip_and_canonical_persistence() -> None:
 
 def test_canonical_store_reconstructs_active_lifecycle() -> None:
     database = SqliteExtDatabase(":memory:")
-    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest)
+    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest, Event)
     database.bind(models)
     database.create_tables(models)
     store = TrackerCanonicalStore(database)
@@ -118,7 +126,7 @@ def test_canonical_store_reconstructs_active_lifecycle() -> None:
 
 def test_canonical_store_supports_main_sqlite_queue_database(tmp_path: Path) -> None:
     database_path = tmp_path / "main.db"
-    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest)
+    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest, Event)
     schema_database = SqliteExtDatabase(database_path)
     with schema_database.bind_ctx(models):
         schema_database.create_tables(models)
@@ -144,10 +152,26 @@ def test_journal_replay_and_exact_ack(tmp_path: Path) -> None:
     journal = TrackerJournal(tmp_path / "journal.db")
     persisted = journal.append(_update(sequence=0))
     assert persisted.journal_sequence == 1
-    assert journal.replay() == (persisted,)
-    assert not journal.acknowledge(1, "wrong", persisted.node_epoch)
-    assert journal.acknowledge(1, persisted.event_id, persisted.node_epoch)
-    assert journal.replay() == ()
+    assert journal.next_pending(persisted.node_epoch) == persisted
+    assert journal.acknowledge_through(persisted.node_epoch, 0) == 0
+    assert journal.acknowledge_through(persisted.node_epoch, 1) == 1
+    assert journal.next_pending(persisted.node_epoch) is None
+    journal.close()
+
+
+def test_journal_health_counts_only_current_epoch(tmp_path: Path) -> None:
+    journal = TrackerJournal(tmp_path / "journal.db")
+    stale = _update(sequence=0)
+    current = TrackerUpdate.from_json(stale.to_json())
+    object.__setattr__(current, "node_epoch", "epoch-current")
+    journal.append(stale)
+    persisted = journal.append(current)
+
+    assert journal.pending_count == 2
+    assert journal.pending_count_for_epoch("epoch-current") == 1
+    journal.acknowledge_through("epoch-current", persisted.journal_sequence)
+    assert journal.pending_count_for_epoch("epoch-current") == 0
+    assert journal.pending_count == 1
     journal.close()
 
 
@@ -175,6 +199,86 @@ def test_launcher_probe_uses_private_json_grpc_contract() -> None:
     launcher = Path("../deploy/run.ps1").read_text(encoding="utf-8")
     assert "/camera.tracker.v1.TrackerService/GetCapabilities" in launcher
     assert "extension.tracker.service.v1" not in launcher
+
+
+def test_tracker_startup_retry_is_not_reported_as_a_disconnect_traceback() -> None:
+    source = Path("src/extension/tracker/transport.py").read_text(encoding="utf-8")
+    assert "session_started = False" in source
+    assert "Tracker node %s is not ready; retrying" in source
+    assert 'logger.exception("Tracker node %s disconnected"' not in source
+
+
+def test_finite_source_finalize_ends_each_active_track_once() -> None:
+    adapter = CameraTrackAdapter.__new__(CameraTrackAdapter)
+    first = SimpleNamespace()
+    second = SimpleNamespace()
+    adapter.camera = "car_camera"
+    adapter.state = SimpleNamespace(tracked_objects={"1": first, "2": second})
+    adapter.event_ids = {"1": "event-one"}
+    ended: list[tuple[str, object]] = []
+    adapter._end = lambda camera, obj: ended.append((camera, obj))  # type: ignore[method-assign]
+    adapter.finalize()
+    assert ended == [("car_camera", first)]
+
+
+def test_tracker_writes_completion_after_all_sources_and_media_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = TrackerRuntime.__new__(TrackerRuntime)
+    runtime.node_id = "edge-local"
+    runtime.node_epoch = "epoch-current"
+    runtime.adapters = {
+        "face_camera": SimpleNamespace(
+            finalize=lambda: None, event_ids={"1": "face-event"}
+        ),
+        "car_camera": SimpleNamespace(
+            finalize=lambda: None, event_ids={"2": "car-event"}
+        ),
+    }
+    runtime.finalized_sources = set()
+    runtime.source_idle_polls = {camera: 1 for camera in runtime.adapters}
+    runtime.session_complete_written = False
+    runtime.media = SimpleNamespace(
+        pending_count=lambda: 0,
+        completed_event_ids=lambda: ("car-event", "face-event"),
+    )
+    for camera in runtime.adapters:
+        (tmp_path / f"{camera}.end").write_text("1.0\n", encoding="utf-8")
+    monkeypatch.setenv("PASSAGE_SOURCE_START_DIR", str(tmp_path))
+
+    runtime._finalize_ended_sources()
+
+    marker = json.loads(
+        (tmp_path / "tracker-session-complete.json").read_text(encoding="utf-8")
+    )
+    assert marker["node_epoch"] == "epoch-current"
+    assert marker["cameras"] == ["car_camera", "face_camera"]
+    assert marker["events"] == ["car-event", "face-event"]
+
+
+def test_tracker_reports_active_lifecycles_from_owned_adapters() -> None:
+    runtime = TrackerRuntime.__new__(TrackerRuntime)
+    runtime.adapters = {
+        "face_camera": SimpleNamespace(event_ids={"1": "face-event"}),
+        "car_camera": SimpleNamespace(event_ids={}),
+    }
+
+    assert runtime.active_lifecycle_count() == 1
+
+
+def test_tracker_clip_temporary_path_keeps_mp4_suffix() -> None:
+    source = Path("src/extension/tracker/runtime.py").read_text(encoding="utf-8")
+    assert 'f"{clip_path.stem}.tmp{clip_path.suffix}"' in source
+    assert 'command.extend(["-t",' in source
+    assert 'with_suffix(".mp4.tmp")' not in source
+
+
+def test_tracker_omits_unconsumed_continuous_media_pipeline() -> None:
+    source = Path("src/extension/tracker/runtime.py").read_text(encoding="utf-8")
+    assert "RecordProcess" not in source
+    assert "OutputProcess" not in source
+    assert "DetectionPublisher" not in source
+    assert "camera_config.record.enabled = False" in source
 
 
 def test_entrypoint_only_delegates_to_runtime_main() -> None:

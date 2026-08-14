@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 import queue
@@ -8,16 +10,20 @@ from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any, cast
 
+from frigate.application.events.canonical import EventAggregator
+from frigate.application.events.types import EventStateEnum, EventTypeEnum
+from frigate.const import CLIPS_DIR, REPLAY_CAMERA_PREFIX, THUMB_DIR
 from frigate.infrastructure.comms.event_metadata_updater import (
     EventMetadataPublisher,
     EventMetadataSubscriber,
     EventMetadataTypeEnum,
 )
-from frigate.infrastructure.comms.events_updater import EventEndPublisher, EventUpdateSubscriber
+from frigate.infrastructure.comms.events_updater import (
+    EventEndPublisher,
+    EventUpdateSubscriber,
+)
 from frigate.infrastructure.config import FrigateConfig
 from frigate.infrastructure.config.classification import ObjectClassificationType
-from frigate.const import CLIPS_DIR, REPLAY_CAMERA_PREFIX, THUMB_DIR
-from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.models import Event
 from frigate.util.builtin import to_relative_box
 from frigate.util.face_snapshot import (
@@ -109,6 +115,7 @@ class EventProcessor(threading.Thread):
         self.face_completion_queue = face_completion_queue or Queue(maxsize=8)
         self.event_update_queue = event_update_queue
         self.tracker_commit_queue = tracker_commit_queue
+        self.event_aggregator = EventAggregator()
 
         self.event_receiver = EventUpdateSubscriber()
         self.event_end_publisher = EventEndPublisher()
@@ -145,6 +152,7 @@ class EventProcessor(threading.Thread):
             open_event.save(only=[Event.end_time])
 
         while not self.stop_event.is_set():
+            self.event_aggregator.finalize_due()
             self._flush_face_completions()
             self._drain_face_snapshot_requests()
             self._retry_deferred_face_jobs()
@@ -208,6 +216,11 @@ class EventProcessor(threading.Thread):
                 self.events_in_process[id] = event_data
                 return
 
+            previous = self.events_in_process[id]
+            for field in ("sub_label", "recognized_license_plate"):
+                if event_data.get(field) is None and previous.get(field) is not None:
+                    event_data[field] = previous[field]
+
             self.handle_object_detection(event_type, camera, event_data)
         elif source_type == EventTypeEnum.api:
             self.timeline_queue.put(
@@ -252,6 +265,57 @@ class EventProcessor(threading.Thread):
                 self.face_snapshot_metrics["released"] += len(paths)
             elif topic.endswith(EventMetadataTypeEnum.face_snapshot_commit.value):
                 self._accept_snapshot_payload(payload)
+            elif topic.endswith(EventMetadataTypeEnum.sub_label.value):
+                event_id, sub_label, score = payload
+                self._apply_recognition_metadata(
+                    str(event_id), "sub_label", sub_label, score, "face"
+                )
+            elif topic.endswith(EventMetadataTypeEnum.attribute.value):
+                event_id, field_name, field_value, score = payload
+                if str(field_name) == "recognized_license_plate":
+                    self._apply_recognition_metadata(
+                        str(event_id), str(field_name), field_value, score, "lpr"
+                    )
+
+    def _apply_recognition_metadata(
+        self,
+        event_id: str,
+        field_name: str,
+        value: str | None,
+        score: float | None,
+        kind: str,
+    ) -> None:
+        """Persist recognition when edge tracking owns the active object lifecycle."""
+        active = self.events_in_process.get(event_id)
+        if active is not None:
+            active[field_name] = (value, score)
+
+        event = Event.get_or_none(Event.id == event_id)
+        if event is not None:
+            data = cast(dict[str, Any], event.data or {})
+            data[field_name] = value
+            data[f"{field_name}_score"] = score
+            event.data = data
+            if field_name == "sub_label":
+                event.sub_label = cast(Any, value)
+            event.save()
+
+        encoded = json.dumps(
+            [kind, event_id, field_name, value, score],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        observation_payload = {"score": score}
+        if kind == "face":
+            observation_payload["sub_label"] = value
+        else:
+            observation_payload["plate"] = value
+        self.event_aggregator.observe(
+            observation_id=hashlib.sha256(encoded.encode()).hexdigest(),
+            event_id=event_id,
+            kind=kind,
+            payload=observation_payload,
+        )
 
     def _accept_snapshot_payload(self, payload: dict[str, Any]) -> None:
         try:

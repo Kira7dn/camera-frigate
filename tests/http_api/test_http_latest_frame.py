@@ -1,6 +1,6 @@
 import os
 import shutil
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import cv2
 import numpy as np
@@ -91,17 +91,17 @@ class TestHttpLatestFrame(BaseTestHttp):
 
     def test_latest_frame_no_preview_found(self):
         camera = "front_door"
-        # 1. Mock frame processor to return None
         self.app.detected_frames_processor.get_current_frame.return_value = None
+        self.app.detected_frames_processor.get_current_frame_time.return_value = 0.0
+        self.app.camera_error_image = None
 
-        # 2. No preview file created
+        with patch("frigate.api.media.glob.glob", return_value=[]):
+            with AuthTestClient(self.app, raise_server_exceptions=False) as client:
+                response = client.get(f"/{camera}/latest.webp")
 
-        with AuthTestClient(self.app) as client:
-            response = client.get(f"/{camera}/latest.webp")
-            # Should fall back to camera-error.jpg (which might not exist in test env, but let's see)
-            # If camera-error.jpg is not found, it returns 500 "Unable to get valid frame" in latest_frame
-            # OR it uses request.app.camera_error_image if already loaded.
-
-            # Since we didn't provide camera-error.jpg, it might 500 if glob fails or return 500 if frame is None.
-            assert response.status_code in [200, 500]
-            assert "X-Frigate-Offline" not in response.headers
+        assert response.status_code == 500
+        assert response.json() == {
+            "success": False,
+            "message": "Unable to get valid frame",
+        }
+        assert "X-Frigate-Offline" not in response.headers

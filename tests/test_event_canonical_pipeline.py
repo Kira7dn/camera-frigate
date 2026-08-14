@@ -16,6 +16,7 @@ from frigate.application.events.canonical import (
     EvidenceMismatch,
     RenderSpec,
 )
+from frigate.application.events.maintainer import EventProcessor
 from frigate.models import (
     Event,
     EventEvidence,
@@ -89,6 +90,31 @@ def create_evidence(
         ],
         technical={"detector": "lpr"},
     )
+
+
+def test_edge_event_processor_persists_recognition_metadata(canonical_db):
+    _, root = canonical_db
+    event = create_event("edge-event")
+    processor = EventProcessor.__new__(EventProcessor)
+    processor.events_in_process = {event.id: {}}
+    processor.event_aggregator = EventAggregator(CanonicalMediaStore(root / "artifacts"))
+
+    processor._apply_recognition_metadata(
+        event.id, "recognized_license_plate", "ABC123", 0.97, "lpr"
+    )
+    processor._apply_recognition_metadata(event.id, "sub_label", "Alice", 0.98, "face")
+    processor.event_aggregator.finalize(event.id)
+
+    event = Event.get_by_id(event.id)
+    assert processor.events_in_process[event.id]["recognized_license_plate"] == (
+        "ABC123",
+        0.97,
+    )
+    assert event.data["recognized_license_plate"] == "ABC123"
+    assert event.data["recognized_license_plate_score"] == 0.97
+    assert event.sub_label == "Alice"
+    assert event.canonical_plate == "ABC123"
+    assert event.canonical_sub_label == "Alice"
 
 
 def test_rejects_bbox_from_another_evidence(canonical_db):

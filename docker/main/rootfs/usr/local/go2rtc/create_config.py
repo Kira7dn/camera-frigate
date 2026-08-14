@@ -9,7 +9,7 @@ from typing import Any
 from ruamel.yaml import YAML
 
 sys.path.insert(0, "/opt/frigate")
-from frigate.config.env import substitute_frigate_vars
+from frigate.infrastructure.config.env import substitute_frigate_vars
 from frigate.const import (
     BIRDSEYE_PIPE,
     LIBAVFORMAT_VERSION_MAJOR,

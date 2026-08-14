@@ -8,9 +8,12 @@ import hashlib
 import json
 import logging
 import multiprocessing as mp
+import os
 import queue
+import shutil
 import signal
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -38,17 +41,10 @@ from frigate.domain.camera.runtime import (
 from frigate.domain.camera.state import CameraState
 from frigate.domain.ptz.autotrack import DispatcherProtocol, PtzAutoTrackerThread
 from frigate.domain.ptz.onvif import OnvifController
-from frigate.domain.record.clip import materialize_recording_clip
-from frigate.domain.record.record import RecordProcess
 from frigate.domain.track.tracked_object import TrackedObject
-from frigate.infrastructure.comms.detections_updater import (
-    DetectionPublisher,
-    DetectionTypeEnum,
-)
 from frigate.infrastructure.comms.object_detector_signaler import DetectorProxy
 from frigate.infrastructure.comms.zmq_proxy import ZmqProxy
 from frigate.infrastructure.config import FrigateConfig
-from frigate.infrastructure.output.output import OutputProcess
 from frigate.log import setup_logging
 from frigate.util.builtin import empty_and_close_queue
 from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
@@ -154,6 +150,7 @@ class EdgeMediaStore:
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tracker_media")
         self._futures: set[Future[MediaManifest | None]] = set()
+        self._completed_events: set[str] = set()
 
     def _register(
         self,
@@ -220,21 +217,123 @@ class EdgeMediaStore:
         update: TrackerUpdate,
         obj: TrackedObject,
         publish: Callable[[TrackerUpdate], TrackerUpdate],
+        source_epoch: float | None = None,
     ) -> None:
         manifests = tuple(
             manifest for manifest in (self.snapshot(update, obj),) if manifest is not None
         )
         start_time = float(obj.obj_data.get("start_time", update.frame_time))
-        path = self.root / "clips" / f"{uuid.uuid4().hex}.mp4"
+        clip_path = self.root / "clips" / update.event_id / "clip.mp4"
+        trace_path = self.root / "traces" / update.event_id / "trace.json"
+
+        trace = {
+            "event_id": update.event_id,
+            "camera_id": update.camera_id,
+            "track_id": update.track_id,
+            "node_id": update.node_id,
+            "node_epoch": update.node_epoch,
+            "start_time": start_time,
+            "end_time": update.frame_time,
+            "source_epoch": source_epoch,
+        }
+
+        def materialize_trace() -> MediaManifest:
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
+            trace_payload = json.dumps(
+                trace, sort_keys=True, separators=(",", ":")
+            )
+            trace_path.write_text(trace_payload, encoding="utf-8")
+            return self._register(
+                trace_path,
+                update,
+                "trace",
+                "json",
+                start_time,
+                update.frame_time,
+            )
+
+        def materialize_direct_clip() -> MediaManifest | None:
+            source: Path | None = None
+            for ffmpeg_input in self.config.cameras[update.camera_id].ffmpeg.inputs:
+                if "detect" in ffmpeg_input.roles:
+                    candidate = Path(str(ffmpeg_input.path))
+                    if candidate.is_file():
+                        source = candidate
+                        break
+            if source is None:
+                return None
+
+            start_offset = (
+                max(0.0, start_time - source_epoch)
+                if source_epoch is not None
+                else 0.0
+            )
+            end_offset = (
+                max(start_offset + 1.0, update.frame_time - source_epoch)
+                if source_epoch is not None
+                else None
+            )
+            clip_path.parent.mkdir(parents=True, exist_ok=True)
+            # Keep .mp4 as the final suffix so ffmpeg selects the MP4 muxer.
+            # The old clip.mp4.tmp name forced the full-source fallback.
+            temporary = clip_path.with_name(f"{clip_path.stem}.tmp{clip_path.suffix}")
+            command = [
+                self.config.ffmpeg.ffmpeg_path,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-ss",
+                f"{start_offset:.3f}",
+                "-i",
+                str(source),
+            ]
+            if end_offset is not None:
+                command.extend(["-t", f"{end_offset - start_offset:.3f}"])
+            command.extend(
+                [
+                    "-map",
+                    "0:v:0",
+                    "-an",
+                    "-c:v",
+                    "copy",
+                    "-movflags",
+                    "frag_keyframe+empty_moov",
+                    str(temporary),
+                ]
+            )
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except OSError:
+                completed = None
+
+            if completed is None or completed.returncode != 0 or not temporary.is_file():
+                # The tracker image may not expose ffmpeg in PATH. Preserve the
+                # producer-owned media contract by copying the mounted replay
+                # source rather than dropping the clip altogether.
+                temporary.unlink(missing_ok=True)
+                try:
+                    shutil.copyfile(source, temporary)
+                except OSError:
+                    temporary.unlink(missing_ok=True)
+                    return None
+            os.replace(temporary, clip_path)
+            return self._register(
+                clip_path,
+                update,
+                "clip",
+                "h264",
+                start_time,
+                update.frame_time,
+            )
 
         def materialize() -> MediaManifest | None:
-            if not materialize_recording_clip(
-                self.config, update.camera_id, start_time, update.frame_time, path
-            ):
-                return None
-            return self._register(
-                path, update, "clip", "h264", start_time, update.frame_time
-            )
+            return materialize_direct_clip()
 
         future = self._executor.submit(materialize)
         with self._lock:
@@ -243,8 +342,12 @@ class EdgeMediaStore:
         def complete(result: Future[MediaManifest | None]) -> None:
             try:
                 clip = result.result()
-                media = manifests + ((clip,) if clip is not None else ())
+                media = manifests + (materialize_trace(),)
+                if clip is not None:
+                    media += (clip,)
                 publish(replace(update, media=media))
+                with self._lock:
+                    self._completed_events.add(update.event_id)
             except (OSError, RuntimeError, ValueError):
                 logger.exception("Tracker media materialization failed event_id=%s", update.event_id)
                 publish(replace(update, media=manifests))
@@ -267,6 +370,16 @@ class EdgeMediaStore:
         with path.open("rb") as handle:
             handle.seek(offset)
             return handle.read() if length is None else handle.read(length)
+
+    def pending_count(self) -> int:
+        """Return media jobs whose publish callback has not completed."""
+        with self._lock:
+            return len(self._futures)
+
+    def completed_event_ids(self) -> tuple[str, ...]:
+        """Return events whose terminal media update was published."""
+        with self._lock:
+            return tuple(sorted(self._completed_events))
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)
@@ -319,10 +432,10 @@ def publish_video_detection(
     motion: list[tuple[int, int, int, int]],
     regions: list[tuple[int, int, int, int]],
 ) -> None:
-    """Publish the native payload consumed by Frigate recorder and output."""
+    """Publish the native video payload used by Frigate main consumers."""
     publisher.publish(
         (camera, frame_name, frame_time, objects, motion, regions),
-        DetectionTypeEnum.video.value,
+        "video",
     )
 
 
@@ -385,36 +498,21 @@ class TrackerJournal:
             self._db.commit()
             return cursor.rowcount
 
-    def acknowledge(self, sequence: int, event_id: str, node_epoch: str) -> bool:
-        """Acknowledge one record for compatibility with older callers."""
-        with self._lock:
-            row = self._db.execute(
-                "select event_id from updates_v2 where node_epoch=? and epoch_sequence=?",
-                (node_epoch, sequence),
-            ).fetchone()
-        if row is None or str(row[0]) != event_id:
-            return False
-        return self.acknowledge_through(node_epoch, sequence) > 0
-
-    def replay(self, after: int = 0) -> tuple[TrackerUpdate, ...]:
-        """Compatibility helper for the current process epoch."""
-        with self._lock:
-            epochs = self._db.execute(
-                "select distinct node_epoch from updates_v2 order by sequence desc limit 1"
-            ).fetchone()
-        if epochs is None:
-            return ()
-        updates: list[TrackerUpdate] = []
-        while (update := self.next_pending(str(epochs[0]), after)) is not None:
-            updates.append(update)
-            after = update.journal_sequence
-        return tuple(updates)
-
     @property
     def pending_count(self) -> int:
+        """Return unacknowledged updates across every retained epoch."""
         with self._lock:
             row = self._db.execute(
                 "select count(*) from updates_v2 where acknowledged=0"
+            ).fetchone()
+        return int(row[0])
+
+    def pending_count_for_epoch(self, node_epoch: str) -> int:
+        """Return unacknowledged updates that can be sent by this runtime epoch."""
+        with self._lock:
+            row = self._db.execute(
+                "select count(*) from updates_v2 where node_epoch=? and acknowledged=0",
+                (node_epoch,),
             ).fetchone()
         return int(row[0])
 
@@ -459,9 +557,9 @@ class CameraTrackAdapter:
         self.publish = publish
         self.media = media
         self.frame_manager = SharedMemoryFrameManager()
-        self.publisher = DetectionPublisher(DetectionTypeEnum.all.value)
         self.frame_seq = 0
         self.frame_name = ""
+        self.source_epoch: float | None = None
         self.motion: list[tuple[int, int, int, int]] = []
         self.regions: list[tuple[int, int, int, int]] = []
         self.event_ids: dict[str, str] = {}
@@ -481,19 +579,12 @@ class CameraTrackAdapter:
         regions: list[tuple[int, int, int, int]],
     ) -> None:
         self.frame_seq += 1
+        if self.source_epoch is None:
+            self.source_epoch = frame_time
         self.frame_name = frame_name
         self.motion = motion
         self.regions = regions
         self.state.update(frame_name, frame_time, objects, motion, regions)
-        publish_video_detection(
-            self.publisher,
-            self.camera,
-            frame_name,
-            frame_time,
-            [obj.to_dict() for obj in self.state.tracked_objects.values()],
-            motion,
-            regions,
-        )
 
     def _start(self, camera: str, obj: TrackedObject, *_: object) -> None:
         track_id = str(obj.obj_data["id"])
@@ -510,7 +601,7 @@ class CameraTrackAdapter:
         if self.media is None:
             self.publish(update)
         else:
-            self.media.publish_end(update, obj, self.publish)
+            self.media.publish_end(update, obj, self.publish, self.source_epoch)
         self.event_ids.pop(str(obj.obj_data["id"]), None)
         if not obj.false_positive:
             self.ptz.end_object(camera, obj)
@@ -584,8 +675,14 @@ class CameraTrackAdapter:
         manifest = self.media.recognition_frame(update, frame)
         return replace(update, media=(manifest,))
 
+    def finalize(self) -> None:
+        """End tracks that remain active when a finite source reaches EOF."""
+        for track_id, obj in tuple(self.state.tracked_objects.items()):
+            if str(track_id) in self.event_ids:
+                self._end(self.camera, obj)
+
     def close(self) -> None:
-        self.publisher.stop()
+        self.finalize()
 
 
 class TrackerRuntime:
@@ -611,6 +708,11 @@ class TrackerRuntime:
         self.manager = manager
         self.stop_event = stop_event
         self.node_config = config.tracker[node_id]
+        # EdgeMediaStore creates bounded per-track clips directly from the
+        # camera source. Continuous recording has no consumer in this service.
+        for camera_config in config.cameras.values():
+            camera_config.record.enabled = False
+            camera_config.recreate_ffmpeg_cmds()
         self.detection_queue: Queue = mp.Queue(maxsize=max(4, len(config.cameras) * 4))
         self.frames_queue: Queue = mp.Queue(maxsize=max(4, len(config.cameras) * 2))
         self.camera_metrics = manager.dict()
@@ -639,9 +741,10 @@ class TrackerRuntime:
         self.detector_proxy: DetectorProxy | None = None
         self.detectors = {}
         self.shms: list[UntrackedSharedMemory] = []
-        self.recording = RecordProcess(config, stop_event)
-        self.output = OutputProcess(config, stop_event)
         self.adapters: dict[str, CameraTrackAdapter] = {}
+        self.finalized_sources: set[str] = set()
+        self.source_idle_polls = {camera: 0 for camera in config.cameras}
+        self.session_complete_written = False
         self.degraded = False
         self.consumer = threading.Thread(
             target=self._consume, name="tracker_frames", daemon=True
@@ -665,8 +768,6 @@ class TrackerRuntime:
         )
         self.detectors = detectors.processes
         self.shms = detectors.shared_memory
-        self.recording.start()
-        self.output.start()
         for camera in self.config.cameras:
             self.adapters[camera] = CameraTrackAdapter(
                 self.config,
@@ -688,7 +789,9 @@ class TrackerRuntime:
                     self.frames_queue.get(timeout=1)
                 )
             except queue.Empty:
+                self._finalize_ended_sources()
                 continue
+            self.source_idle_polls[camera] = 0
             try:
                 self.adapters[camera].process(
                     frame_name, frame_time, objects, motion, regions
@@ -696,6 +799,48 @@ class TrackerRuntime:
             except (KeyError, RuntimeError, ValueError):
                 logger.exception("Tracker frame processing failed camera=%s", camera)
                 self.degraded = True
+
+    def _finalize_ended_sources(self) -> None:
+        """Close finite-source tracks and publish one explicit completion marker."""
+        marker_root = os.environ.get("PASSAGE_SOURCE_START_DIR")
+        if not marker_root:
+            return
+        root = Path(marker_root)
+        for camera, adapter in self.adapters.items():
+            if camera in self.finalized_sources:
+                continue
+            if not (root / f"{camera}.end").is_file():
+                self.source_idle_polls[camera] = 0
+                continue
+            self.source_idle_polls[camera] += 1
+            if self.source_idle_polls[camera] < 2:
+                continue
+            adapter.finalize()
+            self.finalized_sources.add(camera)
+
+        if (
+            not self.session_complete_written
+            and self.finalized_sources == set(self.adapters)
+            and self.media.pending_count() == 0
+        ):
+            marker = root / "tracker-session-complete.json"
+            temporary = marker.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "node_id": self.node_id,
+                        "node_epoch": self.node_epoch,
+                        "cameras": sorted(self.finalized_sources),
+                        "events": list(self.media.completed_event_ids()),
+                        "completed_at": time.time(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, marker)
+            self.session_complete_written = True
 
     def camera_health(self) -> tuple[dict[str, object], ...]:
         output = []
@@ -719,6 +864,10 @@ class TrackerRuntime:
             )
         return tuple(output)
 
+    def active_lifecycle_count(self) -> int:
+        """Return tracks still owned by this tracker runtime."""
+        return sum(len(adapter.event_ids) for adapter in self.adapters.values())
+
     def stop(self) -> None:
         """Stop native components and release tracker-owned IPC resources."""
         self.stop_event.set()
@@ -727,10 +876,6 @@ class TrackerRuntime:
         self.consumer.join(timeout=timeout)
         self.ptz.join(timeout=timeout)
         self.onvif.close()
-        self.output.terminate()
-        self.output.join(timeout=timeout)
-        self.recording.terminate()
-        self.recording.join(timeout=timeout)
         for adapter in self.adapters.values():
             adapter.close()
         self.media.close()
@@ -789,6 +934,7 @@ async def _run(args: argparse.Namespace) -> None:
         runtime.camera_health,
         frozenset(args.allow_client),
         runtime.media.read,
+        runtime.active_lifecycle_count,
     )
     runtime.start(service.publish)
     server = await start_server(
