@@ -4,21 +4,24 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from playhouse.sqlite_ext import SqliteExtDatabase
 from extension.tracker.runtime import (
     BoundingBox,
-    MediaManifest,
     TrackerJournal,
     TrackerOperation,
     TrackerUpdate,
+    tracker_config_fingerprint,
 )
 from extension.tracker.transport import (
     TrackerCanonicalStore,
     TrackerHostIngest,
     TrackerIngestError,
 )
+from playhouse.sqlite_ext import SqliteExtDatabase
+from playhouse.sqliteq import SqliteQueueDatabase
+
 from frigate.models import EdgeMediaManifest, EventObservation, TrackerJournalEntry
 
 
@@ -113,6 +116,30 @@ def test_canonical_store_reconstructs_active_lifecycle() -> None:
     database.close()
 
 
+def test_canonical_store_supports_main_sqlite_queue_database(tmp_path: Path) -> None:
+    database_path = tmp_path / "main.db"
+    models = (TrackerJournalEntry, EventObservation, EdgeMediaManifest)
+    schema_database = SqliteExtDatabase(database_path)
+    with schema_database.bind_ctx(models):
+        schema_database.create_tables(models)
+    schema_database.close()
+    database = SqliteQueueDatabase(database_path, autostart=True)
+    with database.bind_ctx(models):
+        TrackerCanonicalStore(database).accept(_update())
+        assert TrackerJournalEntry.get().event_id == "producer-trace-id"
+        assert EventObservation.get().event_id == "producer-trace-id"
+    database.stop()
+
+
+def test_tracker_event_state_preserves_native_region_box() -> None:
+    update = _update()
+    update.state["region"] = [0, 1, 20, 30]
+    update.state["detection_regions"] = [[0, 0, 50, 50]]
+    restored = TrackerUpdate.from_json(update.to_json())
+    assert restored.state["region"] == [0, 1, 20, 30]
+    assert restored.state["detection_regions"] == [[0, 0, 50, 50]]
+
+
 def test_journal_replay_and_exact_ack(tmp_path: Path) -> None:
     journal = TrackerJournal(tmp_path / "journal.db")
     persisted = journal.append(_update(sequence=0))
@@ -162,3 +189,17 @@ def test_tracker_maintainer_uses_one_grpc_response_api() -> None:
     assert "async for raw in call" not in source
     assert "raw = await call.read()" in source
     assert "if raw is aio.EOF" in source
+
+
+def test_tracker_handshake_uses_compiler_owned_topology_revision() -> None:
+    revision = "a" * 64
+    main = SimpleNamespace(
+        runtime=SimpleNamespace(topology_role="main", topology_revision=revision),
+        tracker={"edge-local": object()},
+    )
+    edge = SimpleNamespace(
+        runtime=SimpleNamespace(topology_role="tracker", topology_revision=revision),
+        tracker={"edge-local": object()},
+    )
+    assert tracker_config_fingerprint(main, "edge-local") == revision
+    assert tracker_config_fingerprint(edge, "edge-local") == revision

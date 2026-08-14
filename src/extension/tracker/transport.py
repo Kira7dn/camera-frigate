@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
@@ -20,6 +21,7 @@ from typing import Any
 
 import grpc
 from grpc import aio
+from playhouse.sqliteq import SqliteQueueDatabase
 
 from extension.topology.compiler import PlatformTopologyPlan
 from extension.tracker.runtime import (
@@ -32,9 +34,12 @@ from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.infrastructure.comms.events_updater import EventUpdatePublisher
 from frigate.infrastructure.config import FrigateConfig
 from frigate.models import EdgeMediaManifest, EventObservation, TrackerJournalEntry
+from frigate.util.image import SharedMemoryFrameManager
 
 logger = logging.getLogger(__name__)
 SERVICE = "camera.tracker.v1.TrackerService"
+PROTOCOL_VERSION = 2
+MAX_IN_FLIGHT = 64
 
 
 def _encode(value: Mapping[str, Any]) -> bytes:
@@ -86,12 +91,9 @@ class TrackerService:
         self.degraded = False
         self.active_lifecycles: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
-        self._subscribers: set[
-            tuple[asyncio.AbstractEventLoop, asyncio.Queue[TrackerUpdate]]
-        ] = set()
 
     def publish(self, update: TrackerUpdate) -> TrackerUpdate:
-        """Persist then notify connected main runtimes."""
+        """Persist an update; the connection sender drains the outbox."""
         persisted = self.journal.append(update)
         with self._lock:
             identity = (update.camera_id, update.stream_epoch, update.track_id)
@@ -99,20 +101,7 @@ class TrackerService:
                 self.active_lifecycles.add(identity)
             elif update.operation is TrackerOperation.END:
                 self.active_lifecycles.discard(identity)
-            subscribers = tuple(self._subscribers)
-        for loop, updates in subscribers:
-            loop.call_soon_threadsafe(self._offer, updates, persisted)
         return persisted
-
-    @staticmethod
-    def _offer(
-        updates: asyncio.Queue[TrackerUpdate], update: TrackerUpdate
-    ) -> None:
-        try:
-            updates.put_nowait(update)
-        except asyncio.QueueFull:
-            # The durable journal is replayed by the next health request.
-            pass
 
     async def _authorize(self, context: aio.ServicerContext) -> None:
         if not self.allowed_clients:
@@ -133,6 +122,7 @@ class TrackerService:
         return _encode(
             {
                 "schema_version": 1,
+                "protocol_version": PROTOCOL_VERSION,
                 "node_id": self.node_id,
                 "node_epoch": self.node_epoch,
                 "config_hash": self.config_hash,
@@ -151,27 +141,55 @@ class TrackerService:
         self, requests: AsyncIterator[bytes], context: aio.ServicerContext
     ) -> AsyncIterator[bytes]:
         await self._authorize(context)
-        loop = asyncio.get_running_loop()
-        updates: asyncio.Queue[TrackerUpdate] = asyncio.Queue(maxsize=256)
-        subscriber = (loop, updates)
-        with self._lock:
-            self._subscribers.add(subscriber)
         yield _encode(
             {
                 "type": "hello",
+                "protocol_version": PROTOCOL_VERSION,
                 "node_id": self.node_id,
                 "node_epoch": self.node_epoch,
                 "config_hash": self.config_hash,
             }
         )
         request_task = asyncio.ensure_future(anext(requests))
-        update_task = asyncio.create_task(updates.get())
-        last_sent = 0
         try:
+            start = _decode(await request_task)
+            request_task = asyncio.ensure_future(anext(requests))
+            if (
+                start.get("type") != "session_start"
+                or int(start.get("protocol_version", 0)) != PROTOCOL_VERSION
+                or str(start.get("node_epoch")) != self.node_epoch
+            ):
+                raise TrackerIngestError("tracker_session_mismatch")
+            acknowledged = int(start.get("ack_sequence", 0))
+            self.journal.acknowledge_through(self.node_epoch, acknowledged)
             while True:
+                cursor = acknowledged
+                batch: list[TrackerUpdate] = []
+                for _ in range(MAX_IN_FLIGHT):
+                    update = self.journal.next_pending(self.node_epoch, cursor)
+                    if update is None:
+                        break
+                    batch.append(update)
+                    cursor = update.journal_sequence
+                    yield _encode({"type": "update", "update": update.to_json()})
+                if batch:
+                    target = batch[-1].journal_sequence
+                    while acknowledged < target:
+                        request = _decode(await request_task)
+                        request_task = asyncio.ensure_future(anext(requests))
+                        if request.get("type") == "ack":
+                            sequence = int(request.get("ack_sequence", -1))
+                            if sequence < acknowledged or sequence > target:
+                                raise TrackerIngestError("tracker_ack_sequence_mismatch")
+                            self.journal.acknowledge_through(
+                                self.node_epoch, sequence
+                            )
+                            acknowledged = sequence
+                        elif request.get("type") != "health":
+                            raise TrackerIngestError("tracker_ack_without_update")
+                    continue
                 done, _ = await asyncio.wait(
-                    (request_task, update_task),
-                    return_when=asyncio.FIRST_COMPLETED,
+                    (request_task,), return_when=asyncio.FIRST_COMPLETED
                 )
                 if request_task in done:
                     try:
@@ -180,37 +198,14 @@ class TrackerService:
                         return
                     request_task = asyncio.ensure_future(anext(requests))
                     kind = request.get("type")
-                    if kind in {"hello", "health"}:
-                        after = (
-                            int(request.get("replay_after_sequence", 0))
-                            if kind == "hello"
-                            else last_sent
-                        )
-                        for update in self.journal.replay(after):
-                            yield _encode(
-                                {"type": "update", "update": update.to_json()}
-                            )
-                            last_sent = update.journal_sequence
-                    elif kind == "ack":
-                        self.journal.acknowledge(
-                            int(request["journal_sequence"]),
-                            str(request["event_id"]),
-                            str(request["node_epoch"]),
-                        )
-                if update_task in done:
-                    update = update_task.result()
-                    update_task = asyncio.create_task(updates.get())
-                    if update.journal_sequence > last_sent:
-                        yield _encode(
-                            {"type": "update", "update": update.to_json()}
-                        )
-                        last_sent = update.journal_sequence
+                    if kind == "ack":
+                        sequence = int(request.get("ack_sequence", -1))
+                        if sequence <= acknowledged:
+                            continue
+                        raise TrackerIngestError("tracker_ack_without_update")
         finally:
             request_task.cancel()
-            update_task.cancel()
-            await asyncio.gather(request_task, update_task, return_exceptions=True)
-            with self._lock:
-                self._subscribers.discard(subscriber)
+            await asyncio.gather(request_task, return_exceptions=True)
 
     async def fetch_media(
         self, request: bytes, context: aio.ServicerContext
@@ -290,14 +285,17 @@ class TrackerHostIngest:
     ) -> None:
         self.camera_owners = dict(camera_owners)
         self.commit = commit
-        self.last_sequences: dict[str, int] = {}
+        self.last_sequences: dict[tuple[str, str], int] = {}
         self.active: dict[tuple[str, str, str, str], str] = {}
         self.accepted: dict[tuple[str, str, int], str] = {}
 
-    def seed(self, node_id: str, sequence: int) -> None:
-        self.last_sequences[node_id] = max(
-            self.last_sequences.get(node_id, 0), sequence
-        )
+    def start_epoch(self, node_id: str, node_epoch: str, sequence: int = 0) -> None:
+        self.last_sequences[(node_id, node_epoch)] = sequence
+        self.active = {
+            key: value
+            for key, value in self.active.items()
+            if key[0] != node_id
+        }
 
     def accept(self, update: TrackerUpdate) -> None:
         if self.camera_owners.get(update.camera_id) != update.node_id:
@@ -312,7 +310,9 @@ class TrackerHostIngest:
             if previous != update.event_id:
                 raise TrackerIngestError("sequence_event_conflict")
             return
-        expected = self.last_sequences.get(update.node_id, 0) + 1
+        expected = self.last_sequences.get(
+            (update.node_id, update.node_epoch), 0
+        ) + 1
         if update.journal_sequence != expected:
             raise TrackerIngestError("journal_sequence_gap")
         track_key = (
@@ -332,7 +332,9 @@ class TrackerHostIngest:
             self.active[track_key] = update.event_id
         elif update.operation is TrackerOperation.END:
             self.active.pop(track_key, None)
-        self.last_sequences[update.node_id] = update.journal_sequence
+        self.last_sequences[(update.node_id, update.node_epoch)] = (
+            update.journal_sequence
+        )
         self.accepted[accepted_key] = update.event_id
 
 
@@ -345,7 +347,12 @@ class TrackerCanonicalStore:
     def accept(self, update: TrackerUpdate) -> None:
         payload = json.loads(update.to_json())
         now = datetime.datetime.now(datetime.UTC)
-        with self.database.atomic():
+        transaction = (
+            nullcontext()
+            if isinstance(self.database, SqliteQueueDatabase)
+            else self.database.atomic()
+        )
+        with transaction:
             existing = TrackerJournalEntry.get_or_none(
                 (TrackerJournalEntry.node_id == update.node_id)
                 & (TrackerJournalEntry.node_epoch == update.node_epoch)
@@ -408,23 +415,29 @@ class TrackerCanonicalStore:
                     ),
                 )
 
-    def last_sequence(self, node_id: str) -> int:
+    def last_sequence(self, node_id: str, node_epoch: str | None = None) -> int:
+        predicate = TrackerJournalEntry.node_id == node_id
+        if node_epoch is not None:
+            predicate &= TrackerJournalEntry.node_epoch == node_epoch
         row = (
             TrackerJournalEntry.select(TrackerJournalEntry.journal_sequence)
-            .where(TrackerJournalEntry.node_id == node_id)
+            .where(predicate)
             .order_by(TrackerJournalEntry.journal_sequence.desc())
             .first()
         )
         return 0 if row is None else int(row.journal_sequence)
 
     def active_lifecycles(
-        self, node_id: str
+        self, node_id: str, node_epoch: str | None = None
     ) -> dict[tuple[str, str, str, str], str]:
         """Rebuild active tracks after a Frigate-main restart."""
         active: dict[tuple[str, str, str, str], str] = {}
+        predicate = TrackerJournalEntry.node_id == node_id
+        if node_epoch is not None:
+            predicate &= TrackerJournalEntry.node_epoch == node_epoch
         rows = (
             TrackerJournalEntry.select()
-            .where(TrackerJournalEntry.node_id == node_id)
+            .where(predicate)
             .order_by(TrackerJournalEntry.journal_sequence.asc())
         )
         for row in rows:
@@ -462,6 +475,7 @@ class TrackerMaintainer(threading.Thread):
         self.event_commit_queue = event_commit_queue
         self.stop_event = stop_event
         self.publisher = EventUpdatePublisher()
+        self.frame_manager = SharedMemoryFrameManager()
         self.shutdown = threading.Event()
         self.loop: asyncio.AbstractEventLoop | None = None
         self.channels: dict[str, aio.Channel] = {}
@@ -510,40 +524,108 @@ class TrackerMaintainer(threading.Thread):
                 "observed_in_frame": False,
             }
         )
+        region = data.get("region")
+        if not isinstance(region, list | tuple) or len(region) != 4:
+            regions = update.region.get("boxes", ())
+            region = next(
+                (
+                    candidate
+                    for candidate in regions
+                    if isinstance(candidate, list | tuple) and len(candidate) == 4
+                ),
+                [
+                    update.bbox.left,
+                    update.bbox.top,
+                    update.bbox.right,
+                    update.bbox.bottom,
+                ],
+            )
+            data["region"] = list(region)
         data.setdefault("start_time", update.frame_time)
         data.setdefault("end_time", None)
         if update.operation is TrackerOperation.END:
             data["end_time"] = update.frame_time
         return data
 
+    @staticmethod
+    def _unavailable_frame_name(update: TrackerUpdate) -> str:
+        """Return a valid missing SHM name for updates without transferred evidence."""
+        return (
+            f"tracker_unavailable_{update.node_id}_{update.journal_sequence}_"
+            f"{update.event_id}"
+        )
+
     def _commit(self, update: TrackerUpdate) -> None:
         node = self.config.tracker[update.node_id]
         receipt = uuid.uuid4().hex
+        frame_name = self._unavailable_frame_name(update)
+        created_frame = False
+        event_data = self._event_data(update)
+        evidence = next(
+            (item for item in update.media if item.media_type == "recognition_frame"),
+            None,
+        )
+        if evidence is not None:
+            if self.loop is None:
+                raise RuntimeError("tracker_media_unavailable")
+            future = asyncio.run_coroutine_threadsafe(
+                self.fetch_media(update.node_id, evidence.media_id), self.loop
+            )
+            content = future.result(timeout=node.deadline)
+            if (
+                len(content) != evidence.byte_size
+                or hashlib.sha256(content).hexdigest() != evidence.sha256
+            ):
+                raise TrackerIngestError("tracker_media_integrity_mismatch")
+            expected_size = int(
+                self.config.cameras[update.camera_id].frame_shape_yuv[0]
+                * self.config.cameras[update.camera_id].frame_shape_yuv[1]
+            )
+            if len(content) != expected_size:
+                raise TrackerIngestError("tracker_recognition_frame_size_mismatch")
+            frame_name = f"recognition_tracker_{uuid.uuid4().hex}"
+            frame_buffer = self.frame_manager.create(frame_name, len(content))
+            frame_buffer[:] = content
+            del frame_buffer
+            created_frame = True
+            event_data["_recognition_evidence_owned"] = True
+            event_data["observed_in_frame"] = True
         canonical = (
             EventTypeEnum.tracked_object,
             self._event_state(update),
             update.camera_id,
-            "",
-            self._event_data(update),
+            frame_name,
+            event_data,
         )
-        self.event_update_queue.put((*canonical, receipt), timeout=node.deadline)
-        self.publisher.publish(canonical)
-        deadline = time.monotonic() + node.deadline
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("tracker_event_commit_timeout")
-            try:
-                received, success, detail = self.event_commit_queue.get(
-                    timeout=remaining
-                )
-            except queue.Empty as error:
-                raise TimeoutError("tracker_event_commit_timeout") from error
-            if received != receipt:
-                raise TrackerIngestError("tracker_event_receipt_order_mismatch")
-            if not success:
-                raise TrackerIngestError(f"tracker_event_commit_failed:{detail}")
-            break
+        try:
+            self.event_update_queue.put((*canonical, receipt), timeout=node.deadline)
+            self.publisher.publish(canonical)
+            deadline = time.monotonic() + node.deadline
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("tracker_event_commit_timeout")
+                try:
+                    received, success, detail = self.event_commit_queue.get(
+                        timeout=remaining
+                    )
+                except queue.Empty as error:
+                    raise TimeoutError("tracker_event_commit_timeout") from error
+                if received != receipt:
+                    raise TrackerIngestError("tracker_event_receipt_order_mismatch")
+                if not success:
+                    raise TrackerIngestError(f"tracker_event_commit_failed:{detail}")
+                break
+        except Exception:
+            if created_frame:
+                self.frame_manager.delete(frame_name)
+            raise
+        else:
+            if created_frame:
+                # Keep the creator handle alive until the consumer acknowledges the
+                # event. Windows removes named shared memory when its last handle
+                # closes, while POSIX keeps it until unlink.
+                self.frame_manager.close(frame_name)
         self.store.accept(update)
 
     async def _run_node(self, node_id: str) -> None:
@@ -573,20 +655,27 @@ class TrackerMaintainer(threading.Thread):
                 )
                 call = connect()
                 hello = _decode(await asyncio.wait_for(call.read(), node.deadline))
-                if hello.get("type") != "hello" or hello.get("node_id") != node_id:
+                if (
+                    hello.get("type") != "hello"
+                    or hello.get("node_id") != node_id
+                    or int(hello.get("protocol_version", 0)) != PROTOCOL_VERSION
+                ):
                     raise TrackerIngestError("tracker_hello_mismatch")
                 if hello.get("config_hash") != tracker_config_fingerprint(
                     self.config, node_id
                 ):
                     raise TrackerIngestError("tracker_config_hash_mismatch")
-                durable_sequence = self.store.last_sequence(node_id)
-                ingest.seed(node_id, durable_sequence)
-                ingest.active = self.store.active_lifecycles(node_id)
+                node_epoch = str(hello["node_epoch"])
+                durable_sequence = self.store.last_sequence(node_id, node_epoch)
+                ingest.start_epoch(node_id, node_epoch, durable_sequence)
+                ingest.active = self.store.active_lifecycles(node_id, node_epoch)
                 await call.write(
                     _encode(
                         {
-                            "type": "hello",
-                            "replay_after_sequence": durable_sequence,
+                            "type": "session_start",
+                            "protocol_version": PROTOCOL_VERSION,
+                            "node_epoch": node_epoch,
+                            "ack_sequence": durable_sequence,
                         }
                     )
                 )
@@ -610,9 +699,7 @@ class TrackerMaintainer(threading.Thread):
                         _encode(
                             {
                                 "type": "ack",
-                                "node_epoch": update.node_epoch,
-                                "journal_sequence": update.journal_sequence,
-                                "event_id": update.event_id,
+                                "ack_sequence": update.journal_sequence,
                             }
                         )
                     )

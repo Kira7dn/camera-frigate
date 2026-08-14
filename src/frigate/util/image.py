@@ -2,13 +2,14 @@
 
 import datetime
 import logging
+import mmap
 import subprocess as sp
 import threading
 from abc import ABC, abstractmethod
 from multiprocessing import resource_tracker as _mprt
 from multiprocessing import shared_memory as _mpshm
 from string import printable
-from typing import Any, AnyStr, cast
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -397,7 +398,7 @@ def draw_snapshot_overlay_boxes(
 
         box_color = overlay_box.get("color", default_color)
         color = (
-            tuple(box_color) if isinstance(box_color, (list, tuple)) else default_color
+            tuple(box_color) if isinstance(box_color, list | tuple) else default_color
         )
         draw_box_with_label(
             frame,
@@ -1068,6 +1069,13 @@ class SharedMemoryFrameManager(FrameManager):
     def __init__(self):
         self.shm_store: dict[str, UntrackedSharedMemory] = {}
 
+    @staticmethod
+    def _size_matches(actual: int, required: int) -> bool:
+        if cast(Any, _mpshm)._USE_POSIX:
+            return actual == required
+        page_size = mmap.PAGESIZE
+        return actual == ((required + page_size - 1) // page_size) * page_size
+
     def create(self, name: str, size) -> memoryview:
         try:
             shm = UntrackedSharedMemory(
@@ -1100,7 +1108,7 @@ class SharedMemoryFrameManager(FrameManager):
         try:
             required = int(np.prod(shape))
             shm = self.shm_store.get(name)
-            if shm is not None and shm.size != required:
+            if shm is not None and not self._size_matches(shm.size, required):
                 # stale cached ref from a same-name recreate — drop and reopen
                 try:
                     shm.close()
@@ -1110,7 +1118,7 @@ class SharedMemoryFrameManager(FrameManager):
                 shm = None
             if shm is None:
                 shm = UntrackedSharedMemory(name=name)
-                if shm.size != required:
+                if not self._size_matches(shm.size, required):
                     # mid-recreate: OS segment doesn't match shape yet; skip
                     try:
                         shm.close()

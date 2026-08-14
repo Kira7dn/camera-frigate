@@ -26,7 +26,6 @@ from typing import Any
 
 from peewee import SqliteDatabase
 
-from extension.topology.fingerprint import canonical_json, fingerprint, model_value
 from extension.topology.loader import PlatformConfigLoader
 from frigate.domain.camera import CameraMetrics, PTZMetrics
 from frigate.domain.camera.maintainer import CameraMaintainer
@@ -39,8 +38,8 @@ from frigate.domain.camera.runtime import (
 from frigate.domain.camera.state import CameraState
 from frigate.domain.ptz.autotrack import DispatcherProtocol, PtzAutoTrackerThread
 from frigate.domain.ptz.onvif import OnvifController
-from frigate.domain.record.record import RecordProcess
 from frigate.domain.record.clip import materialize_recording_clip
+from frigate.domain.record.record import RecordProcess
 from frigate.domain.track.tracked_object import TrackedObject
 from frigate.infrastructure.comms.detections_updater import (
     DetectionPublisher,
@@ -200,6 +199,22 @@ class EdgeMediaStore:
         timestamp = update.frame_time if frame_time is None else frame_time
         return self._register(path, update, "snapshot", "jpeg", timestamp, timestamp)
 
+    def recognition_frame(
+        self, update: TrackerUpdate, frame: Any
+    ) -> MediaManifest:
+        """Stage one exact I420 frame for recognition in Frigate main."""
+        path = self.root / "recognition" / f"{uuid.uuid4().hex}.i420"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(frame.tobytes())
+        return self._register(
+            path,
+            update,
+            "recognition_frame",
+            "i420",
+            update.frame_time,
+            update.frame_time,
+        )
+
     def publish_end(
         self,
         update: TrackerUpdate,
@@ -312,7 +327,7 @@ def publish_video_detection(
 
 
 class TrackerJournal:
-    """Persist producer updates until main acknowledges them."""
+    """Persist one ordered outbox per tracker process epoch."""
 
     def __init__(self, path: str | Path) -> None:
         path = Path(path)
@@ -321,12 +336,14 @@ class TrackerJournal:
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.execute("pragma journal_mode=wal")
         self._db.execute(
-            """create table if not exists updates(
+            """create table if not exists updates_v2(
                 sequence integer primary key autoincrement,
+                epoch_sequence integer not null,
                 node_epoch text not null,
                 event_id text not null,
                 payload text not null,
-                acknowledged integer not null default 0
+                acknowledged integer not null default 0,
+                unique(node_epoch, epoch_sequence)
             )"""
         )
         self._db.commit()
@@ -334,44 +351,70 @@ class TrackerJournal:
     def append(self, update: TrackerUpdate) -> TrackerUpdate:
         with self._lock:
             cursor = self._db.execute(
-                "insert into updates(node_epoch,event_id,payload) values(?,?,?)",
-                (update.node_epoch, update.event_id, update.to_json()),
+                "select coalesce(max(epoch_sequence), 0) + 1 from updates_v2 where node_epoch=?",
+                (update.node_epoch,),
             )
-            if cursor.lastrowid is None:
+            row = cursor.fetchone()
+            if row is None:
                 raise RuntimeError("tracker journal did not allocate a sequence")
-            sequence = int(cursor.lastrowid)
+            sequence = int(row[0])
             value = TrackerUpdate.from_json(update.to_json())
             object.__setattr__(value, "journal_sequence", sequence)
             self._db.execute(
-                "update updates set payload=? where sequence=?",
-                (value.to_json(), sequence),
+                "insert into updates_v2(epoch_sequence,node_epoch,event_id,payload) values(?,?,?,?)",
+                (sequence, update.node_epoch, update.event_id, value.to_json()),
             )
             self._db.commit()
             return value
 
-    def replay(self, after: int = 0) -> tuple[TrackerUpdate, ...]:
+    def next_pending(self, node_epoch: str, after: int = 0) -> TrackerUpdate | None:
         with self._lock:
-            rows = self._db.execute(
-                "select payload from updates where sequence>? and acknowledged=0 order by sequence",
-                (after,),
-            ).fetchall()
-        return tuple(TrackerUpdate.from_json(row[0]) for row in rows)
+            row = self._db.execute(
+                "select payload from updates_v2 where node_epoch=? and epoch_sequence>? and acknowledged=0 order by epoch_sequence limit 1",
+                (node_epoch, after),
+            ).fetchone()
+        return None if row is None else TrackerUpdate.from_json(row[0])
 
-    def acknowledge(self, sequence: int, event_id: str, node_epoch: str) -> bool:
+    def acknowledge_through(self, node_epoch: str, sequence: int) -> int:
         with self._lock:
             cursor = self._db.execute(
-                """update updates set acknowledged=1
-                   where sequence=? and event_id=? and node_epoch=? and acknowledged=0""",
-                (sequence, event_id, node_epoch),
+                """update updates_v2 set acknowledged=1
+                   where node_epoch=? and epoch_sequence<=? and acknowledged=0""",
+                (node_epoch, sequence),
             )
             self._db.commit()
-            return cursor.rowcount == 1
+            return cursor.rowcount
+
+    def acknowledge(self, sequence: int, event_id: str, node_epoch: str) -> bool:
+        """Acknowledge one record for compatibility with older callers."""
+        with self._lock:
+            row = self._db.execute(
+                "select event_id from updates_v2 where node_epoch=? and epoch_sequence=?",
+                (node_epoch, sequence),
+            ).fetchone()
+        if row is None or str(row[0]) != event_id:
+            return False
+        return self.acknowledge_through(node_epoch, sequence) > 0
+
+    def replay(self, after: int = 0) -> tuple[TrackerUpdate, ...]:
+        """Compatibility helper for the current process epoch."""
+        with self._lock:
+            epochs = self._db.execute(
+                "select distinct node_epoch from updates_v2 order by sequence desc limit 1"
+            ).fetchone()
+        if epochs is None:
+            return ()
+        updates: list[TrackerUpdate] = []
+        while (update := self.next_pending(str(epochs[0]), after)) is not None:
+            updates.append(update)
+            after = update.journal_sequence
+        return tuple(updates)
 
     @property
     def pending_count(self) -> int:
         with self._lock:
             row = self._db.execute(
-                "select count(*) from updates where acknowledged=0"
+                "select count(*) from updates_v2 where acknowledged=0"
             ).fetchone()
         return int(row[0])
 
@@ -381,26 +424,13 @@ class TrackerJournal:
 
 
 def tracker_config_fingerprint(config: FrigateConfig, node_id: str) -> str:
-    """Hash behavior while excluding deployment-specific TLS mount paths."""
-    node = config.tracker[node_id]
-    return fingerprint(
-        canonical_json(
-            {
-                "node_id": node_id,
-                "node": model_value(node, exclude={"tls"}),
-                "tls_server_name": node.tls.server_name,
-                "cameras": {
-                    name: model_value(config.cameras[name])
-                    for name in sorted(config.cameras)
-                },
-                "model": model_value(config.model),
-                "detectors": {
-                    name: model_value(value)
-                    for name, value in sorted(config.detectors.items())
-                },
-            }
-        )
-    )
+    """Return the compiler-owned revision shared by every runtime view."""
+    if node_id not in config.tracker:
+        raise ValueError(f"unknown tracker node: {node_id}")
+    revision = config.runtime.topology_revision
+    if not revision:
+        raise ValueError("compiled tracker topology revision is required")
+    return revision
 
 
 class _Dispatcher(DispatcherProtocol):
@@ -431,6 +461,7 @@ class CameraTrackAdapter:
         self.frame_manager = SharedMemoryFrameManager()
         self.publisher = DetectionPublisher(DetectionTypeEnum.all.value)
         self.frame_seq = 0
+        self.frame_name = ""
         self.motion: list[tuple[int, int, int, int]] = []
         self.regions: list[tuple[int, int, int, int]] = []
         self.event_ids: dict[str, str] = {}
@@ -450,6 +481,7 @@ class CameraTrackAdapter:
         regions: list[tuple[int, int, int, int]],
     ) -> None:
         self.frame_seq += 1
+        self.frame_name = frame_name
         self.motion = motion
         self.regions = regions
         self.state.update(frame_name, frame_time, objects, motion, regions)
@@ -504,35 +536,53 @@ class CameraTrackAdapter:
                 "score_history": tuple(obj.score_history),
                 "path": tuple(point for point, _ in obj.path_data),
                 "speed": obj.current_estimated_speed,
-                "motion": {"boxes": tuple(self.motion)},
-                "region": {"boxes": tuple(self.regions)},
+                "frame_name": self.frame_name,
+                "motion_boxes": tuple(self.motion),
+                "detection_regions": tuple(self.regions),
             }
         )
-        return TrackerUpdate(
-                self.node_id,
-                self.node_epoch,
-                self.camera,
-                self.stream_epoch,
-                0,
-                self.frame_seq,
-                state["source_pts"],
-                float(data["frame_time"]),
-                self.event_ids[track_id],
-                track_id,
-                operation,
-                str(data["label"]),
-                tuple(float(value) for value in obj.score_history),
-                float(data["score"]),
-                BoundingBox(*box),
-                dict(data.get("attributes") or {}),
-                state,
-                tuple(data.get("current_zones") or ()),
-                tuple(data.get("entered_zones") or ()),
-                tuple(state["path"]),
-                state["speed"],
-                state["motion"],
-                state["region"],
+        update = TrackerUpdate(
+            self.node_id,
+            self.node_epoch,
+            self.camera,
+            self.stream_epoch,
+            0,
+            self.frame_seq,
+            state["source_pts"],
+            float(data["frame_time"]),
+            self.event_ids[track_id],
+            track_id,
+            operation,
+            str(data["label"]),
+            tuple(float(value) for value in obj.score_history),
+            float(data["score"]),
+            BoundingBox(*box),
+            dict(data.get("attributes") or {}),
+            state,
+            tuple(data.get("current_zones") or ()),
+            tuple(data.get("entered_zones") or ()),
+            tuple(state["path"]),
+            state["speed"],
+            {"boxes": tuple(self.motion)},
+            {"boxes": tuple(self.regions)},
         )
+        camera_config = self.config.cameras[self.camera]
+        needs_recognition = (
+            operation is not TrackerOperation.END
+            and (
+                (update.label == "person" and camera_config.face_recognition.enabled)
+                or (update.label in ("car", "motorcycle") and camera_config.lpr.enabled)
+            )
+        )
+        if self.media is None or not needs_recognition:
+            return update
+        frame = self.frame_manager.get(
+            self.frame_name, camera_config.frame_shape_yuv
+        )
+        if frame is None:
+            return update
+        manifest = self.media.recognition_frame(update, frame)
+        return replace(update, media=(manifest,))
 
     def close(self) -> None:
         self.publisher.stop()
