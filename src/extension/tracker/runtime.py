@@ -27,6 +27,7 @@ from multiprocessing.synchronize import Event as MpEvent
 from pathlib import Path
 from typing import Any
 
+import cv2
 from peewee import SqliteDatabase
 
 from extension.topology.loader import PlatformConfigLoader
@@ -47,7 +48,11 @@ from frigate.infrastructure.comms.zmq_proxy import ZmqProxy
 from frigate.infrastructure.config import FrigateConfig
 from frigate.log import setup_logging
 from frigate.util.builtin import empty_and_close_queue
-from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
+from frigate.util.image import (
+    SharedMemoryFrameManager,
+    UntrackedSharedMemory,
+    get_snapshot_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +156,7 @@ class EdgeMediaStore:
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tracker_media")
         self._futures: set[Future[MediaManifest | None]] = set()
         self._completed_events: set[str] = set()
+        self._latest_snapshots: dict[str, tuple[Path, float]] = {}
 
     def _register(
         self,
@@ -179,7 +185,52 @@ class EdgeMediaStore:
             self._paths[media_id] = path
         return manifest
 
-    def snapshot(self, update: TrackerUpdate, obj: TrackedObject) -> MediaManifest | None:
+    def _capture_snapshot_from_frame(
+        self, update: TrackerUpdate, obj: TrackedObject, frame: Any
+    ) -> tuple[Path, float] | None:
+        if frame is None or not should_save_snapshot(self.config, update.camera_id, obj):
+            return None
+        camera_config = self.config.cameras[update.camera_id]
+        try:
+            image = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+            data = obj.obj_data
+            label = data.get("sub_label") or data.get("label", update.label)
+            if isinstance(label, tuple):
+                label = label[0]
+            image_bytes, frame_time = get_snapshot_bytes(
+                image,
+                update.frame_time,
+                "jpg",
+                timestamp=True,
+                bounding_box=True,
+                quality=camera_config.snapshots.quality,
+                label=str(label),
+                box=(
+                    update.bbox.left,
+                    update.bbox.top,
+                    update.bbox.right,
+                    update.bbox.bottom,
+                ),
+                score=float(data.get("score", update.score)),
+                area=data.get("area"),
+                attributes=data.get("attributes") or [],
+                color=obj.colormap.get(update.label, (255, 255, 255)),
+                timestamp_style=camera_config.timestamp_style,
+                estimated_speed=obj.current_estimated_speed,
+            )
+        except (KeyError, TypeError, ValueError, cv2.error):
+            logger.exception("Unable to encode fallback snapshot event_id=%s", update.event_id)
+            return None
+        if image_bytes is None:
+            return None
+        path = self.root / "snapshots" / f"{uuid.uuid4().hex}.jpg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(image_bytes)
+        return path, frame_time
+
+    def _capture_snapshot(
+        self, update: TrackerUpdate, obj: TrackedObject, frame: Any = None
+    ) -> tuple[Path, float] | None:
         if not should_save_snapshot(self.config, update.camera_id, obj):
             return None
         image, frame_time = obj.get_img_bytes(
@@ -189,12 +240,40 @@ class EdgeMediaStore:
             quality=self.config.cameras[update.camera_id].snapshots.quality,
         )
         if image is None:
-            return None
+            return self._capture_snapshot_from_frame(update, obj, frame)
         path = self.root / "snapshots" / f"{uuid.uuid4().hex}.jpg"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(image)
         timestamp = update.frame_time if frame_time is None else frame_time
-        return self._register(path, update, "snapshot", "jpeg", timestamp, timestamp)
+        return path, timestamp
+
+    def remember_snapshot(
+        self, update: TrackerUpdate, obj: TrackedObject, frame: Any = None
+    ) -> None:
+        """Retain the newest valid frame for terminal media materialization."""
+        captured = self._capture_snapshot(update, obj, frame)
+        if captured is not None:
+            previous = self._latest_snapshots.get(update.event_id)
+            if previous is not None and previous[0] != captured[0]:
+                previous[0].unlink(missing_ok=True)
+            self._latest_snapshots[update.event_id] = captured
+
+    def snapshot(
+        self, update: TrackerUpdate, obj: TrackedObject, frame: Any = None
+    ) -> MediaManifest | None:
+        captured = self._capture_snapshot(update, obj, frame)
+        if captured is None:
+            captured = self._latest_snapshots.pop(update.event_id, None)
+        else:
+            previous = self._latest_snapshots.pop(update.event_id, None)
+            if previous is not None and previous[0] != captured[0]:
+                previous[0].unlink(missing_ok=True)
+        if captured is None:
+            return None
+        path, timestamp = captured
+        return self._register(
+            path, update, "snapshot_jpg", "jpeg", timestamp, timestamp
+        )
 
     def recognition_frame(
         self, update: TrackerUpdate, frame: Any
@@ -218,9 +297,12 @@ class EdgeMediaStore:
         obj: TrackedObject,
         publish: Callable[[TrackerUpdate], TrackerUpdate],
         source_epoch: float | None = None,
+        frame: Any = None,
     ) -> None:
         manifests = tuple(
-            manifest for manifest in (self.snapshot(update, obj),) if manifest is not None
+            manifest
+            for manifest in (self.snapshot(update, obj, frame),)
+            if manifest is not None
         )
         start_time = float(obj.obj_data.get("start_time", update.frame_time))
         clip_path = self.root / "clips" / update.event_id / "clip.mp4"
@@ -388,9 +470,14 @@ class EdgeMediaStore:
 def should_save_snapshot(
     config: FrigateConfig, camera: str, obj: TrackedObject
 ) -> bool:
-    """Use Frigate's existing snapshot configuration without new heuristics."""
-    if obj.false_positive or obj.obj_data["position_changes"] == 0:
-        return False
+    """Save one canonical image for every notification-eligible track.
+
+    Position changes remain a recording policy, not a notification-media
+    policy.  A stationary or very short track still needs one canonical image
+    so the completed Event can be delivered with evidence.  Detector confidence
+    is evaluated by the configured notification rule; it must not silently
+    remove the media required to produce the requested event contract.
+    """
     snapshot = config.cameras[camera].snapshots
     return bool(
         snapshot.enabled
@@ -601,7 +688,13 @@ class CameraTrackAdapter:
         if self.media is None:
             self.publish(update)
         else:
-            self.media.publish_end(update, obj, self.publish, self.source_epoch)
+            self.media.publish_end(
+                update,
+                obj,
+                self.publish,
+                self.source_epoch,
+                self._current_frame(),
+            )
         self.event_ids.pop(str(obj.obj_data["id"]), None)
         if not obj.false_positive:
             self.ptz.end_object(camera, obj)
@@ -610,7 +703,15 @@ class CameraTrackAdapter:
         self.ptz.autotrack_object(camera, obj)
 
     def _emit(self, operation: TrackerOperation, obj: TrackedObject) -> None:
-        self.publish(self._update_value(operation, obj))
+        update = self._update_value(operation, obj)
+        if self.media is not None and operation is not TrackerOperation.END:
+            self.media.remember_snapshot(update, obj, self._current_frame())
+        self.publish(update)
+
+    def _current_frame(self) -> Any:
+        return self.frame_manager.get(
+            self.frame_name, self.config.cameras[self.camera].frame_shape_yuv
+        )
 
     def _update_value(
         self, operation: TrackerOperation, obj: TrackedObject
@@ -746,6 +847,7 @@ class TrackerRuntime:
         self.source_idle_polls = {camera: 0 for camera in config.cameras}
         self.session_complete_written = False
         self.degraded = False
+        self._camera_start_thread: threading.Thread | None = None
         self.consumer = threading.Thread(
             target=self._consume, name="tracker_frames", daemon=True
         )
@@ -780,7 +882,24 @@ class TrackerRuntime:
             )
         self.ptz.start()
         self.consumer.start()
-        self.cameras.start()
+        input_start_path = os.environ.get("PASSAGE_INPUT_START_PATH")
+        if input_start_path:
+            self._camera_start_thread = threading.Thread(
+                target=self._wait_for_input_start,
+                args=(Path(input_start_path),),
+                name="tracker-input-barrier",
+                daemon=True,
+            )
+            self._camera_start_thread.start()
+        else:
+            self.cameras.start()
+
+    def _wait_for_input_start(self, marker: Path) -> None:
+        """Release direct camera readers only after the shared E2E barrier."""
+        while not self.stop_event.is_set() and not marker.is_file():
+            self.stop_event.wait(0.1)
+        if not self.stop_event.is_set():
+            self.cameras.start()
 
     def _consume(self) -> None:
         while not self.stop_event.is_set():
@@ -872,6 +991,8 @@ class TrackerRuntime:
         """Stop native components and release tracker-owned IPC resources."""
         self.stop_event.set()
         timeout = self.node_config.shutdown_drain
+        if self._camera_start_thread is not None:
+            self._camera_start_thread.join(timeout=timeout)
         self.cameras.join(timeout=timeout)
         self.consumer.join(timeout=timeout)
         self.ptz.join(timeout=timeout)

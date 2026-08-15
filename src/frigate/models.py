@@ -311,7 +311,7 @@ class NotificationDelivery(Model):
     id = CharField(null=False, primary_key=True, max_length=36)
     provider = CharField(null=False, max_length=20, index=True)
     recipient_id = CharField(null=False, max_length=64)
-    rule_id = CharField(null=False, max_length=64, default="legacy")
+    rule_id = CharField(null=False, max_length=64, default="")
     source_type = CharField(null=False, max_length=30)
     source_id = CharField(null=False, max_length=64)
     payload = JSONField()

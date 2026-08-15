@@ -211,10 +211,29 @@ class EventProcessor(threading.Thread):
                 )
             )
 
-            # if this is the first message, just store it and continue, its not time to insert it in the db
-            if event_type == EventStateEnum.start or id not in self.events_in_process:
+            # START is only a seed; the first UPDATE creates the canonical Event.
+            # An END can arrive without the in-memory seed after a reconnect or a
+            # duplicate delivery.  If Frigate already owns the Event, process that
+            # END instead of silently parking it forever as an in-progress item.
+            if event_type == EventStateEnum.start:
                 self.events_in_process[id] = event_data
                 return
+            if id not in self.events_in_process:
+                if event_type != EventStateEnum.end:
+                    self.events_in_process[id] = event_data
+                    return
+                try:
+                    existing_event = Event.get(Event.id == id)
+                except Event.DoesNotExist:
+                    self.events_in_process[id] = event_data
+                    return
+                previous = dict(event_data)
+                previous["end_time"] = None
+                previous["has_clip"] = existing_event.has_clip or event_data["has_clip"]
+                previous["has_snapshot"] = (
+                    existing_event.has_snapshot or event_data["has_snapshot"]
+                )
+                self.events_in_process[id] = previous
 
             previous = self.events_in_process[id]
             for field in ("sub_label", "recognized_license_plate"):
@@ -622,7 +641,8 @@ class EventProcessor(threading.Thread):
         """handle tracked object event updates."""
         updated_db = False
 
-        if should_update_db(self.events_in_process[event_data["id"]], event_data):
+        previous_event = self.events_in_process[event_data["id"]]
+        if event_type == EventStateEnum.end or should_update_db(previous_event, event_data):
             updated_db = True
             camera_config = self.config.cameras.get(camera)
             if camera_config is None:
@@ -791,6 +811,10 @@ class EventProcessor(threading.Thread):
                 existing_event = None
             if existing_event is not None:
                 existing_data = existing_event.data or {}
+                # A late non-terminal update must not reopen an Event after its
+                # canonical END has been committed.
+                if existing_event.end_time is not None and end_time is None:
+                    event[Event.end_time] = existing_event.end_time
                 if existing_data.get("snapshot_source") == "face_recognition":
                     for key in (
                         "box",

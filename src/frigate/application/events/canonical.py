@@ -383,7 +383,7 @@ class EventAggregator:
         height: int,
         boxes: list[dict[str, Any]],
         technical: dict[str, Any] | None = None,
-    ) -> EventEvidence:
+    ) -> EventEvidence | None:
         normalized = []
         for box in boxes:
             if not isinstance(box, dict):
@@ -413,7 +413,11 @@ class EventAggregator:
             technical=technical or {},
             created_at=utcnow(),
         ).on_conflict_ignore().execute()
-        return EventEvidence.get_by_id(evidence_id)
+        # SQLite may transiently expose the insert on a different connection
+        # while Frigate is reopening/restoring its database. Treat that as a
+        # retryable missing observation instead of killing the notification
+        # maintenance thread.
+        return EventEvidence.get_or_none(EventEvidence.id == evidence_id)
 
     def observe(
         self,

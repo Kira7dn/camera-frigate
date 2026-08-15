@@ -40,6 +40,7 @@ from frigate.domain.camera import PTZMetrics
 from frigate.domain.object_detection.base import LocalObjectDetector
 from frigate.domain.track.norfair_tracker import NorfairTracker
 from frigate.infrastructure.config import FrigateConfig
+from frigate.infrastructure.config.env import FRIGATE_ENV_VARS
 from frigate.timeline import TimelineProcessor
 from frigate.util.image import SharedMemoryFrameManager
 
@@ -413,11 +414,19 @@ async def _production_commit_roundtrip(
 
 
 @pytest.mark.integration
-def test_mock_videos_produce_tracker_trace_ids(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mock_videos_produce_tracker_trace_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Mock videos must cross tracker transport and Frigate-main payload boundaries."""
     for asset in (FACE_VIDEO, LPR_VIDEO, MODEL, LABELMAP):
         assert asset.is_file(), asset
-    monkeypatch.setattr(tracker_runtime, "DetectionPublisher", _Publisher)
+    for name, value in {
+        "TELEGRAM_BOT_TOKEN": "test-telegram-token",
+        "TELEGRAM_CHAT_ID": "test-telegram-chat",
+        "ZALO_BOT_TOKEN": "test-zalo-token",
+        "ZALO_CHAT_ID": "test-zalo-chat",
+    }.items():
+        monkeypatch.setitem(FRIGATE_ENV_VARS, name, value)
     config = _config(tmp_path)
     journal = TrackerJournal(tmp_path / "journal.db")
     detector = LocalObjectDetector(

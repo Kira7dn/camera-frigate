@@ -12,8 +12,8 @@ from frigate.infrastructure.config.camera.notification import NotificationRuleCo
 class TestNotificationClient(unittest.TestCase):
     def setUp(self):
         self.client = NotificationClient.__new__(NotificationClient)
-        self.client._alert_plates = {}
         self.client._lpr_updates = {}
+        self.client._review_ids = {}
         self.client._aggregator = SimpleNamespace(
             observe=lambda **_kwargs: None,
             media=SimpleNamespace(get=lambda _artifact_id: None),
@@ -34,29 +34,6 @@ class TestNotificationClient(unittest.TestCase):
         self.assertIsNone(normalize_plate(3789.091994191706))
         self.assertIsNone(normalize_plate(("3789", 0.91)))
 
-    def test_lpr_final_car_event_builds_complete_envelope(self):
-        envelope = self.client._lpr_envelope(
-            {
-                "type": "end",
-                "after": {
-                    "id": "event-1",
-                    "camera": "car_camera",
-                    "label": "car",
-                    "end_time": 123.0,
-                    "data": {
-                        "recognized_license_plate": "51A-123.45",
-                        "recognized_license_plate_score": 0.91,
-                        "license_plate_box": [1, 2, 3, 4],
-                    },
-                },
-            }
-        )
-        self.assertIsNotNone(envelope)
-        self.assertEqual(envelope.source_id, "event-1")
-        self.assertEqual(envelope.camera, "car_camera")
-        self.assertEqual(envelope.lpr_plate, "51A12345")
-        self.assertEqual(envelope.lpr_score, 0.91)
-
     def test_lpr_update_supplies_plate_box_and_sub_label(self):
         self.client._remember_lpr_update(
             {
@@ -67,37 +44,15 @@ class TestNotificationClient(unittest.TestCase):
                 "name": "company_car",
             }
         )
-        envelope = self.client._lpr_envelope(
+        self.assertEqual(
+            self.client._lpr_updates["event-2"],
             {
-                "type": "end",
-                "after": {
-                    "id": "event-2",
-                    "camera": "car_camera",
-                    "label": "car",
-                    "data": {},
-                },
-            }
-        )
-        self.assertEqual(envelope.lpr_plate_box, [10, 20, 100, 60])
-        self.assertEqual(envelope.sub_label, "company_car")
-
-    def test_lpr_ignores_updates_non_cars_and_missing_plates(self):
-        base = {
-            "type": "end",
-            "after": {
-                "id": "event-1",
-                "camera": "car_camera",
-                "label": "car",
-                "data": {},
+                "plate": "51A12345",
+                "score": 0.95,
+                "plate_box": [10, 20, 100, 60],
+                "sub_label": "company_car",
             },
-        }
-        self.assertIsNone(self.client._lpr_envelope(base))
-        base["after"]["data"] = {"recognized_license_plate": "51A12345"}
-        base["after"]["label"] = "person"
-        self.assertIsNone(self.client._lpr_envelope(base))
-        base["after"]["label"] = "car"
-        base["type"] = "update"
-        self.assertIsNone(self.client._lpr_envelope(base))
+        )
 
     def test_rule_matches_camera_label_and_zone(self):
         rule = NotificationRuleConfig.model_validate(
@@ -134,15 +89,8 @@ class TestNotificationClient(unittest.TestCase):
             )
         )
 
-    def test_smoking_review_matches_safety_alert_rule(self):
-        self.client.config = SimpleNamespace(
-            cameras={
-                "safety_camera": SimpleNamespace(
-                    friendly_name="Safety Smoking Camera"
-                )
-            }
-        )
-        envelope = self.client._review_envelope(
+    def test_review_only_remembers_canonical_event_url(self):
+        self.client._remember_review_id(
             {
                 "after": {
                     "id": "review-smoking-1",
@@ -156,33 +104,7 @@ class TestNotificationClient(unittest.TestCase):
                 }
             }
         )
-        rule = NotificationRuleConfig.model_validate(
-            {
-                "id": "smoking_alert",
-                "name": "Smoking alert",
-                "event": "alert",
-                "filters": {
-                    "cameras": ["safety_camera"],
-                    "labels": ["smoking"],
-                },
-            }
-        )
-
-        self.assertIsNotNone(envelope)
-        self.assertEqual(envelope.object_label, "smoking")
-        self.assertTrue(self.client._rule_matches(rule, envelope))
-        self.assertFalse(
-            self.client._rule_matches(
-                rule,
-                envelope.__class__.from_dict(
-                    {
-                        **envelope.as_dict(),
-                        "object_label": "car",
-                        "genai": {"_labels": ["car"], "_zones": []},
-                    }
-                ),
-            )
-        )
+        self.assertEqual(self.client._review_ids, {"event-smoking-1": "review-smoking-1"})
 
     def test_finalized_smoking_event_keeps_safety_notification_copy(self):
         self.client.config = SimpleNamespace(
@@ -254,3 +176,31 @@ class TestNotificationClient(unittest.TestCase):
         ):
             self.client._route_finalized_event(event.id)
         self.client._route.assert_not_called()
+
+    def test_active_smoking_event_routes_from_the_same_event_id(self):
+        event = SimpleNamespace(
+            id="event-smoking-active-1",
+            camera="safety_camera",
+            label="smoking",
+            display_label=None,
+            canonical_sub_label=None,
+            sub_label="camera-safety",
+            canonical_plate=None,
+            canonical_plate_score=None,
+            data={"score": 0.91},
+            zones=[],
+            state="ACTIVE",
+            end_time=None,
+        )
+        self.client._route = MagicMock()
+        with patch(
+            "frigate.application.notifications.client.Event.get_or_none",
+            return_value=event,
+        ):
+            self.client._route_finalized_event(event.id)
+
+        self.client._route.assert_called_once()
+        event_name, envelope = self.client._route.call_args.args
+        self.assertEqual(event_name, "alert")
+        self.assertEqual(envelope.source_type, "event")
+        self.assertEqual(envelope.source_id, event.id)

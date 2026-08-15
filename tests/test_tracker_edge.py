@@ -15,6 +15,7 @@ from extension.tracker.runtime import (
     TrackerOperation,
     TrackerRuntime,
     TrackerUpdate,
+    should_save_snapshot,
     tracker_config_fingerprint,
 )
 from extension.tracker.transport import (
@@ -63,6 +64,14 @@ def test_tracker_extension_contains_exactly_four_python_files() -> None:
     assert files == ["__init__.py", "app.py", "runtime.py", "transport.py"]
 
 
+def test_tracker_can_hold_direct_inputs_until_shared_acceptance_barrier() -> None:
+    source = Path("src/extension/tracker/runtime.py").read_text(encoding="utf-8")
+
+    assert 'os.environ.get("PASSAGE_INPUT_START_PATH")' in source
+    assert "tracker-input-barrier" in source
+    assert "self.cameras.start()" in source
+
+
 def test_tracker_runtime_does_not_depend_on_backup() -> None:
     sources = "\n".join(
         path.read_text(encoding="utf-8")
@@ -99,7 +108,7 @@ def test_media_manifest_roundtrip_and_canonical_persistence() -> None:
             '"media":[{"byte_size":3,"camera_id":"face_camera",'
             '"codec":"jpeg","end_time":1.0,"event_id":"producer-trace-id",'
             '"expiry_unix_ms":4102444800000,"media_id":"abc",'
-            '"media_type":"snapshot","sha256":"abc","start_time":1.0}]',
+            '"media_type":"snapshot_jpg","sha256":"abc","start_time":1.0}]',
         )
     )
     TrackerCanonicalStore(database).accept(update)
@@ -107,6 +116,14 @@ def test_media_manifest_roundtrip_and_canonical_persistence() -> None:
     assert row.event_id == update.event_id
     assert row.byte_size == 3
     database.close()
+
+
+def test_snapshot_policy_keeps_stationary_valid_events_media_ready() -> None:
+    snapshots = SimpleNamespace(enabled=True, required_zones=[])
+    config = SimpleNamespace(cameras={"face_camera": SimpleNamespace(snapshots=snapshots)})
+    obj = SimpleNamespace(false_positive=True, obj_data={"position_changes": 0}, entered_zones=[])
+
+    assert should_save_snapshot(config, "face_camera", obj)
 
 
 def test_canonical_store_reconstructs_active_lifecycle() -> None:

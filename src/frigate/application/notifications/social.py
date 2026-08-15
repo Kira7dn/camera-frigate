@@ -93,7 +93,7 @@ class SocialClient:
             return False
         if camera and camera not in self.config.cameras:
             return False
-        if rule_id and rule_id not in ("legacy", "event_revision"):
+        if rule_id:
             rule = next(
                 (
                     rule

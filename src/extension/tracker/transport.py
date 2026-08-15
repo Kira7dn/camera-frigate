@@ -535,7 +535,7 @@ class TrackerMaintainer(threading.Thread):
             data["end_time"] = update.frame_time
         if any(item.media_type == "clip" for item in update.media):
             data["has_clip"] = True
-        if any(item.media_type == "snapshot" for item in update.media):
+        if any(item.media_type == "snapshot_jpg" for item in update.media):
             data["has_snapshot"] = True
         return data
 

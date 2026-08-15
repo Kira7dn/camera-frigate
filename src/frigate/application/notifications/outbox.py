@@ -76,7 +76,7 @@ class NotificationOutbox:
                 id=delivery_id,
                 provider=provider,
                 recipient_id=recipient_id,
-                rule_id=envelope.rule_id or "legacy",
+                rule_id=envelope.rule_id or "",
                 source_type=envelope.source_type,
                 source_id=envelope.source_id,
                 payload=envelope.as_dict(),
@@ -153,7 +153,13 @@ class NotificationOutbox:
             self._update_depth(provider)
             return
         started = time.monotonic()
-        result = await self.deliver(client, provider, recipient_id, envelope)
+        try:
+            result = await asyncio.wait_for(
+                self.deliver(client, provider, recipient_id, envelope),
+                timeout=30.0,
+            )
+        except TimeoutError:
+            result = DeliveryResult(False, True, "delivery_timeout")
         observe_latency(provider, time.monotonic() - started)
         if result.sent:
             self._complete(delivery, "sent", None)
