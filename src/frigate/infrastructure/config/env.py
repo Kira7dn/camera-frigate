@@ -5,7 +5,19 @@ from typing import Annotated
 
 from pydantic import AfterValidator, ValidationInfo
 
-FRIGATE_ENV_VARS = {k: v for k, v in os.environ.items() if k.startswith("FRIGATE_")}
+NOTIFICATION_ENV_NAMES = frozenset(
+    {
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "ZALO_BOT_TOKEN",
+        "ZALO_CHAT_ID",
+    }
+)
+FRIGATE_ENV_VARS = {
+    k: v
+    for k, v in os.environ.items()
+    if k.startswith("FRIGATE_") or k in NOTIFICATION_ENV_NAMES
+}
 secrets_dir = os.environ.get("CREDENTIALS_DIRECTORY", "/run/secrets")
 # read secret files as env vars too
 if os.path.isdir(secrets_dir) and os.access(secrets_dir, os.R_OK):
@@ -18,17 +30,21 @@ if os.path.isdir(secrets_dir) and os.access(secrets_dir, os.R_OK):
 
 # Matches a FRIGATE_* identifier following an opening brace.
 _FRIGATE_IDENT_RE = re.compile(r"FRIGATE_[A-Za-z0-9_]+")
+_NOTIFICATION_IDENT_RE = re.compile(
+    r"(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|ZALO_BOT_TOKEN|ZALO_CHAT_ID)"
+)
 
 
 def substitute_frigate_vars(value: str) -> str:
-    """Substitute `{FRIGATE_*}` placeholders in *value*.
+    """Substitute Frigate and notification credential placeholders in *value*.
 
     Reproduces the subset of `str.format()` brace semantics that Frigate's
     config has historically supported, while leaving unrelated brace content
     (e.g. ffmpeg `%{localtime\\:...}` expressions) untouched:
 
     * `{{` and `}}` collapse to literal `{` / `}` (the documented escape).
-    * `{FRIGATE_NAME}` is replaced from `FRIGATE_ENV_VARS`; an unknown name
+    * `{FRIGATE_NAME}` and the four notification placeholders are replaced
+      from `FRIGATE_ENV_VARS`; an unknown name
       raises `KeyError` to preserve the existing "Invalid substitution"
       error path.
     * A `{` that begins `{FRIGATE_` but is not a well-formed
@@ -48,9 +64,14 @@ def substitute_frigate_vars(value: str) -> str:
                 out.append("{")
                 i += 2
                 continue
-            # Possible `{FRIGATE_*}` placeholder.
-            if value.startswith("{FRIGATE_", i):
-                ident_match = _FRIGATE_IDENT_RE.match(value, i + 1)
+            # Possible Frigate or notification credential placeholder.
+            if value.startswith("{FRIGATE_", i) or any(
+                value.startswith("{" + name, i) for name in NOTIFICATION_ENV_NAMES
+            ):
+                ident_match = (
+                    _FRIGATE_IDENT_RE.match(value, i + 1)
+                    or _NOTIFICATION_IDENT_RE.match(value, i + 1)
+                )
                 if (
                     ident_match is not None
                     and ident_match.end() < n
@@ -62,10 +83,10 @@ def substitute_frigate_vars(value: str) -> str:
                     out.append(FRIGATE_ENV_VARS[key])
                     i = ident_match.end() + 1
                     continue
-                # Looks like a FRIGATE placeholder but is malformed
+                # Looks like a supported placeholder but is malformed
                 # (no closing brace, illegal char, format spec, etc.).
                 raise ValueError(
-                    f"Malformed FRIGATE_ placeholder near {value[i : i + 32]!r}"
+                    f"Malformed environment placeholder near {value[i : i + 32]!r}"
                 )
             # Plain `{` — pass through (e.g. `%{localtime\:...}`).
             out.append("{")

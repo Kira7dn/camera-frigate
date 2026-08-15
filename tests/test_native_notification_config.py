@@ -22,7 +22,7 @@ class TestNativeNotificationConfig(unittest.TestCase):
             "channels": {
                 "telegram": {
                     "recipients": [
-                        {"id": "ops", "chat_id": "{FRIGATE_TELEGRAM_CHAT_ID}"}
+                        {"id": "ops", "chat_id": "{TELEGRAM_CHAT_ID}"}
                     ]
                 }
             }
@@ -30,7 +30,7 @@ class TestNativeNotificationConfig(unittest.TestCase):
         _restore_recipient_chat_ids(serialized, requested)
         self.assertEqual(
             serialized["channels"]["telegram"]["recipients"][0]["chat_id"],
-            "{FRIGATE_TELEGRAM_CHAT_ID}",
+            "{TELEGRAM_CHAT_ID}",
         )
 
     def test_camera_defaults_to_webpush_only(self):
@@ -73,8 +73,8 @@ class TestNativeNotificationConfig(unittest.TestCase):
         self.assertEqual(config.delivery.max_pending, 5000)
 
     def test_tokens_are_not_part_of_config_dump(self):
-        os.environ["FRIGATE_TELEGRAM_BOT_TOKEN"] = "do-not-serialize"
-        os.environ["FRIGATE_ZALO_BOT_TOKEN"] = "do-not-serialize-either"
+        os.environ["TELEGRAM_BOT_TOKEN"] = "do-not-serialize"
+        os.environ["ZALO_BOT_TOKEN"] = "do-not-serialize-either"
         dumped = str(NotificationConfig().model_dump())
         self.assertNotIn("do-not-serialize", dumped)
 

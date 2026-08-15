@@ -16,6 +16,7 @@ class NotificationEnvelope:
     direct_url: str
     snapshot_ref: str | None
     notification_type: str
+    snapshot_url: str | None = None
     rule_id: str | None = None
     object_label: str | None = None
     sub_label: str | None = None

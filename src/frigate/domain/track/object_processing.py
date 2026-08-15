@@ -1158,7 +1158,21 @@ class TrackedObjectProcessor(threading.Thread):
 
                 _, _, camera, event_data = update
                 event_id = str(event_data["id"])
-                self.camera_states[camera].finished(event_id)
+                camera_state = self.camera_states.get(camera)
+                if camera_state is None:
+                    logger.warning(
+                        "Skipping event cleanup for %s: camera state is unavailable",
+                        camera,
+                    )
+                    continue
+                if event_id not in camera_state.tracked_objects:
+                    logger.warning(
+                        "Skipping event cleanup for %s/%s: tracked object is unavailable",
+                        camera,
+                        event_id,
+                    )
+                    continue
+                camera_state.finished(event_id)
 
         # shut down camera states
         for state in self.camera_states.values():

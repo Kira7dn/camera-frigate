@@ -457,6 +457,7 @@ def events_explore(
                         "path_data",
                         "recognized_license_plate",
                         "recognized_license_plate_score",
+                        "draw",
                     ]
                 },
                 "state": event.state,

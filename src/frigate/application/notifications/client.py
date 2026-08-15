@@ -16,6 +16,7 @@ from typing import Any
 import cv2
 from titlecase import titlecase
 
+from frigate.application.events.canonical import CanonicalMediaStore, EventAggregator
 from frigate.infrastructure.comms.base_communicator import Communicator
 from frigate.infrastructure.comms.config_updater import ConfigSubscriber
 from frigate.infrastructure.config import FrigateConfig
@@ -24,7 +25,6 @@ from frigate.infrastructure.config.camera.notification import (
     NotificationDestinationsConfig,
     NotificationRuleConfig,
 )
-from frigate.application.events.canonical import CanonicalMediaStore, EventAggregator
 from frigate.models import (
     EdgeMediaManifest,
     Event,
@@ -76,6 +76,7 @@ class NotificationClient(Communicator):
         self._camera_status: dict[str, str] = {}
         self._offline_since: dict[str, float] = {}
         self._offline_notified: set[str] = set()
+        self._notification_started_at = self._now()
         self._aggregator = EventAggregator(
             CanonicalMediaStore(
                 max_storage_mb=config.notifications.media.max_storage_mb
@@ -192,6 +193,7 @@ class NotificationClient(Communicator):
             self._seen = {key: at for key, at in self._seen.items() if at >= cutoff}
             for event_id in self._aggregator.finalize_due():
                 self._route_finalized_event(event_id)
+            self._reconcile_recent_events()
 
     def _refresh_config(self) -> None:
         changed = False
@@ -291,46 +293,35 @@ class NotificationClient(Communicator):
             increment("all", "skipped_suspended")
             return []
         envelope = self._canonical_envelope(envelope)
-        if envelope.snapshot_ref and not envelope.media_artifact_id:
-            # Never enqueue a provisional or dynamically rendered image.
-            increment("all", "waiting_for_finalization")
-            return []
         if self.config.notifications.pipeline.shadow_mode:
             increment("all", "shadow_committed")
             return []
-        event_types = {event}
-        if envelope.media_artifact_id:
-            event_types.update(("alert", "object_detected"))
-            if envelope.lpr_plate:
-                event_types.add("license_plate")
-            if envelope.sub_label:
-                event_types.add("face_recognized")
         matching_rules = [
             rule
             for rule in self.config.notifications.rules
             if rule.enabled
-            and rule.event in event_types
+            and rule.event == event
             and self._rule_matches(rule, envelope)
         ]
-        destinations = NotificationDestinationsConfig()
-        cooldown_keys: list[tuple[str, str, str, str]] = []
-        dedupe_keys: list[tuple[str, str, str]] = []
-        for rule in matching_rules:
-            dedupe_key = (rule.id, envelope.source_type, envelope.source_id)
-            if dedupe_key in self._seen:
-                increment("all", "deduplicated")
-                continue
-            available, keys = self._available_destinations(rule, envelope)
-            destinations.webpush = destinations.webpush or available.webpush
-            destinations.telegram = sorted(
-                set(destinations.telegram).union(available.telegram)
-            )
-            destinations.zalo = sorted(set(destinations.zalo).union(available.zalo))
-            cooldown_keys.extend(keys)
-            dedupe_keys.append(dedupe_key)
-        if not dedupe_keys:
+        if not matching_rules:
             return []
-        ruled_envelope = replace(envelope, rule_id="event_revision")
+        rule = matching_rules[0]
+        if len(matching_rules) > 1:
+            logger.warning(
+                "Multiple notification rules match event %s; using %s",
+                envelope.source_id,
+                rule.id,
+            )
+        dedupe_key = (rule.id, envelope.source_type, envelope.source_id)
+        if dedupe_key in self._seen:
+            increment("all", "deduplicated")
+            return []
+        destinations, cooldown_keys = self._available_destinations(rule, envelope)
+        if not any(
+            (destinations.webpush, destinations.telegram, destinations.zalo)
+        ):
+            return []
+        ruled_envelope = replace(envelope, rule_id=rule.id)
         self._persist_intents(ruled_envelope, destinations)
         delivered = False
         if destinations.webpush and self.config.notifications.channels.webpush.enabled:
@@ -339,8 +330,7 @@ class NotificationClient(Communicator):
         delivered = bool(deliveries) or delivered
         if delivered:
             now = self._now()
-            for dedupe_key in dedupe_keys:
-                self._seen[dedupe_key] = now
+            self._seen[dedupe_key] = now
             for key in set(cooldown_keys):
                 self._last_delivery[key] = now
                 self._persist_rule_state(key, ruled_envelope, now)
@@ -382,7 +372,11 @@ class NotificationClient(Communicator):
         if not event_id:
             return envelope
         event = Event.get_or_none(Event.id == event_id)
-        if event is None or event.end_time is None or event.state != "FINALIZED":
+        # A completed Event is canonical for notification presentation even if
+        # the state transition is still catching up in the same SQLite tick.
+        # Do not fall back to the raw `car`/`person` topic payload in that
+        # window; the Event row remains read-only here.
+        if event is None or event.end_time is None:
             return envelope
         artifact = self._aggregator.media.get(event.canonical_artifact_id)
         edge_artifact = None
@@ -396,11 +390,19 @@ class NotificationClient(Communicator):
                 .order_by(EdgeMediaManifest.end_time.desc())
                 .first()
             )
-        if artifact is None and edge_artifact is None:
-            return envelope
         identity = event.canonical_sub_label or event.sub_label
         is_face = event.label == "person" and bool(identity)
-        label = event.display_label or identity or envelope.lpr_plate or event.label
+        label = event.display_label or (
+            identity
+            if is_face
+            else envelope.lpr_plate
+            if event.label == "car"
+            else None
+        ) or event.label
+        label_text = titlecase(str(label).replace("_", " "))
+        camera_name = self.config.cameras[event.camera].friendly_name or titlecase(
+            event.camera.replace("_", " ")
+        )
         if is_face:
             confidence = (event.data or {}).get("sub_label_score") or (
                 event.data or {}
@@ -412,17 +414,26 @@ class NotificationClient(Communicator):
             if confidence is not None
             else ""
         )
-        title = f"{'👤' if is_face else '🚗'} {label} · {event.camera}"
-        message = (
-            f"Đã nhận diện khuôn mặt{confidence_text}"
-            if is_face
-            else f"Xe đã kết thúc lượt qua{confidence_text}"
-        )
+        if is_face:
+            title = f"👤 {label_text} · {event.camera}"
+            message = f"Đã nhận diện khuôn mặt{confidence_text}"
+        elif event.label == "car" or envelope.lpr_plate:
+            title = f"🚗 {label_text} · {event.camera}"
+            message = f"Xe đã kết thúc lượt qua{confidence_text}"
+        else:
+            title = f"🚨 {label_text} · {event.camera}"
+            message = f"Phát hiện {label_text} tại {camera_name}{confidence_text}"
         return replace(
             envelope,
             title=title,
             message=message,
-            snapshot_ref=None,
+            snapshot_ref=event.id if event.has_snapshot else None,
+            snapshot_url=(
+                f"{str(self.config.notifications.public_base_url).rstrip('/')}/api/events/"
+                f"{event.id}/snapshot.jpg"
+                if event.has_snapshot and self.config.notifications.public_base_url
+                else None
+            ),
             media_artifact_id=(
                 artifact.id if artifact else edge_artifact.media_id if edge_artifact else None
             ),
@@ -432,7 +443,7 @@ class NotificationClient(Communicator):
                 f"/explore?event_id={event.id}&revision="
                 f"{artifact.revision if artifact else event.revision}"
                 if self.config.notifications.public_base_url
-                else ""
+                else f"/explore?event_id={event.id}"
             ),
             facts={
                 **envelope.facts,
@@ -475,12 +486,10 @@ class NotificationClient(Communicator):
                         kind="event_ended",
                         payload={"end_time": after.get("end_time")},
                     )
-            envelope = self._lpr_envelope(decoded)
-            if envelope:
-                result = ("license_plate", envelope)
-            else:
-                envelope = self._object_envelope(decoded)
-                result = ("object_detected", envelope) if envelope else None
+            # Object/LPR topics are enrichment only. The finalized Event is
+            # routed once below, after the canonical plate/face data is in
+            # SQLite; emitting here would duplicate the same Event.
+            self._lpr_envelope(decoded)
         elif (
             topic in ("face_recognized", "tracked_object_update")
             and isinstance(decoded, dict)
@@ -491,10 +500,6 @@ class NotificationClient(Communicator):
                 evidence_id = self._capture_evidence(
                     str(decoded.get("event_id") or decoded.get("id")), decoded
                 )
-                previous = Event.get_or_none(
-                    Event.id == str(decoded.get("event_id") or decoded.get("id"))
-                )
-                previous_revision = previous.revision if previous else 0
                 self._aggregator.observe(
                     observation_id=self._observation_id("face", decoded),
                     event_id=str(decoded.get("event_id") or decoded.get("id")),
@@ -506,16 +511,8 @@ class NotificationClient(Communicator):
                     frame_time=decoded.get("timestamp"),
                     evidence_id=evidence_id,
                 )
-                current = Event.get_or_none(
-                    Event.id == str(decoded.get("event_id") or decoded.get("id"))
-                )
-                if (
-                    current
-                    and current.revision > previous_revision
-                    and current.state == "FINALIZED"
-                ):
-                    self._route_finalized_event(current.id)
-            result = ("face_recognized", envelope) if envelope else None
+            # Face observations enrich the Event. Notification ownership stays
+            # with the single finalized Event path above.
         elif (
             topic == "tracked_object_update"
             and isinstance(decoded, dict)
@@ -538,22 +535,22 @@ class NotificationClient(Communicator):
 
     def _route_finalized_event(self, event_id: str) -> None:
         event = Event.get_or_none(Event.id == event_id)
-        if event is None:
+        if event is None or event.end_time is None or event.state != "FINALIZED":
             return
         plate = event.canonical_plate or (event.data or {}).get(
             "recognized_license_plate"
         )
         envelope = NotificationEnvelope(
             id=str(uuid.uuid4()),
-            source_type="event_revision",
-            source_id=f"{event.id}:r{event.revision}",
+            source_type="event",
+            source_id=str(event.id),
             camera=event.camera,
             timestamp=self._now(),
             title=event.display_label or event.label,
             message="Event finalized",
             direct_url="",
             snapshot_ref=event.id,
-            notification_type="event_revision",
+            notification_type="event",
             object_label=event.label,
             sub_label=event.canonical_sub_label or event.sub_label,
             genai={"_labels": [event.label], "_zones": event.zones or []},
@@ -561,7 +558,54 @@ class NotificationClient(Communicator):
             lpr_score=event.canonical_plate_score
             or (event.data or {}).get("recognized_license_plate_score"),
         )
-        self._route("license_plate" if plate else "alert", envelope)
+        # Finalized Frigate Event is the sole notification source for car and
+        # face. Intermediate LPR/face topics enrich the Event but must not
+        # emit a second message for the same event.
+        self._route(
+            "face_recognized"
+            if event.label == "person" and envelope.sub_label
+            else "alert",
+            envelope,
+        )
+
+    def _reconcile_recent_events(self) -> None:
+        """Recover missed end topics without bypassing canonical finalization."""
+        recent = (
+            Event.select(
+                Event.id,
+                Event.camera,
+                Event.label,
+                Event.start_time,
+                Event.end_time,
+                Event.state,
+            )
+            .where(
+                (Event.camera.is_null(False))
+                & (Event.label.in_(("car", "person")))
+                & (Event.end_time.is_null(False))
+            )
+            .order_by(Event.start_time)
+        )
+        for event in recent:
+            start_time = event.start_time
+            if isinstance(start_time, datetime.datetime):
+                started_at = start_time.replace(tzinfo=datetime.UTC).timestamp()
+            else:
+                started_at = float(start_time or 0)
+            if started_at < self._notification_started_at:
+                continue
+            if event.state == "FINALIZED":
+                self._route_finalized_event(str(event.id))
+                continue
+            self._aggregator.observe(
+                observation_id=self._observation_id(
+                    "event_ended_reconcile",
+                    {"event_id": event.id, "end_time": event.end_time},
+                ),
+                event_id=str(event.id),
+                kind="event_ended",
+                payload={"end_time": event.end_time},
+            )
 
     def _review_envelope(self, payload: dict[str, Any]) -> NotificationEnvelope | None:
         after = payload.get("after") or {}
@@ -572,9 +616,15 @@ class NotificationClient(Communicator):
             return None
         data = after.get("data") or {}
         metadata = dict(data.get("metadata") or {})
-        objects = [
-            value for value in data.get("objects", []) if "-verified" not in value
-        ]
+        objects = []
+        for value in data.get("objects", []):
+            if "-verified" in value:
+                continue
+            # Manual events are stored by Review as "label: sub_label".
+            # Notification filters operate on the canonical object label.
+            label = str(value).split(": ", 1)[0]
+            if label:
+                objects.append(label)
         objects.extend(data.get("sub_labels", []))
         metadata["_labels"] = objects
         metadata["_zones"] = data.get("zones", [])
@@ -595,8 +645,9 @@ class NotificationClient(Communicator):
             camera=camera,
             timestamp=float(after.get("start_time") or self._now()),
             title=metadata.get("title")
-            or f"{titlecase(label.replace('_', ' '))} detected",
-            message=metadata.get("shortSummary") or f"Detected on {camera_name}",
+            or f"🚨 {titlecase(label.replace('_', ' '))} · {camera}",
+            message=metadata.get("shortSummary")
+            or f"Phát hiện {titlecase(label.replace('_', ' '))} tại {camera_name}",
             direct_url=f"/review?id={source_id}",
             snapshot_ref=snapshot_ref,
             notification_type="alert",
@@ -688,8 +739,6 @@ class NotificationClient(Communicator):
             "sub_label": payload.get("name"),
         }
         evidence_id = self._capture_evidence(str(event_id), payload)
-        previous = Event.get_or_none(Event.id == str(event_id))
-        previous_revision = previous.revision if previous else 0
         self._aggregator.observe(
             observation_id=self._observation_id("lpr", payload),
             event_id=str(event_id),
@@ -703,9 +752,8 @@ class NotificationClient(Communicator):
             frame_time=payload.get("frame_time") or payload.get("timestamp"),
             evidence_id=evidence_id,
         )
-        current = Event.get_or_none(Event.id == str(event_id))
-        if current and current.revision > previous_revision and current.state == "FINALIZED":
-            self._route_finalized_event(str(event_id))
+        # Finalization and notification routing are owned by the maintenance
+        # loop after the observation reducer has committed the Event.
 
     def _capture_evidence(
         self, event_id: str, payload: dict[str, Any]

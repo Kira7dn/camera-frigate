@@ -8,7 +8,9 @@ from typing import Any
 
 import httpx
 
-from frigate.infrastructure.config.camera.notification import NotificationRecipientConfig
+from frigate.infrastructure.config.camera.notification import (
+    NotificationRecipientConfig,
+)
 
 from .envelope import NotificationEnvelope
 from .media import NotificationMediaSigner, load_snapshot
@@ -22,9 +24,9 @@ class DeliveryResult:
     retry_after: float | None = None
 
 
-def _provider_token(primary_name: str, legacy_name: str) -> str:
+def _provider_token(name: str) -> str:
     """Read a provider token without exposing it through config or status APIs."""
-    return os.getenv(primary_name, "").strip() or os.getenv(legacy_name, "").strip()
+    return os.getenv(name, "").strip()
 
 
 def _retry_after(response: httpx.Response) -> float | None:
@@ -81,7 +83,7 @@ class TelegramProvider:
 
     @property
     def configured(self) -> bool:
-        return bool(_provider_token("FRIGATE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"))
+        return bool(_provider_token("TELEGRAM_BOT_TOKEN"))
 
     async def deliver(
         self,
@@ -91,12 +93,12 @@ class TelegramProvider:
         public_base_url: str | None = None,
         media_url_ttl: int = 300,
     ) -> DeliveryResult:
-        token = _provider_token("FRIGATE_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN")
+        token = _provider_token("TELEGRAM_BOT_TOKEN")
         if not token:
             return DeliveryResult(False, False, "Telegram token is missing")
         base_url = f"https://api.telegram.org/bot{token}"
         text = envelope_text(envelope)
-        artifact_ref = envelope.artifact_ref or envelope.snapshot_ref
+        artifact_ref = envelope.artifact_ref
         snapshot = load_snapshot(artifact_ref) if artifact_ref else None
         try:
             if snapshot:
@@ -114,6 +116,15 @@ class TelegramProvider:
                         "photo": self.signer.url(
                             public_base_url, artifact_ref, media_url_ttl
                         ),
+                    },
+                )
+            elif envelope.snapshot_url:
+                response = await client.post(
+                    f"{base_url}/sendPhoto",
+                    data={
+                        "chat_id": recipient.chat_id,
+                        "caption": text[:1024],
+                        "photo": envelope.snapshot_url,
                     },
                 )
             elif artifact_ref:
@@ -136,7 +147,7 @@ class ZaloProvider:
 
     @property
     def configured(self) -> bool:
-        return bool(_provider_token("FRIGATE_ZALO_BOT_TOKEN", "ZALO_BOT_TOKEN"))
+        return bool(_provider_token("ZALO_BOT_TOKEN"))
 
     async def deliver(
         self,
@@ -146,14 +157,14 @@ class ZaloProvider:
         public_base_url: str | None,
         media_url_ttl: int,
     ) -> DeliveryResult:
-        token = _provider_token("FRIGATE_ZALO_BOT_TOKEN", "ZALO_BOT_TOKEN")
+        token = _provider_token("ZALO_BOT_TOKEN")
         if not token:
             return DeliveryResult(False, False, "Zalo token is missing")
         base_url = f"https://bot-api.zaloplatforms.com/bot{token}"
         text = envelope_text(envelope)
         payload: dict[str, Any] = {"chat_id": recipient.chat_id}
         endpoint = "sendMessage"
-        artifact_ref = envelope.artifact_ref or envelope.snapshot_ref
+        artifact_ref = envelope.artifact_ref
         if public_base_url and artifact_ref:
             endpoint = "sendPhoto"
             payload.update(
@@ -164,6 +175,9 @@ class ZaloProvider:
                     "caption": text,
                 }
             )
+        elif envelope.snapshot_url:
+            endpoint = "sendPhoto"
+            payload.update({"photo": envelope.snapshot_url, "caption": text})
         else:
             payload["text"] = text
         try:
