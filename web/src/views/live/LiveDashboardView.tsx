@@ -74,6 +74,19 @@ export default function LiveDashboardView({
   toggleFullscreen,
 }: LiveDashboardViewProps) {
   const { t } = useTranslation(["views/live"]);
+  const [runtimeTestRunning, setRuntimeTestRunning] = useState(false);
+
+  const toggleRuntimeTest = useCallback(async () => {
+    const action = runtimeTestRunning ? "stop" : "start";
+    const response = await fetch(`/api/runtime/input/${action}`, {
+      method: "POST",
+      headers: { "X-CSRF-Token": "1" },
+    });
+    if (!response.ok) {
+      throw new Error(`runtime input ${action} failed: ${response.status}`);
+    }
+    setRuntimeTestRunning(action === "start");
+  }, [runtimeTestRunning]);
 
   const { data: config } = useSWR<FrigateConfig>("config");
 
@@ -223,7 +236,6 @@ export default function LiveDashboardView({
     };
   }, []);
 
-  const [globalAutoLive] = useUserPersistence("autoLiveView", true);
   const [displayCameraNames] = useUserPersistence("displayCameraNames", false);
 
   const { allGroupsStreamingSettings, setAllGroupsStreamingSettings } =
@@ -401,6 +413,11 @@ export default function LiveDashboardView({
       className="scrollbar-container size-full select-none overflow-y-auto px-1 pt-2 md:p-2"
       ref={containerRef}
     >
+      <div className="flex justify-end px-2 pb-1">
+        <Button size="sm" variant={runtimeTestRunning ? "destructive" : "secondary"} onClick={toggleRuntimeTest}>
+          {runtimeTestRunning ? "Stop mock live" : "Test mock live"}
+        </Button>
+      </div>
       {isMobile && (
         <div className="relative flex h-11 items-center justify-between">
           <Logo className="absolute inset-x-1/2 h-8 -translate-x-1/2" />
@@ -548,15 +565,6 @@ export default function LiveDashboardView({
                   const streamName = streamExists
                     ? streamNameFromSettings
                     : firstStreamEntry;
-                  const streamType =
-                    currentGroupStreamingSettings?.[camera.name]?.streamType;
-                  const autoLive =
-                    streamType !== undefined
-                      ? streamType !== "no-streaming"
-                      : undefined;
-                  const showStillWithoutActivity =
-                    currentGroupStreamingSettings?.[camera.name]?.streamType !==
-                    "continuous";
                   const useWebGL =
                     currentGroupStreamingSettings?.[camera.name]
                       ?.compatibilityMode || false;
@@ -605,10 +613,8 @@ export default function LiveDashboardView({
                         preferredLiveMode={
                           preferredLiveModes[camera.name] ?? "mse"
                         }
-                        autoLive={autoLive ?? globalAutoLive}
-                        showStillWithoutActivity={
-                          showStillWithoutActivity ?? true
-                        }
+                        autoLive={true}
+                        showStillWithoutActivity={false}
                         alwaysShowCameraName={displayCameraNames}
                         useWebGL={useWebGL}
                         playInBackground={false}

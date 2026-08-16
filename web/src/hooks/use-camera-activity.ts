@@ -33,6 +33,7 @@ type useCameraActivityReturn = {
 export function useCameraActivity(
   camera: CameraConfig | undefined,
   revalidateOnFocus: boolean = true,
+  liveStatus?: "online" | "offline",
 ): useCameraActivityReturn {
   const { data: config } = useSWR<FrigateConfig>("config", {
     revalidateOnFocus: false,
@@ -139,6 +140,7 @@ export function useCameraActivity(
           area: updatedEvent.after.area,
           ratio: updatedEvent.after.ratio,
           score: updatedEvent.after.score,
+          box: updatedEvent.after.box,
           sub_label: updatedEvent.after.sub_label?.[0] ?? "",
         };
         return [...existingObjects, newActiveObject];
@@ -158,6 +160,7 @@ export function useCameraActivity(
         ...existing,
         label,
         stationary: updatedEvent.after.stationary,
+        box: updatedEvent.after.box,
       };
       return newObjects;
     });
@@ -168,6 +171,10 @@ export function useCameraActivity(
   const stats = useAutoFrigateStats();
 
   const offline = useMemo(() => {
+    if (liveStatus !== undefined) {
+      return liveStatus === "offline";
+    }
+
     if (!stats) {
       return false;
     }
@@ -185,7 +192,7 @@ export function useCameraActivity(
     return (
       cameras[camera.name]?.camera_fps == 0 && stats["service"].uptime > 60
     );
-  }, [camera, stats]);
+  }, [camera, liveStatus, stats]);
 
   const isCameraEnabled = cameraEnabled ? cameraEnabled === "ON" : true;
 

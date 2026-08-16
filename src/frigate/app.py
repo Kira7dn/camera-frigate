@@ -362,13 +362,6 @@ class FrigateApp:
             self.onvif_controller,
             self.ptz_metrics,
             comms,
-            edge_control=lambda camera, operation, payload: (
-                hasattr(self, "tracker_maintainer")
-                and self.tracker_maintainer.control_camera(
-                    camera, operation, payload
-                )
-            ),
-            edge_cameras=frozenset(self.topology_plan.camera_owners),
         )
 
     def init_profile_manager(self) -> None:
@@ -573,7 +566,27 @@ class FrigateApp:
 
     def init_auth(self) -> None:
         if self.config.auth.enabled:
-            if User.select().count() == 0:
+            username = self.config.auth.user or "admin"
+            password = self.config.auth.password
+
+            if password:
+                password_hash = hash_password(
+                    password, iterations=self.config.auth.hash_iterations
+                )
+                User.replace(
+                    username=username,
+                    role="admin",
+                    password_hash=password_hash,
+                    notification_tokens=[],
+                ).execute()
+
+                logger.info("********************************************************")
+                logger.info("********************************************************")
+                logger.info("***    Config-based admin credentials detected.       ***")
+                logger.info(f"***    Ensured admin user: {username}               ***")
+                logger.info("********************************************************")
+                logger.info("********************************************************")
+            elif User.select().count() == 0:
                 password = secrets.token_hex(16)
                 password_hash = hash_password(
                     password, iterations=self.config.auth.hash_iterations
@@ -688,8 +701,9 @@ class FrigateApp:
                     self.profile_manager,
                     config_holder=self.config_holder,
                     tracker_maintainer=self.tracker_maintainer,
+                    camera_maintainer=self.camera_maintainer,
                 ),
-                host="127.0.0.1",
+                host="0.0.0.0",
                 port=5001,
                 log_level="error",
             )

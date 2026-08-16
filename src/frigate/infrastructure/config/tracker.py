@@ -10,13 +10,6 @@ from pydantic import Field, RootModel, model_validator
 from .base import FrigateBaseModel
 
 
-class TrackerTlsConfig(FrigateBaseModel):
-    ca: str = ""
-    certificate: str = ""
-    key: str = ""
-    server_name: str = ""
-
-
 class TrackerEvidenceConfig(FrigateBaseModel):
     memory_bytes_per_camera: int = Field(
         default=32 * 1024 * 1024, ge=1024 * 1024, le=1024 * 1024 * 1024
@@ -41,21 +34,11 @@ class TrackerNodeConfig(FrigateBaseModel):
     shutdown_drain: float = Field(default=10, gt=0, le=120)
     evidence: TrackerEvidenceConfig = Field(default_factory=TrackerEvidenceConfig)
     spool: TrackerSpoolConfig = Field(default_factory=TrackerSpoolConfig)
-    tls: TrackerTlsConfig = Field(default_factory=TrackerTlsConfig)
 
     @model_validator(mode="after")
-    def require_private_mtls(self) -> Self:
+    def validate_tracker_node(self) -> Self:
         if not self.endpoint:
             raise ValueError("tracker node endpoint is required")
-        missing = [
-            field
-            for field in ("ca", "certificate", "key", "server_name")
-            if not getattr(self.tls, field)
-        ]
-        if missing:
-            raise ValueError(
-                "tracker nodes require mTLS fields: " + ", ".join(missing)
-            )
         if len(self.cameras) != len(set(self.cameras)):
             raise ValueError("a tracker node cannot list a camera more than once")
         return self

@@ -118,6 +118,69 @@ async def go2rtc_streams(request: Request):
     return JSONResponse(content=stream_data)
 
 
+@router.get("/live/{camera_name}", dependencies=[Depends(allow_any_authenticated())])
+async def live_session(request: Request, camera_name: str, stream: str | None = None):
+    """Return the Frigate-owned live session contract for one camera."""
+    frigate_config = request.app.frigate_config
+    camera = frigate_config.cameras.get(camera_name)
+    if camera is None:
+        return JSONResponse(
+            content={"success": False, "message": f"Camera {camera_name} not found"},
+            status_code=404,
+        )
+
+    current_user = await get_current_user(request)
+    if not isinstance(current_user, JSONResponse):
+        role = current_user["role"]
+        roles_dict = frigate_config.auth.roles
+        if role != "admin" and roles_dict.get(role):
+            allowed_cameras = set(
+                User.get_allowed_cameras(
+                    role, roles_dict, set(frigate_config.cameras.keys())
+                )
+            )
+            if camera_name not in allowed_cameras:
+                return JSONResponse(
+                    content={"success": False, "message": "Camera access denied"},
+                    status_code=403,
+                )
+
+    stream_names = set(camera.live.streams.values())
+    stream_name = stream or next(iter(stream_names), camera_name)
+    if stream_name not in stream_names and stream_name != camera_name:
+        return JSONResponse(
+            content={"success": False, "message": "Stream is not owned by camera"},
+            status_code=400,
+        )
+
+    try:
+        response = await asyncio.to_thread(
+            requests.get,
+            "http://127.0.0.1:1984/api/streams",
+            params={"src": stream_name},
+            timeout=5,
+        )
+        stream_data = response.json() if response.ok else {}
+    except (requests.RequestException, ValueError):
+        stream_data = {}
+
+    producers = stream_data.get("producers") or []
+    return JSONResponse(
+        content={
+            "camera": camera_name,
+            "stream_name": stream_name,
+            "status": "online" if producers else "offline",
+            "video_source": "frigate-main/go2rtc",
+            "inference": {
+                "configured": camera.media_mode.value == "external",
+                "status": "external" if camera.media_mode.value == "external" else "local",
+            },
+            "transports": ["webrtc", "mse"] if producers else [],
+            "producer_count": len(producers),
+        }
+    )
+
+
 @router.get(
     "/go2rtc/streams/{stream_name}",
     dependencies=[Depends(require_go2rtc_stream_access)],

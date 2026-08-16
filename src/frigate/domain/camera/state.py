@@ -540,6 +540,7 @@ class CameraState:
                         "area": obj.obj_data["area"],
                         "ratio": obj.obj_data["ratio"],
                         "score": obj.obj_data["score"],
+                        "box": obj.obj_data["box"],
                         "sub_label": sub_label,
                         "current_zones": obj.current_zones,
                     }

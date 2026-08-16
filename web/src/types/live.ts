@@ -31,6 +31,19 @@ export type LiveStreamMetadata = {
   consumers: LiveConsumerMetadata[];
 };
 
+export type LiveSession = {
+  camera: string;
+  stream_name: string;
+  status: "online" | "offline";
+  video_source: "frigate-main/go2rtc";
+  inference: {
+    configured: boolean;
+    status: "external" | "local";
+  };
+  transports: Array<"webrtc" | "mse">;
+  producer_count: number;
+};
+
 export type LivePlayerError = "stalled" | "startup" | "mse-decode";
 
 export type AudioState = Record<string, boolean>;

@@ -849,6 +849,7 @@ class TrackerRuntime:
         self.session_complete_written = False
         self.degraded = False
         self._camera_start_thread: threading.Thread | None = None
+        self._runtime_input_thread: threading.Thread | None = None
         self.consumer = threading.Thread(
             target=self._consume, name="tracker_frames", daemon=True
         )
@@ -894,6 +895,30 @@ class TrackerRuntime:
             self._camera_start_thread.start()
         else:
             self.cameras.start()
+        self._runtime_input_thread = threading.Thread(
+            target=self._watch_runtime_input,
+            name="tracker-runtime-input",
+            daemon=True,
+        )
+        self._runtime_input_thread.start()
+
+    def _watch_runtime_input(self) -> None:
+        """Apply the shared runtime input mode without restarting capture."""
+        state_path = Path("/config/runtime-input.json")
+        last_mode = "rtsp"
+        while not self.stop_event.is_set():
+            mode = "rtsp"
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+                if payload.get("mode") == "mock":
+                    mode = "mock"
+            except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+                pass
+            if mode != last_mode:
+                self.cameras.set_runtime_input(list(self.config.cameras), mode == "mock")
+                logger.info("Tracker runtime input changed to %s", mode)
+                last_mode = mode
+            self.stop_event.wait(0.25)
 
     def _wait_for_input_start(self, marker: Path) -> None:
         """Release direct camera readers only after the shared E2E barrier."""
@@ -994,6 +1019,8 @@ class TrackerRuntime:
         timeout = self.node_config.shutdown_drain
         if self._camera_start_thread is not None:
             self._camera_start_thread.join(timeout=timeout)
+        if self._runtime_input_thread is not None:
+            self._runtime_input_thread.join(timeout=timeout)
         self.cameras.join(timeout=timeout)
         self.consumer.join(timeout=timeout)
         self.ptz.join(timeout=timeout)
@@ -1022,15 +1049,12 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--bind", default="0.0.0.0:50052")
     parser.add_argument("--spool-dir", default="/var/lib/camera-tracker/spool")
     parser.add_argument("--media-dir", default="/media/tracker")
-    parser.add_argument("--certificate", required=True)
-    parser.add_argument("--key", required=True)
-    parser.add_argument("--client-ca", required=True)
-    parser.add_argument("--allow-client", action="append", required=True)
+    parser.add_argument("--allow-client", action="append", default=[])
     return parser.parse_args()
 
 
 async def _run(args: argparse.Namespace) -> None:
-    from extension.tracker.transport import TrackerService, TrackerTls, start_server
+    from extension.tracker.transport import TrackerService, start_server
 
     config = await asyncio.to_thread(
         PlatformConfigLoader.load_runtime,
@@ -1059,15 +1083,7 @@ async def _run(args: argparse.Namespace) -> None:
         runtime.active_lifecycle_count,
     )
     runtime.start(service.publish)
-    server = await start_server(
-        args.bind,
-        service,
-        TrackerTls(
-            Path(args.certificate).read_bytes(),
-            Path(args.key).read_bytes(),
-            Path(args.client_ca).read_bytes(),
-        ),
-    )
+    server = await start_server(args.bind, service)
     try:
         while not stop_event.is_set():
             service.degraded = runtime.degraded

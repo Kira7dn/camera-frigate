@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import threading
 import time
@@ -49,6 +50,7 @@ class HealthState:
     event_end_successes: int = 0
     event_sync_failures: int = 0
     last_event_id: str = ""
+    source_mode: str = "rtsp"
 
     @property
     def ready(self) -> bool:
@@ -59,8 +61,10 @@ class HealthState:
 class LatestFrameReader:
     """Latest frame plus a bounded producer-owned rolling evidence buffer."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, mock_url: str | None = None) -> None:
         self.url = url
+        self.mock_url = mock_url
+        self.state_path = Path("/config/runtime-input.json")
         self._capture: cv2.VideoCapture | None = None
         self._frame: object = None
         self._frame_at = 0.0
@@ -75,16 +79,36 @@ class LatestFrameReader:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            capture = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+            with self._lock:
+                url = self.url
+            capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            mock_capture = (
+                cv2.VideoCapture(self.mock_url, cv2.CAP_FFMPEG)
+                if self.mock_url
+                else None
+            )
             self._capture = capture
             if not capture.isOpened():
                 capture.release()
+                if mock_capture is not None:
+                    mock_capture.release()
                 self._capture = None
                 self._stop.wait(1.0)
                 continue
             try:
                 while not self._stop.is_set():
                     ok, frame = capture.read()
+                    mock_ok, mock_frame = (False, None)
+                    if mock_capture is not None:
+                        mock_ok, mock_frame = mock_capture.read()
+                    try:
+                        mode = json.loads(
+                            self.state_path.read_text(encoding="utf-8")
+                        ).get("mode", "rtsp")
+                    except (FileNotFoundError, json.JSONDecodeError, OSError):
+                        mode = "rtsp"
+                    if mode == "mock" and mock_ok:
+                        frame, ok = mock_frame, True
                     if not ok:
                         break
                     with self._lock:
@@ -95,6 +119,8 @@ class LatestFrameReader:
                             del self._history[:-120]
             finally:
                 capture.release()
+                if mock_capture is not None:
+                    mock_capture.release()
                 self._capture = None
             self._stop.wait(0.5)
 
@@ -132,7 +158,8 @@ class CameraWorker:
         self.events = events
         self.health = health
         self.stop_event = stop_event
-        self.reader = LatestFrameReader(resolve_stream_url(config, camera))
+        mock_url = os.environ.get(f"CAMERA_MOCK_VIDEO_{camera.upper()}")
+        self.reader = LatestFrameReader(resolve_stream_url(config, camera), mock_url)
         self.media = SafetyMediaStore()
         self.gate = TemporalGate({camera: config.cameras[camera]})
         self.pending: dict[tuple[str, str], HazardDecision] = {}
@@ -142,6 +169,12 @@ class CameraWorker:
         interval = 1.0 / self.config.cameras[self.camera].inference_fps
         try:
             while not self.stop_event.is_set():
+                try:
+                    self.health.source_mode = json.loads(
+                        Path("/config/runtime-input.json").read_text(encoding="utf-8")
+                    ).get("mode", "rtsp")
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    self.health.source_mode = "rtsp"
                 sample = self.reader.latest()
                 if sample is None:
                     self.health.source = False
@@ -205,6 +238,7 @@ class SafetyApplication:
         self.events = SafetyProducer(self.config.grpc_url)
         self.model = None
         self.workers: list[CameraWorker] = []
+        self.control_server: ThreadingHTTPServer | None = None
 
     def start(self) -> None:
         self.model = OnnxSafetyModel.build(self.config.model)

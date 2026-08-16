@@ -38,6 +38,9 @@ export function AnimatedEventCard({
   const { t } = useTranslation(["views/events"]);
   const { data: config } = useSWR<FrigateConfig>("config");
   const apiHost = useApiHost();
+  const isExternalCamera =
+    config?.cameras[event.camera]?.media_mode === "external";
+  const canPlayAlertVideo = config !== undefined && !isExternalCamera;
 
   const currentHour = useMemo(() => isCurrentHour(event.start_time), [event]);
 
@@ -52,7 +55,7 @@ export function AnimatedEventCard({
 
   const previews = useCameraPreviews(initialTimeRange, {
     camera: event.camera,
-    fetchPreviews: !currentHour,
+    fetchPreviews: !currentHour && !isExternalCamera,
   });
 
   const getEventType = useCallback(
@@ -190,7 +193,7 @@ export function AnimatedEventCard({
             </TooltipTrigger>
             <TooltipContent>{t("markAsReviewed")}</TooltipContent>
           </Tooltip>
-          {previews != undefined && alertVideosLoaded && (
+          {(isExternalCamera || previews != undefined) && alertVideosLoaded && (
             <div
               className="size-full cursor-pointer"
               onClick={onOpenReview}
@@ -202,7 +205,7 @@ export function AnimatedEventCard({
                 }
               }}
             >
-              {!alertVideos ? (
+              {!alertVideos || !canPlayAlertVideo ? (
                 <img
                   className={cn(
                     "h-full w-auto min-w-10 select-none object-contain",
@@ -214,7 +217,7 @@ export function AnimatedEventCard({
                 />
               ) : (
                 <>
-                  {previews.length ? (
+                  {previews?.length ? (
                     <VideoPreview
                       relevantPreview={previews[previews.length - 1]}
                       startTime={event.start_time}
@@ -232,25 +235,12 @@ export function AnimatedEventCard({
                       windowVisible={windowVisible}
                     />
                   ) : (
-                    <video
-                      preload="auto"
-                      autoPlay
-                      playsInline
-                      muted
-                      disableRemotePlayback
-                      disablePictureInPicture
-                      loop
-                      onTimeUpdate={() => {
-                        if (!isLoaded) {
-                          setIsLoaded(true);
-                        }
-                      }}
-                    >
-                      <source
-                        src={`${baseUrl}api/review/${event.id}/preview?format=mp4`}
-                        type="video/mp4"
-                      />
-                    </video>
+                    <img
+                      className="h-full w-auto min-w-10 select-none object-contain"
+                      src={`${apiHost}${event.thumb_path.replace("/media/frigate/", "")}`}
+                      loading="lazy"
+                      onLoad={() => setIsLoaded(true)}
+                    />
                   )}
                 </>
               )}

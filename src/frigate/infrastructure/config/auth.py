@@ -6,6 +6,18 @@ __all__ = ["AuthConfig"]
 
 
 class AuthConfig(FrigateBaseModel):
+    user: str | None = Field(
+        default=None,
+        title="Admin username",
+        description="Username to use when seeding/replacing the built-in admin account from config.",
+    )
+    password: str | None = Field(
+        default=None,
+        title="Admin password",
+        description="Password to use when seeding/replacing the built-in admin account from config. "
+        "Minimum 6 characters.",
+        min_length=6,
+    )
     enabled: bool = Field(
         default=True,
         title="Enable authentication",

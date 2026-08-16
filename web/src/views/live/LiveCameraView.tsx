@@ -29,6 +29,7 @@ import useKeyboardListener from "@/hooks/use-keyboard-listener";
 import { CameraConfig, FrigateConfig } from "@/types/frigateConfig";
 import {
   LivePlayerError,
+  LiveSession,
   LiveStreamMetadata,
   VideoResolutionType,
 } from "@/types/live";
@@ -178,8 +179,18 @@ export default function LiveCameraView({
     }
   }, [streamNameLoaded, camera.live.streams, streamName, setStreamName]);
 
+  const { data: liveSession } = useSWR<LiveSession>(
+    streamNameLoaded && streamName
+      ? `live/${encodeURIComponent(camera.name)}?stream=${encodeURIComponent(streamName)}`
+      : null,
+    { revalidateOnFocus: true, refreshInterval: 5000 },
+  );
+  const effectiveStreamName = liveSession?.stream_name ?? streamName;
+
   const { data: cameraMetadata } = useSWR<LiveStreamMetadata>(
-    isRestreamed ? `go2rtc/streams/${streamName}` : null,
+    isRestreamed && effectiveStreamName
+      ? `go2rtc/streams/${effectiveStreamName}`
+      : null,
     {
       revalidateOnFocus: false,
       revalidateOnReconnect: false,
@@ -681,7 +692,7 @@ export default function LiveCameraView({
                 camera.audio_transcription.enabled_in_config
               }
               fullscreen={fullscreen}
-              streamName={streamName ?? ""}
+              streamName={effectiveStreamName ?? ""}
               setStreamName={setStreamName}
               preferredLiveMode={preferredLiveMode}
               playInBackground={playInBackground ?? false}
@@ -764,6 +775,7 @@ export default function LiveCameraView({
                   showStillWithoutActivity={false}
                   alwaysShowCameraName={false}
                   cameraConfig={camera}
+                  liveStatus={liveSession?.status ?? "online"}
                   playAudio={audio}
                   playInBackground={playInBackground ?? false}
                   showStats={showStats}
@@ -771,7 +783,7 @@ export default function LiveCameraView({
                   iOSCompatFullScreen={isIOS}
                   preferredLiveMode={preferredLiveMode}
                   useWebGL={true}
-                  streamName={streamName ?? ""}
+                  streamName={effectiveStreamName ?? ""}
                   pip={pip}
                   containerRef={containerRef}
                   setFullResolution={setFullResolution}

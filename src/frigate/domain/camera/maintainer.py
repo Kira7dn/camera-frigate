@@ -61,6 +61,20 @@ class CameraMaintainer(threading.Thread):
         self.metrics_manager = metrics_manager
         self.allowed_cameras = frozenset(config.cameras)
 
+    def set_runtime_input(self, cameras: list[str], mock: bool) -> None:
+        """Switch frame selection without stopping RTSP, capture, or queues."""
+        requested = set(cameras)
+        unknown = requested.difference(self.camera_metrics)
+        if unknown:
+            raise ValueError(f"Unknown cameras: {sorted(unknown)}")
+        for camera in requested:
+            self.camera_metrics[camera].runtime_input.value = 1 if mock else 0
+        logger.info(
+            "Runtime input changed to %s for %s",
+            "mock" if mock else "rtsp",
+            ",".join(sorted(requested)),
+        )
+
     def __ensure_camera_stop_event(self, camera: str) -> MpEvent:
         camera_stop_event = self.camera_stop_events.get(camera)
 

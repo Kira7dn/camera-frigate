@@ -54,10 +54,7 @@ def preview_ts(
         camera_list = allowed_cameras
 
     if not camera_list:
-        return JSONResponse(
-            content={"success": False, "message": "No previews found."},
-            status_code=404,
-        )
+        return JSONResponse(content=[], status_code=200)
 
     previews = (
         Previews.select(
@@ -93,13 +90,7 @@ def preview_ts(
         )
 
     if not clips:
-        return JSONResponse(
-            content={
-                "success": False,
-                "message": "No previews found.",
-            },
-            status_code=404,
-        )
+        return JSONResponse(content=[], status_code=200)
 
     return JSONResponse(content=clips, status_code=200)
 

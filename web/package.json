@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host",
     "postinstall": "patch-package",
-    "build": "tsc && vite build --base=/BASE_PATH/",
+    "build": "tsc --pretty false && vite build --base=/BASE_PATH/ --logLevel=warn",
     "lint": "eslint --ext .jsx,.js,.tsx,.ts --ignore-path .gitignore . && npm run e2e:lint",
     "e2e:lint": "node e2e/scripts/lint-specs.mjs",
     "lint:fix": "eslint --ext .jsx,.js,.tsx,.ts --ignore-path .gitignore --fix .",

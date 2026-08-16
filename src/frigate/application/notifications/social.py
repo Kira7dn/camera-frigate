@@ -187,7 +187,7 @@ class SocialClient:
         zalo_config = self.config.notifications.channels.zalo
         public_base_url = self.config.notifications.public_base_url
         if provider == "zalo" and not self.public_media_ready():
-            return DeliveryResult(False, True, "Public media tunnel is unavailable")
+            public_base_url = None
         return await self.zalo.deliver(
             client,
             recipient,

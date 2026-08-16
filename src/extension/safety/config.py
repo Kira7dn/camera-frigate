@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -117,7 +118,7 @@ def load_config(path: str | Path) -> SafetyConfig:
         raise SafetyConfigError("Safety model does not exist at /models/smoking/best.onnx")
 
     return SafetyConfig(
-        grpc_url=SAFETY_GRPC_URL,
+        grpc_url=os.environ.get("SAFETY_GRPC_URL", SAFETY_GRPC_URL),
         restream_url=SAFETY_RESTREAM_URL,
         model=ModelConfig(model_path, ("CPUExecutionProvider",)),
         cameras=MappingProxyType(cameras),

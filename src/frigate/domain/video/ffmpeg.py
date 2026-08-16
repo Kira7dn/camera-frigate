@@ -91,6 +91,8 @@ logger = logging.getLogger(__name__)
 
 def capture_frames(
     ffmpeg_process: sp.Popen[Any],
+    mock_ffmpeg_process: sp.Popen[Any] | None,
+    runtime_input: Any,
     config: CameraConfig,
     shm_frame_count: int,
     frame_index: int,
@@ -142,7 +144,10 @@ def capture_frames(
                 logger.error(f"{config.name}: SharedMemoryFrameManager write returned None.")
                 break
             try:
-                process_stdout = ffmpeg_process.stdout
+                active_process = (
+                    mock_ffmpeg_process if runtime_input.value == 1 else ffmpeg_process
+                )
+                process_stdout = active_process.stdout if active_process else None
                 if process_stdout is None:
                     logger.error(f"{config.name}: ffmpeg stdout is unavailable.")
                     break
@@ -169,7 +174,7 @@ def capture_frames(
                     f"{config.name}: Unable to read frames from ffmpeg process."
                 )
 
-                if ffmpeg_process.poll() is not None:
+                if active_process is not None and active_process.poll() is not None:
                     logger.error(
                         f"{config.name}: ffmpeg process is not running. exiting capture thread..."
                     )
@@ -247,6 +252,7 @@ class CameraWatchdog(threading.Thread):
         reconnects: Any | None,
         detection_frame: Any,
         stop_event,
+        runtime_input: Any,
     ):
         threading.Thread.__init__(self)
         self.logger = logging.getLogger(f"watchdog.{config.name}")
@@ -270,6 +276,8 @@ class CameraWatchdog(threading.Thread):
         self.stalls = stalls
         self.reconnects = reconnects
         self.detection_frame = detection_frame
+        self.runtime_input = runtime_input
+        self.mock_ffmpeg_process: sp.Popen[Any] | None = None
 
         self.config_subscriber = CameraConfigUpdateSubscriber(
             None,
@@ -722,11 +730,64 @@ class CameraWatchdog(threading.Thread):
             ffmpeg_cmd, self.logger, self.logpipe, self.frame_size
         )
         self.ffmpeg_pid.value = self.ffmpeg_detect_process.pid
+        mock_path = os.environ.get(
+            f"CAMERA_MOCK_VIDEO_{str(self.config.name).upper()}"
+        )
+        if mock_path and os.path.isfile(mock_path):
+            mock_cmd: list[str] = []
+            skip_next = False
+            for argument in ffmpeg_cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if argument in {
+                    "-rtsp_transport",
+                    "-timeout",
+                    "-rw_timeout",
+                    "-stimeout",
+                    "-user_agent",
+                }:
+                    skip_next = True
+                    continue
+                mock_cmd.append(argument)
+            source_paths = [str(item.path) for item in self.config.ffmpeg.inputs]
+            replaced = False
+            for index, argument in enumerate(mock_cmd):
+                if argument in source_paths or argument.startswith("rtsp://"):
+                    mock_cmd[index] = mock_path
+                    replaced = True
+                    break
+            if replaced:
+                input_index = mock_cmd.index(mock_path)
+                input_option_index = input_index
+                while input_option_index > 0 and mock_cmd[input_option_index - 1] != "-i":
+                    input_option_index -= 1
+                if input_option_index > 0 and mock_cmd[input_option_index - 1] == "-i":
+                    mock_cmd[input_option_index - 1:input_option_index - 1] = [
+                        "-stream_loop",
+                        "-1",
+                        "-re",
+                    ]
+                self.logger.info("Starting mock ffmpeg for %s: %s", self.config.name, mock_cmd)
+                self.mock_ffmpeg_process = start_or_restart_ffmpeg(
+                    mock_cmd,
+                    self.logger,
+                    LogPipe(f"ffmpeg.{self.config.name}.mock"),
+                    self.frame_size,
+                )
+            else:
+                self.logger.error(
+                    "Mock video configured for %s but detect input was not found: %s",
+                    self.config.name,
+                    mock_path,
+                )
         self.capture_thread = CameraCaptureRunner(
             self.config,
             self.shm_frame_count,
             self.frame_index,
             self.ffmpeg_detect_process,
+            self.mock_ffmpeg_process,
+            self.runtime_input,
             self.frame_shape,
             self.frame_queue,
             self.camera_fps,
@@ -788,6 +849,9 @@ class CameraWatchdog(threading.Thread):
         if self.ffmpeg_detect_process is not None:
             stop_ffmpeg(self.ffmpeg_detect_process, self.logger)
             self.ffmpeg_detect_process = None
+        if self.mock_ffmpeg_process is not None:
+            stop_ffmpeg(self.mock_ffmpeg_process, self.logger)
+            self.mock_ffmpeg_process = None
         for p in self.ffmpeg_other_processes[:]:
             if p["process"] is not None:
                 stop_ffmpeg(p["process"], self.logger)
@@ -802,6 +866,8 @@ class CameraCaptureRunner(threading.Thread):
         shm_frame_count: int,
         frame_index: int,
         ffmpeg_process: sp.Popen[Any],
+        mock_ffmpeg_process: sp.Popen[Any] | None,
+        runtime_input: Any,
         frame_shape: tuple[int, int],
         frame_queue: Queue,
         fps: Any,
@@ -820,12 +886,16 @@ class CameraCaptureRunner(threading.Thread):
         self.skipped_fps = skipped_fps
         self.frame_manager = SharedMemoryFrameManager()
         self.ffmpeg_process = ffmpeg_process
+        self.mock_ffmpeg_process = mock_ffmpeg_process
+        self.runtime_input = runtime_input
         self.current_frame = Value("d", 0.0)
         self.last_frame = 0
 
     def run(self):
         capture_frames(
             self.ffmpeg_process,
+            self.mock_ffmpeg_process,
+            self.runtime_input,
             self.config,
             self.shm_frame_count,
             self.frame_index,
@@ -872,6 +942,7 @@ class CameraCapture(FrigateProcess):
             self.camera_metrics.reconnects_last_hour,
             self.camera_metrics.detection_frame,
             self.stop_event,
+            self.camera_metrics.runtime_input,
         )
         camera_watchdog.start()
         camera_watchdog.join()

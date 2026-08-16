@@ -68,23 +68,8 @@ def _decode(value: bytes) -> dict[str, Any]:
     return decoded
 
 
-@dataclass(frozen=True, slots=True)
-class TrackerTls:
-    certificate: bytes
-    private_key: bytes
-    peer_ca: bytes
-
-
-@dataclass(frozen=True, slots=True)
-class ClientTls:
-    ca: bytes
-    certificate: bytes
-    private_key: bytes
-    server_name: str
-
-
 class TrackerService:
-    """Stream durable producer updates over a private mTLS endpoint."""
+    """Stream durable producer updates over the configured gRPC endpoint."""
 
     def __init__(
         self,
@@ -160,7 +145,12 @@ class TrackerService:
         )
         request_task = asyncio.ensure_future(anext(requests))
         try:
-            start = _decode(await request_task)
+            try:
+                start = _decode(await request_task)
+            except StopAsyncIteration:
+                # A client may disconnect before sending session_start. This is
+                # a normal reconnect path, not a tracker server failure.
+                return
             request_task = asyncio.ensure_future(anext(requests))
             if (
                 start.get("type") != "session_start"
@@ -255,21 +245,11 @@ class TrackerService:
         )
 
 
-async def start_server(
-    bind: str, service: TrackerService, tls: TrackerTls | None = None
-) -> aio.Server:
+async def start_server(bind: str, service: TrackerService) -> aio.Server:
     """Start the private tracker endpoint."""
     server = aio.server()
     server.add_generic_rpc_handlers((service.handler(),))
-    if tls is None:
-        server.add_insecure_port(bind)
-    else:
-        credentials = grpc.ssl_server_credentials(
-            ((tls.private_key, tls.certificate),),
-            root_certificates=tls.peer_ca,
-            require_client_auth=True,
-        )
-        server.add_secure_port(bind, credentials)
+    server.add_insecure_port(bind)
     await server.start()
     return server
 
@@ -651,15 +631,6 @@ class TrackerMaintainer(threading.Thread):
         self.producer_event_aggregator = EventAggregator()
 
     @staticmethod
-    def _tls(node: Any) -> ClientTls:
-        return ClientTls(
-            Path(node.tls.ca).read_bytes(),
-            Path(node.tls.certificate).read_bytes(),
-            Path(node.tls.key).read_bytes(),
-            node.tls.server_name,
-        )
-
-    @staticmethod
     def _event_state(update: TrackerUpdate) -> EventStateEnum:
         return {
             TrackerOperation.START: EventStateEnum.start,
@@ -1033,17 +1004,7 @@ class TrackerMaintainer(threading.Thread):
             heartbeat: asyncio.Task[None] | None = None
             session_started = False
             try:
-                tls = await asyncio.to_thread(self._tls, node)
-                credentials = grpc.ssl_channel_credentials(
-                    root_certificates=tls.ca,
-                    private_key=tls.private_key,
-                    certificate_chain=tls.certificate,
-                )
-                channel = aio.secure_channel(
-                    node.endpoint,
-                    credentials,
-                    options=(("grpc.ssl_target_name_override", tls.server_name),),
-                )
+                channel = aio.insecure_channel(node.endpoint)
                 self.channels[node_id] = channel
                 await asyncio.wait_for(channel.channel_ready(), node.deadline)
                 connect = channel.stream_stream(
@@ -1165,12 +1126,6 @@ class TrackerMaintainer(threading.Thread):
 
     def request_stop(self) -> None:
         self.shutdown.set()
-
-    def control_camera(
-        self, camera_id: str, operation: str, payload: dict[str, object]
-    ) -> bool:
-        # Control is intentionally unavailable until its integration path is tested.
-        return False
 
     async def fetch_media(
         self,

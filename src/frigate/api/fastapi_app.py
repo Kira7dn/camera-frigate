@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from contextlib import suppress
@@ -30,6 +31,7 @@ from frigate.api import (
     preview,
     record,
     review,
+    runtime_input,
 )
 from frigate.api.auth import get_jwt_secret, limiter, require_admin_by_default
 from frigate.infrastructure.comms.dispatcher import Dispatcher
@@ -80,6 +82,7 @@ def create_fastapi_app(
     enforce_default_admin: bool = True,
     config_holder: ConfigHolder | None = None,
     tracker_maintainer=None,
+    camera_maintainer=None,
 ):
     @asynccontextmanager
     async def app_lifespan(app: FastAPI):
@@ -101,7 +104,7 @@ def create_fastapi_app(
         lifespan=app_lifespan,
         swagger_ui_parameters={"apisSorter": "alpha", "operationsSorter": "alpha"},
         dependencies=[Depends(require_admin_by_default())]
-        if enforce_default_admin
+        if enforce_default_admin and os.environ.get("CAMERA_OPEN_RUNTIME_API") != "1"
         else [],
     )
 
@@ -118,7 +121,8 @@ def create_fastapi_app(
     @app.middleware("http")
     async def frigate_middleware(request: Request, call_next):
         # Before request
-        if not check_csrf(request):
+        runtime_input_request = request.url.path.startswith("/runtime/input/")
+        if not runtime_input_request and not check_csrf(request):
             return JSONResponse(
                 content={"success": False, "message": "Missing CSRF header"},
                 status_code=401,
@@ -162,6 +166,7 @@ def create_fastapi_app(
     app.include_router(motion_search.router)
     app.include_router(record.router)
     app.include_router(debug_replay.router)
+    app.include_router(runtime_input.router)
     # App Properties
     app_state = cast(Any, app)
     app_state.frigate_config = frigate_config
@@ -179,6 +184,7 @@ def create_fastapi_app(
     app_state.profile_manager = profile_manager
     app_state.config_holder = config_holder
     app_state.tracker_maintainer = tracker_maintainer
+    app_state.camera_maintainer = camera_maintainer
 
     if frigate_config.auth.enabled:
         secret = get_jwt_secret()

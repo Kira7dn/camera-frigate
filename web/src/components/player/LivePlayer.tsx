@@ -14,6 +14,7 @@ import {
   LivePlayerMode,
   PlayerStatsType,
   VideoResolutionType,
+  LiveSession,
 } from "@/types/live";
 import { getIconForLabel } from "@/utils/iconUtil";
 import Chip from "../indicators/Chip";
@@ -28,6 +29,62 @@ import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
 import { ImageShadowOverlay } from "../overlay/ImageShadowOverlay";
 import { getTranslatedLabel } from "@/utils/i18n";
 import { formatList } from "@/utils/stringUtil";
+import useSWR from "swr";
+
+function LiveBoundingBoxes({
+  objects,
+  width,
+  height,
+}: {
+  objects: { id: string; label: string; score: number; box?: [number, number, number, number] }[];
+  width: number;
+  height: number;
+}) {
+  const boxes = objects.filter((object) => object.box);
+
+  if (!boxes.length || width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return (
+    <svg
+      className="pointer-events-none absolute inset-0 z-30 size-full"
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      aria-hidden="true"
+    >
+      {boxes.map((object) => {
+        const [left, top, right, bottom] = object.box!;
+        const boxWidth = Math.max(0, right - left);
+        const boxHeight = Math.max(0, bottom - top);
+        return (
+          <g key={object.id}>
+            <rect
+              x={left}
+              y={top}
+              width={boxWidth}
+              height={boxHeight}
+              fill="none"
+              stroke="#22c55e"
+              strokeWidth={Math.max(2, width / 320)}
+            />
+            <text
+              x={left}
+              y={Math.max(14, top - 4)}
+              fill="#ffffff"
+              fontSize={Math.max(12, width / 48)}
+              paintOrder="stroke"
+              stroke="#14532d"
+              strokeWidth={3}
+            >
+              {`${object.label} ${Math.round(object.score * 100)}%`}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
 
 type LivePlayerProps = {
   cameraRef?: (ref: HTMLDivElement | null) => void;
@@ -35,6 +92,7 @@ type LivePlayerProps = {
   className?: string;
   cameraConfig: CameraConfig;
   streamName: string;
+  liveStatus?: "online" | "offline";
   preferredLiveMode: LivePlayerMode;
   showStillWithoutActivity?: boolean;
   alwaysShowCameraName?: boolean;
@@ -60,6 +118,7 @@ export default function LivePlayer({
   className,
   cameraConfig,
   streamName,
+  liveStatus,
   preferredLiveMode,
   showStillWithoutActivity = true,
   alwaysShowCameraName = false,
@@ -84,6 +143,14 @@ export default function LivePlayer({
   const overlayRef = useRef<HTMLDivElement | null>(null);
 
   const cameraName = useCameraFriendlyName(cameraConfig);
+
+  const { data: liveSession } = useSWR<LiveSession>(
+    streamName
+      ? `live/${encodeURIComponent(cameraConfig.name)}?stream=${encodeURIComponent(streamName)}`
+      : null,
+    { revalidateOnFocus: true, refreshInterval: 5000 },
+  );
+  const effectiveLiveStatus = liveStatus ?? liveSession?.status;
 
   // player is showing on a dashboard if containerRef is not provided
 
@@ -113,7 +180,43 @@ export default function LivePlayer({
     activeTracking,
     objects,
     offline,
-  } = useCameraActivity(cameraConfig);
+  } = useCameraActivity(cameraConfig, true, effectiveLiveStatus);
+
+  const { data: liveEvents } = useSWR<
+    { id: string; label: string; score: number; box?: [number, number, number, number]; end_time?: number | null }[]
+  >(`events?camera=${encodeURIComponent(cameraConfig.name)}&limit=20`, {
+    refreshInterval: 1000,
+    revalidateOnFocus: false,
+  });
+
+  const liveBoundingObjects = useMemo(() => {
+    const byId = new Map(objects.map((object) => [object.id, object]));
+    for (const event of liveEvents ?? []) {
+      if (!event.box || event.end_time != null) {
+        continue;
+      }
+      const [left, top, right, bottom] = event.box;
+      const normalized = Math.max(left, top, right, bottom) <= 1;
+      byId.set(event.id, {
+        id: event.id,
+        label: event.label,
+        score: event.score,
+        box: normalized
+          ? [
+              left * cameraConfig.detect.width,
+              top * cameraConfig.detect.height,
+              right * cameraConfig.detect.width,
+              bottom * cameraConfig.detect.height,
+            ]
+          : event.box,
+        stationary: false,
+        area: 0,
+        ratio: 0,
+        sub_label: "",
+      });
+    }
+    return [...byId.values()];
+  }, [cameraConfig, liveEvents, objects]);
 
   const cameraActive = useMemo(
     () =>
@@ -254,7 +357,7 @@ export default function LivePlayer({
   }
 
   let player;
-  if (!autoLive || !streamName || !cameraEnabled) {
+  if (!autoLive || !streamName) {
     player = null;
   } else if (preferredLiveMode == "webrtc") {
     player = (
@@ -360,6 +463,13 @@ export default function LivePlayer({
           />
         )}
       {player}
+      {liveReady && (
+        <LiveBoundingBoxes
+          objects={liveBoundingObjects}
+          width={cameraConfig.detect.width}
+          height={cameraConfig.detect.height}
+        />
+      )}
       {cameraEnabled &&
         !offline &&
         (!showStillWithoutActivity || isReEnabling) &&
@@ -443,7 +553,11 @@ export default function LivePlayer({
           <div className="absolute inset-0 rounded-lg bg-black/50 md:rounded-2xl" />
           <div className="absolute inset-0 left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 items-center justify-center">
             <div className="flex flex-col items-center justify-center gap-2 rounded-lg bg-background/50 p-3 text-center">
-              <div>{t("streamOffline.title")}</div>
+              <div>
+                {effectiveLiveStatus === "offline"
+                  ? "Không nhận được khung hình nào từ Frigate main"
+                  : t("streamOffline.title")}
+              </div>
               <TbExclamationCircle className="size-6" />
               {!isCompact && (
                 <p className="text-center text-sm">
@@ -465,7 +579,11 @@ export default function LivePlayer({
       {offline && !showStillWithoutActivity && cameraEnabled && (
         <div className="absolute inset-0 left-1/2 top-1/2 flex h-96 w-96 -translate-x-1/2 -translate-y-1/2">
           <div className="flex flex-col items-center justify-center rounded-lg bg-background/50 p-5">
-            <p className="my-5 text-lg">{t("streamOffline.title")}</p>
+            <p className="my-5 text-lg">
+              {effectiveLiveStatus === "offline"
+                ? "Không nhận được khung hình nào từ Frigate main"
+                : t("streamOffline.title")}
+            </p>
             <TbExclamationCircle className="mb-3 size-10" />
             {!isCompact && (
               <p className="max-w-96 text-center">

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from urllib.parse import urlsplit
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,8 +136,8 @@ def compile_topology(config: FrigateConfig) -> PlatformTopologyPlan:
             endpoint=node.endpoint,
             cameras=tuple(node.cameras),
             service=service,
-            container="camera-" + service,
-            server_name=node.tls.server_name,
+            container=("edge-tracker" if node_id == "edge-local" else f"edge-tracker-{node_id}"),
+            server_name=urlsplit(f"//{node.endpoint}").hostname or node.endpoint,
         )
 
     role = config.runtime.topology_role
@@ -229,30 +230,6 @@ def materialize_topology(
             "topology_node_id": "",
         }
     )
-    streams = main.setdefault("go2rtc", {}).setdefault("streams", {})
-    for node in plan.tracker_nodes.values():
-        if managed_only and not node.managed:
-            raise ValueError(
-                f"Phase 8 supports managed same-host tracker nodes only: {node.node_id}"
-            )
-        expected_endpoint = f"{node.service}:50052"
-        if node.managed and node.endpoint != expected_endpoint:
-            raise ValueError(
-                f"tracker.{node.node_id}.endpoint must be "
-                f"'{expected_endpoint}' for managed same-host deployment"
-            )
-        for camera in node.cameras:
-            streams[camera] = f"rtsp://{node.service}:8554/{camera}"
-        tls = main["tracker"][node.node_id].setdefault("tls", {})
-        tls_root = f"/run/tracker-tls/{node.node_id}"
-        tls.update(
-            {
-                "ca": f"{tls_root}/ca.crt",
-                "certificate": f"{tls_root}/client.crt",
-                "key": f"{tls_root}/client.key",
-            }
-        )
-
     main_path = output_dir / "config.main.yml"
     _write_utf8(
         main_path,

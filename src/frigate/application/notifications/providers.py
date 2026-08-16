@@ -196,7 +196,7 @@ class ZaloProvider:
                     "caption": text,
                 }
             )
-        elif envelope.snapshot_url:
+        elif public_base_url and envelope.snapshot_url:
             endpoint = "sendPhoto"
             payload.update({"photo": envelope.snapshot_url, "caption": text})
         else:
@@ -205,4 +205,11 @@ class ZaloProvider:
             response = await client.post(f"{base_url}/{endpoint}", json=payload)
         except (httpx.TimeoutException, httpx.NetworkError) as error:
             return DeliveryResult(False, True, type(error).__name__)
-        return classify_response(response)
+        result = classify_response(response)
+        if not result.success and endpoint == "sendPhoto":
+            fallback = await client.post(
+                f"{base_url}/sendMessage",
+                json={"chat_id": recipient.chat_id, "text": text[:4096]},
+            )
+            return classify_response(fallback)
+        return result
