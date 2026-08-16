@@ -14,7 +14,13 @@ from pathlib import Path
 import cv2
 
 from .config import SafetyConfigError, load_config, resolve_stream_url
-from .events import FrigateEventClient, HazardDecision, SafetyEventError, TemporalGate
+from .events import (
+    HazardDecision,
+    SafetyEventError,
+    SafetyMediaStore,
+    SafetyProducer,
+    TemporalGate,
+)
 from .inference import OnnxSafetyModel
 
 logger = logging.getLogger(__name__)
@@ -51,7 +57,7 @@ class HealthState:
 
 
 class LatestFrameReader:
-    """A single latest-frame slot; old frames are dropped instead of queued."""
+    """Latest frame plus a bounded producer-owned rolling evidence buffer."""
 
     def __init__(self, url: str) -> None:
         self.url = url
@@ -61,6 +67,7 @@ class LatestFrameReader:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._history: list[tuple[float, object]] = []
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="safety-reader", daemon=True)
@@ -83,6 +90,9 @@ class LatestFrameReader:
                     with self._lock:
                         self._frame = frame
                         self._frame_at = time.time()
+                        self._history.append((self._frame_at, frame.copy()))
+                        if len(self._history) > 120:
+                            del self._history[:-120]
             finally:
                 capture.release()
                 self._capture = None
@@ -101,6 +111,10 @@ class LatestFrameReader:
         if self._thread is not None:
             self._thread.join(timeout=3)
 
+    def history(self) -> list[tuple[float, object]]:
+        with self._lock:
+            return [(timestamp, frame.copy()) for timestamp, frame in self._history]
+
 
 class CameraWorker:
     def __init__(
@@ -108,7 +122,7 @@ class CameraWorker:
         camera: str,
         config,
         model: OnnxSafetyModel,
-        events: FrigateEventClient,
+        events: SafetyProducer,
         health: HealthState,
         stop_event: threading.Event,
     ) -> None:
@@ -119,6 +133,7 @@ class CameraWorker:
         self.health = health
         self.stop_event = stop_event
         self.reader = LatestFrameReader(resolve_stream_url(config, camera))
+        self.media = SafetyMediaStore()
         self.gate = TemporalGate({camera: config.cameras[camera]})
         self.pending: dict[tuple[str, str], HazardDecision] = {}
 
@@ -157,10 +172,14 @@ class CameraWorker:
                             else:
                                 self.health.clear_decision_count += 1
                                 self.health.event_end_attempts += 1
-                            self.events.apply(decision)
-                            event_id = self.events.active.get(key, "")
-                            if event_id:
-                                self.health.last_event_id = event_id
+                            event_id = self.events.publish(
+                                decision,
+                                frame,
+                                frame_at,
+                                self.media,
+                                self.reader.history(),
+                            )
+                            self.health.last_event_id = event_id
                             if decision.active:
                                 self.health.event_create_successes += 1
                             else:
@@ -183,18 +202,18 @@ class SafetyApplication:
         self.config = load_config(config_path)
         self.health = HealthState()
         self.stop_event = threading.Event()
-        self.events = FrigateEventClient(self.config.frigate_url)
+        self.events = SafetyProducer(self.config.grpc_url)
         self.model = None
         self.workers: list[CameraWorker] = []
 
     def start(self) -> None:
         self.model = OnnxSafetyModel.build(self.config.model)
         self.health.model = True
-        labels = [(camera, label) for camera, policy in self.config.cameras.items() for label in policy.labels]
         last_error: SafetyEventError | None = None
         for _ in range(30):
             try:
-                self.events.reconcile(labels)
+                if not self.events.ready():
+                    raise SafetyEventError("producer ingress is not ready")
                 last_error = None
                 break
             except SafetyEventError as exc:
@@ -222,6 +241,7 @@ class SafetyApplication:
         self.stop_event.set()
         for worker in self.workers:
             worker.reader.stop()
+        self.events.close()
         self._write_health()
 
 

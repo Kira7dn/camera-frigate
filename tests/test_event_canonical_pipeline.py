@@ -16,7 +16,7 @@ from frigate.application.events.canonical import (
     EvidenceMismatch,
     RenderSpec,
 )
-from frigate.application.events.maintainer import EventProcessor
+from frigate.application.events.maintainer import EventProcessor, event_timestamp
 from frigate.models import (
     Event,
     EventEvidence,
@@ -68,6 +68,13 @@ def create_event(event_id: str) -> Event:
         model_type="",
         data={},
     )
+
+
+def test_event_timestamp_accepts_external_iso_and_native_epoch() -> None:
+    value = "2026-08-16 10:47:14.891707+00:00"
+
+    assert event_timestamp(value) == pytest.approx(1786877234.891707)
+    assert event_timestamp(1786877234.891707) == pytest.approx(1786877234.891707)
 
 
 def create_evidence(
@@ -234,6 +241,50 @@ def test_missing_evidence_file_does_not_abort_finalization(canonical_db):
     event = Event.get_by_id(event.id)
     assert event.state == "FINALIZED"
     assert event.canonical_artifact_id is None
+
+
+def test_external_safety_finalization_keeps_active_artifact(canonical_db):
+    _, root = canonical_db
+    event = create_event("safety-lineage")
+    Event.update(
+        label="smoking",
+        camera="safety_camera",
+        has_snapshot=True,
+        has_clip=True,
+        state="ACTIVE",
+        data={"type": "producer", "source_type": "safety"},
+    ).where(Event.id == event.id).execute()
+    aggregator = EventAggregator(CanonicalMediaStore(root / "artifacts"), 0)
+    active = create_evidence(aggregator, root, event.id, "safety-active")
+    active_artifact = aggregator.media.materialize(
+        RenderSpec(event.id, 0, active.id), active, "smoking"
+    )
+    Event.update(
+        canonical_evidence_id=active.id,
+        canonical_artifact_id=active_artifact.id,
+        display_label="smoking",
+    ).where(Event.id == event.id).execute()
+
+    ended = create_evidence(aggregator, root, event.id, "safety-ended")
+    Event.update(end_time=datetime.datetime.now(datetime.UTC)).where(
+        Event.id == event.id
+    ).execute()
+    aggregator.observe(
+        observation_id="safety-ended-observation",
+        event_id=event.id,
+        kind="event_ended",
+        payload={},
+        evidence_id=ended.id,
+        observed_at=datetime.datetime.now(datetime.UTC),
+    )
+    artifact = aggregator.finalize(event.id)
+
+    event = Event.get_by_id(event.id)
+    assert artifact is not None
+    assert artifact.id == active_artifact.id
+    assert event.state == "FINALIZED"
+    assert event.canonical_evidence_id == active.id
+    assert event.canonical_artifact_id == active_artifact.id
 
 
 def test_pending_delivery_protects_expired_artifact(canonical_db):

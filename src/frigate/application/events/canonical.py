@@ -7,7 +7,6 @@ Tracking continues to populate the legacy columns during the shadow rollout.
 from __future__ import annotations
 
 import datetime
-import builtins
 import hashlib
 import logging
 import os
@@ -41,7 +40,7 @@ CanonicalRole = str
 
 
 def _is_str_number_sequence(value: Any) -> bool:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
         return False
     return True
 
@@ -226,7 +225,7 @@ class CanonicalMediaStore:
         if box.get("evidence_id", evidence.id) != evidence.id:
             raise EvidenceMismatch("bbox belongs to another evidence frame")
         normalized_bbox = box.get("normalized_xyxy")
-        if not isinstance(normalized_bbox, (list, tuple)) or len(normalized_bbox) != 4:
+        if not isinstance(normalized_bbox, list | tuple) or len(normalized_bbox) != 4:
             raise ValueError("canonical evidence requires normalized bbox")
         try:
             x1, y1, x2, y2 = [float(value) for value in normalized_bbox]
@@ -482,6 +481,12 @@ class EventAggregator:
         )
         facts: dict[str, Any] = {}
         chosen_evidence = event.canonical_evidence_id
+        producer_safety = (
+            event.label == "smoking"
+            and isinstance(event.data, dict)
+            and event.data.get("type") == "producer"
+            and event.data.get("source_type") == "safety"
+        )
         for observation in observations:
             payload = observation.payload or {}
             if observation.kind == "lpr" and payload.get("plate"):
@@ -489,7 +494,7 @@ class EventAggregator:
                 facts["plate_score"] = payload.get("score")
             if observation.kind == "face" and payload.get("sub_label"):
                 facts["sub_label"] = payload["sub_label"]
-            if observation.evidence_id:
+            if observation.evidence_id and not (producer_safety and chosen_evidence):
                 chosen_evidence = observation.evidence_id
         plate = facts.get("plate") or event.canonical_plate
         sub_label = facts.get("sub_label") or event.canonical_sub_label or event.sub_label
@@ -502,6 +507,18 @@ class EventAggregator:
             and event.display_label == label
         )
         if unchanged:
+            return self.media.get(event.canonical_artifact_id)
+        if producer_safety and event.canonical_artifact_id:
+            # Safety opens the event with a producer-owned frame that is
+            # already used for the active alert. END contributes the clip and
+            # lifecycle state, but must not replace that alert image with a
+            # later CLEAR frame or create a second notification lineage.
+            Event.update(
+                state="FINALIZED",
+                finalized_at=utcnow(),
+                canonical_evidence_id=chosen_evidence,
+                display_label=label,
+            ).where(Event.id == event_id).execute()
             return self.media.get(event.canonical_artifact_id)
         revision = event.revision + 1
         Event.update(

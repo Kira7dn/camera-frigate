@@ -1,40 +1,39 @@
-"""Isolated contracts for the standalone Safety extension."""
+"""Contracts for the canonical-config Safety extension."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
-import requests
 from extension.safety.config import SafetyConfigError, load_config, validate_camera_keys
 from extension.safety.events import (
-    FrigateEventClient,
     HazardDecision,
     SafetyEventError,
+    SafetyMediaStore,
+    SafetyProducer,
     TemporalGate,
 )
 from extension.safety.inference import Detection, OnnxSafetyModel
+from extension.tracker.transport import ProducerTransportError
 
 
-def _config(tmp_path: Path, *, threshold: float = 0.1) -> Path:
+def _config(tmp_path: Path) -> Path:
     model = tmp_path / "best.onnx"
     model.write_bytes(b"test")
-    path = tmp_path / "safety.yaml"
+    path = tmp_path / "config.yaml"
     path.write_text(
-        f"""frigate_url: http://frigate:5000
-restream_url: rtsp://frigate:8554
-model:
-  path: {model.as_posix()}
-  providers: [CPUExecutionProvider]
+        """runtime:
+  replay:
+    sources:
+      safety_camera: fixture.mp4
 cameras:
   cam:
-    stream: cam
-    inference_fps: 1
-    labels:
-      smoking: {{enabled: true, threshold: {threshold}}}
-    confirm_seconds: 1
-    clear_seconds: 2
+    media_mode: external
+    review:
+      alerts:
+        labels: [smoking]
 """,
         encoding="utf-8",
     )
@@ -47,13 +46,33 @@ def _detection(score: float = 0.8, observed_at: float = 1.0) -> Detection:
 
 def test_config_rejects_unknown_fields_and_camera_mismatch(tmp_path: Path) -> None:
     path = _config(tmp_path)
-    path.write_text(path.read_text(encoding="utf-8") + "unexpected: true\n", encoding="utf-8")
-    with pytest.raises(SafetyConfigError, match="unknown field"):
+    path.write_text("cameras: {}\n", encoding="utf-8")
+    with pytest.raises(SafetyConfigError, match="external smoking camera"):
         load_config(path)
 
     config = load_config(_config(tmp_path))
+    assert config.cameras["cam"].inference_fps == 2
     with pytest.raises(SafetyConfigError, match="missing"):
         validate_camera_keys(config, {"other"})
+
+
+def test_config_excludes_external_camera_without_smoking_label(
+    tmp_path: Path,
+) -> None:
+    path = _config(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + "  tracker_camera:\n"
+        + "    media_mode: external\n"
+        + "    review:\n"
+        + "      alerts:\n"
+        + "        labels: []\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert set(config.cameras) == {"cam"}
 
 
 def test_temporal_gate_requires_confirm_and_clear_time(tmp_path: Path) -> None:
@@ -64,120 +83,151 @@ def test_temporal_gate_requires_confirm_and_clear_time(tmp_path: Path) -> None:
     active = gate.observe("cam", [_detection()], 1.1)
     assert active == [HazardDecision("cam", "smoking", True, 0.8, (0.1, 0.1, 0.2, 0.2))]
     assert gate.observe("cam", [], 2.9) == []
-    assert gate.observe("cam", [], 4.9) == [HazardDecision("cam", "smoking", False, 0.0, None)]
+    assert gate.observe("cam", [], 8.1) == [HazardDecision("cam", "smoking", False, 0.0, None)]
 
 
 def test_smoking_below_threshold_does_not_open_event(tmp_path: Path) -> None:
-    config = load_config(_config(tmp_path, threshold=0.5))
+    config = load_config(_config(tmp_path))
     gate = TemporalGate(dict(config.cameras))
-    assert gate.observe("cam", [_detection(score=0.49)], 0.0) == []
-    assert gate.observe("cam", [_detection(score=0.49)], 2.0) == []
+    assert gate.observe("cam", [_detection(score=0.05)], 0.0) == []
+    assert gate.observe("cam", [_detection(score=0.05)], 2.0) == []
 
 
-def test_smoking_single_frame_does_not_open_event(tmp_path: Path) -> None:
+def test_smoking_confirmation_tolerates_short_detection_gap(tmp_path: Path) -> None:
     config = load_config(_config(tmp_path))
     gate = TemporalGate(dict(config.cameras))
     assert gate.observe("cam", [_detection()], 0.0) == []
     assert gate.observe("cam", [], 0.1) == []
-    assert gate.observe("cam", [_detection()], 1.0) == []
+    assert gate.observe("cam", [_detection()], 1.0) == [
+        HazardDecision("cam", "smoking", True, 0.8, (0.1, 0.1, 0.2, 0.2))
+    ]
 
 
-class _Response:
-    def __init__(self, payload, status: int = 200, headers=None):
-        self._payload = payload
-        self.status_code = status
-        self.headers = headers or {}
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise RuntimeError(self.status_code)
-
-    def json(self):
-        return self._payload
+def test_smoking_single_frame_expires_without_opening_event(tmp_path: Path) -> None:
+    config = load_config(_config(tmp_path))
+    gate = TemporalGate(dict(config.cameras))
+    assert gate.observe("cam", [_detection()], 0.0) == []
+    assert gate.observe("cam", [], 0.1) == []
+    assert gate.observe("cam", [], 5.2) == []
+    assert gate.observe("cam", [_detection()], 6.0) == []
 
 
-class _Session:
-    def __init__(self):
-        self.calls = []
-
-    def get(self, url, **kwargs):
-        self.calls.append(("GET", url, kwargs))
-        if url.endswith("latest.jpg"):
-            return _Response(b"jpg", headers={"X-Frame-Time": "10"})
-        return _Response([])
-
-    def post(self, url, **kwargs):
-        self.calls.append(("POST", url, kwargs))
-        return _Response({"success": True, "event_id": "server-event"})
-
-    def put(self, url, **kwargs):
-        self.calls.append(("PUT", url, kwargs))
-        return _Response({"success": True})
+def test_safety_snapshot_is_real_and_requires_bbox() -> None:
+    media = SafetyMediaStore()
+    frame = np.full((32, 48, 3), 80, dtype=np.uint8)
+    decision = HazardDecision("cam", "smoking", True, 0.91, (0.1, 0.2, 0.5, 0.8))
+    image = media.snapshot(frame, decision)
+    assert image[:2] == b"\xff\xd8"
+    decoded = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert decoded is not None
+    # Producer media is a raw full frame. The canonical Frigate renderer owns
+    # the only bbox/label overlay.
+    assert int(decoded[8, 5, 2]) < 150
+    with pytest.raises(SafetyEventError, match="requires_bbox"):
+        media.snapshot(frame, HazardDecision("cam", "smoking", True, 0.9, None))
 
 
-def test_event_client_uses_server_id_and_safety_sub_label() -> None:
-    session = _Session()
-    client = FrigateEventClient("http://frigate:5000", session=session)
-    decision = HazardDecision("cam", "smoking", True, 0.91, (0.1, 0.2, 0.4, 0.5))
-    assert client.probe_camera("cam")
-    assert client.create_event(decision) == "server-event"
-    client.apply(HazardDecision("cam", "smoking", False, 0, None))
-    post = next(call for call in session.calls if call[0] == "POST")
-    assert post[1].endswith("/api/events/cam/smoking/create")
-    assert post[2]["json"]["sub_label"] == "camera-safety"
-    assert post[2]["json"]["draw"]["boxes"][0]["box"] == [0.1, 0.2, 0.4, 0.5]
-    put = next(call for call in session.calls if call[0] == "PUT")
-    assert put[1].endswith("/api/events/server-event/end")
+def test_safety_clear_reuses_active_bbox_and_event_id(monkeypatch) -> None:
+    class Client:
+        node_epoch = "epoch"
+        stream_epoch = "stream"
+
+        def __init__(self, *_args):
+            self.uploads = []
+            self.updates = []
+
+        def upload_media(self, manifest, content):
+            self.uploads.append((manifest, content))
+
+        def publish(self, update):
+            self.updates.append(update)
+
+        def close(self):
+            return None
+
+    class Media:
+        def snapshot(self, _frame, decision):
+            assert decision.bbox == (0.1, 0.2, 0.5, 0.8)
+            return b"snapshot"
+
+        def clip(self, _event_id, _frames):
+            return b"clip"
+
+    monkeypatch.setattr("extension.safety.events.ProducerClient", Client)
+    producer = SafetyProducer("unused")
+    frame = np.zeros((32, 48, 3), dtype=np.uint8)
+    start_id = producer.publish(
+        HazardDecision("cam", "smoking", True, 0.91, (0.1, 0.2, 0.5, 0.8)),
+        frame,
+        1.0,
+        Media(),
+        [(1.0, frame)],
+    )
+    end_id = producer.publish(
+        HazardDecision("cam", "smoking", False, 0.0, None),
+        frame,
+        2.0,
+        Media(),
+        [(1.0, frame), (2.0, frame)],
+    )
+
+    assert end_id == start_id
+    assert [update.operation.value for update in producer.client.updates] == ["START", "END"]
+    assert producer.client.updates[1].bbox == producer.client.updates[0].bbox
+    assert [manifest.media_type for manifest, _content in producer.client.uploads] == [
+        "snapshot_jpg",
+        "snapshot_jpg",
+        "clip",
+    ]
+    assert producer.active == {}
+    assert producer.last_bbox == {}
 
 
-class _TimeoutSession(_Session):
-    def post(self, url, **kwargs):
-        self.calls.append(("POST", url, kwargs))
-        raise requests.Timeout("create response lost")
+def test_safety_publish_reuses_sequence_after_transport_failure(monkeypatch) -> None:
+    class Client:
+        node_epoch = "epoch"
+        stream_epoch = "stream"
 
-    def get(self, url, **kwargs):
-        self.calls.append(("GET", url, kwargs))
-        if url.endswith("latest.jpg"):
-            return _Response(b"jpg", headers={"X-Frame-Time": "10"})
-        return _Response([{"id": "reconciled-event", "sub_label": "camera-safety"}])
+        def __init__(self, *_args):
+            self.attempts = []
+            self.fail_once = True
+
+        def upload_media(self, _manifest, _content):
+            return None
+
+        def publish(self, update):
+            self.attempts.append(update.journal_sequence)
+            if self.fail_once:
+                self.fail_once = False
+                raise ProducerTransportError("publish_failed")
+
+        def close(self):
+            return None
+
+    class Media:
+        def snapshot(self, _frame, _decision):
+            return b"snapshot"
+
+    monkeypatch.setattr("extension.safety.events.ProducerClient", Client)
+    producer = SafetyProducer("unused")
+    frame = np.zeros((32, 48, 3), dtype=np.uint8)
+    decision = HazardDecision("cam", "smoking", True, 0.91, (0.1, 0.2, 0.5, 0.8))
+
+    with pytest.raises(SafetyEventError, match="publish_failed"):
+        producer.publish(decision, frame, 1.0, Media(), [(1.0, frame)])
+    producer.publish(decision, frame, 1.0, Media(), [(1.0, frame)])
+
+    assert producer.client.attempts == [1, 1]
+    assert producer.sequence == 1
 
 
-def test_event_create_timeout_reconciles_existing_smoking_event() -> None:
-    session = _TimeoutSession()
-    client = FrigateEventClient("http://frigate:5000", session=session)
-    decision = HazardDecision("cam", "smoking", True, 0.91, None)
-    assert client.create_event(decision) == "reconciled-event"
-    assert client.active[("cam", "smoking")] == "reconciled-event"
-    assert len([call for call in session.calls if call[0] == "POST"]) == 1
-
-
-def test_event_api_error_fails_closed_without_active_event() -> None:
-    class ErrorSession(_Session):
-        def post(self, url, **kwargs):
-            raise requests.ConnectionError("Frigate unavailable")
-
-    client = FrigateEventClient("http://frigate:5000", session=ErrorSession())
-    with pytest.raises(SafetyEventError):
-        client.create_event(HazardDecision("cam", "smoking", True, 0.9, None))
-    assert client.active == {}
-
-
-def test_reconcile_ends_only_camera_safety_smoking_events() -> None:
-    class ReconcileSession(_Session):
-        def get(self, url, **kwargs):
-            self.calls.append(("GET", url, kwargs))
-            return _Response(
-                [
-                    {"id": "safety-event", "sub_label": "camera-safety"},
-                    {"id": "other-event", "sub_label": "other-producer"},
-                ]
-            )
-
-    session = ReconcileSession()
-    client = FrigateEventClient("http://frigate:5000", session=session)
-    client.reconcile([("cam", "smoking")])
-    puts = [call for call in session.calls if call[0] == "PUT"]
-    assert [call[1] for call in puts] == ["http://frigate:5000/api/events/safety-event/end"]
+def test_safety_clip_uses_rolling_real_frames() -> None:
+    media = SafetyMediaStore()
+    frames = []
+    for index in range(3):
+        frames.append((float(index), np.full((32, 48, 3), index + 1, dtype=np.uint8)))
+    clip = media.clip("producer-event", frames)
+    assert clip[:4] == b"\x00\x00\x00\x18" or len(clip) > 32
 
 
 def test_latest_frame_reader_keeps_one_latest_sample(monkeypatch) -> None:

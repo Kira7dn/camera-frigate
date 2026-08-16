@@ -18,6 +18,8 @@ FRIGATE_ENV_VARS = {
     for k, v in os.environ.items()
     if k.startswith("FRIGATE_") or k in NOTIFICATION_ENV_NAMES
 }
+DAHUA_ENV_NAMES = frozenset({"DAHUA_USER", "DAHUA_PASSWORD"})
+DAHUA_ENV_VARS = {k: v for k, v in os.environ.items() if k in DAHUA_ENV_NAMES}
 secrets_dir = os.environ.get("CREDENTIALS_DIRECTORY", "/run/secrets")
 # read secret files as env vars too
 if os.path.isdir(secrets_dir) and os.access(secrets_dir, os.R_OK):
@@ -30,21 +32,22 @@ if os.path.isdir(secrets_dir) and os.access(secrets_dir, os.R_OK):
 
 # Matches a FRIGATE_* identifier following an opening brace.
 _FRIGATE_IDENT_RE = re.compile(r"FRIGATE_[A-Za-z0-9_]+")
+_DAHUA_IDENT_RE = re.compile(r"DAHUA_(?:USER|PASSWORD)")
 _NOTIFICATION_IDENT_RE = re.compile(
     r"(?:TELEGRAM_BOT_TOKEN|TELEGRAM_CHAT_ID|ZALO_BOT_TOKEN|ZALO_CHAT_ID)"
 )
 
 
 def substitute_frigate_vars(value: str) -> str:
-    """Substitute Frigate and notification credential placeholders in *value*.
+    """Substitute Frigate, Dahua, and notification placeholders in *value*.
 
     Reproduces the subset of `str.format()` brace semantics that Frigate's
     config has historically supported, while leaving unrelated brace content
     (e.g. ffmpeg `%{localtime\\:...}` expressions) untouched:
 
     * `{{` and `}}` collapse to literal `{` / `}` (the documented escape).
-    * `{FRIGATE_NAME}` and the four notification placeholders are replaced
-      from `FRIGATE_ENV_VARS`; an unknown name
+    * `{FRIGATE_NAME}`, `{DAHUA_USER}`, `{DAHUA_PASSWORD}`, and the four
+      notification placeholders are replaced from the process environment; an unknown name
       raises `KeyError` to preserve the existing "Invalid substitution"
       error path.
     * A `{` that begins `{FRIGATE_` but is not a well-formed
@@ -64,12 +67,17 @@ def substitute_frigate_vars(value: str) -> str:
                 out.append("{")
                 i += 2
                 continue
-            # Possible Frigate or notification credential placeholder.
-            if value.startswith("{FRIGATE_", i) or any(
-                value.startswith("{" + name, i) for name in NOTIFICATION_ENV_NAMES
+            # Possible Frigate, Dahua, or notification credential placeholder.
+            if (
+                value.startswith("{FRIGATE_", i)
+                or value.startswith("{DAHUA_", i)
+                or any(
+                    value.startswith("{" + name, i) for name in NOTIFICATION_ENV_NAMES
+                )
             ):
                 ident_match = (
                     _FRIGATE_IDENT_RE.match(value, i + 1)
+                    or _DAHUA_IDENT_RE.match(value, i + 1)
                     or _NOTIFICATION_IDENT_RE.match(value, i + 1)
                 )
                 if (
@@ -78,9 +86,10 @@ def substitute_frigate_vars(value: str) -> str:
                     and value[ident_match.end()] == "}"
                 ):
                     key = ident_match.group(0)
-                    if key not in FRIGATE_ENV_VARS:
+                    env_vars = {**FRIGATE_ENV_VARS, **DAHUA_ENV_VARS}
+                    if key not in env_vars:
                         raise KeyError(key)
-                    out.append(FRIGATE_ENV_VARS[key])
+                    out.append(env_vars[key])
                     i = ident_match.end() + 1
                     continue
                 # Looks like a supported placeholder but is malformed

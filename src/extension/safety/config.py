@@ -1,4 +1,4 @@
-"""Strict configuration for the standalone camera-safety service."""
+"""Read the Safety section from the canonical Frigate runtime config."""
 
 from __future__ import annotations
 
@@ -52,17 +52,15 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class SafetyConfig:
-    frigate_url: str
+    grpc_url: str
     restream_url: str
     model: ModelConfig
     cameras: Mapping[str, CameraSafetyConfig]
 
 
-_ROOT_KEYS = frozenset({"frigate_url", "restream_url", "model", "cameras"})
-_MODEL_KEYS = frozenset({"path", "providers"})
-_CAMERA_KEYS = frozenset(
-    {"stream", "inference_fps", "labels", "confirm_seconds", "clear_seconds"}
-)
+SAFETY_GRPC_URL = "frigate:50052"
+SAFETY_RESTREAM_URL = "rtsp://frigate:8554"
+SAFETY_MODEL_CONTAINER_PATH = Path("/models/smoking/best.onnx")
 
 
 def _mapping(value: Any, name: str) -> dict[str, Any]:
@@ -71,14 +69,8 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
-def _strict_keys(value: Mapping[str, Any], allowed: frozenset[str], name: str) -> None:
-    unknown = sorted(set(value) - allowed)
-    if unknown:
-        raise SafetyConfigError(f"{name} contains unknown field(s): {', '.join(unknown)}")
-
-
 def load_config(path: str | Path) -> SafetyConfig:
-    """Load and validate one UTF-8 Safety YAML file."""
+    """Load Safety cameras from the canonical Frigate YAML file."""
     config_path = Path(path)
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -87,58 +79,47 @@ def load_config(path: str | Path) -> SafetyConfig:
     except yaml.YAMLError as exc:
         raise SafetyConfigError(f"invalid Safety YAML: {exc}") from exc
 
-    root = _mapping(raw, "Safety config")
-    _strict_keys(root, _ROOT_KEYS, "Safety config")
-    model = _mapping(root.get("model"), "model")
-    _strict_keys(model, _MODEL_KEYS, "model")
-    providers = model.get("providers")
-    if not isinstance(providers, list) or not providers or not all(
-        isinstance(item, str) and item.strip() for item in providers
-    ):
-        raise SafetyConfigError("model.providers must be a non-empty list of strings")
+    root = _mapping(raw, "Frigate config")
     cameras_raw = _mapping(root.get("cameras"), "cameras")
-    if not cameras_raw:
-        raise SafetyConfigError("cameras must contain at least one camera")
 
     cameras: dict[str, CameraSafetyConfig] = {}
     for name, value in cameras_raw.items():
         if not isinstance(name, str) or not name.strip():
             raise SafetyConfigError("camera names must be non-empty strings")
         camera = _mapping(value, f"cameras.{name}")
-        _strict_keys(camera, _CAMERA_KEYS, f"cameras.{name}")
-        labels_raw = _mapping(camera.get("labels"), f"cameras.{name}.labels")
-        labels: dict[str, LabelPolicy] = {}
-        for label, policy_raw in labels_raw.items():
-            policy = _mapping(policy_raw, f"cameras.{name}.labels.{label}")
-            _strict_keys(policy, frozenset({"enabled", "threshold"}), f"labels.{label}")
-            labels[str(label)] = LabelPolicy(
-                enabled=bool(policy.get("enabled", True)),
-                threshold=float(policy.get("threshold", 0.5)),
-            )
+        if camera.get("media_mode") != "external":
+            continue
+        review = camera.get("review") or {}
+        alerts = review.get("alerts") or {}
+        labels = {
+            str(label): LabelPolicy(True, 0.10)
+            for label in alerts.get("labels", [])
+            if str(label) == "smoking"
+        }
+        if not labels:
+            continue
         cameras[name] = CameraSafetyConfig(
-            stream=str(camera.get("stream", name)),
-            inference_fps=float(camera.get("inference_fps", 1)),
+            stream=name,
+            inference_fps=2,
             labels=MappingProxyType(labels),
-            confirm_seconds=float(camera.get("confirm_seconds", 1)),
-            clear_seconds=float(camera.get("clear_seconds", 5)),
+            confirm_seconds=1,
+            clear_seconds=5,
         )
-
-    frigate_url = str(root.get("frigate_url", "")).rstrip("/")
-    restream_url = str(root.get("restream_url", "")).rstrip("/")
-    if not frigate_url.startswith(("http://", "https://")):
-        raise SafetyConfigError("frigate_url must be an HTTP(S) URL")
-    if not restream_url.startswith(("rtsp://", "rtsps://")):
-        raise SafetyConfigError("restream_url must be an RTSP(S) URL")
-    model_path = Path(str(model.get("path", "")))
-    if not model_path.is_absolute():
-        model_path = (config_path.parent / model_path).resolve()
-    if not model_path.is_file():
-        raise SafetyConfigError(f"Safety model does not exist: {model_path}")
+    if not cameras:
+        raise SafetyConfigError("canonical config must define an external smoking camera")
+    model_candidates = (
+        SAFETY_MODEL_CONTAINER_PATH,
+        config_path.parent / "best.onnx",
+        Path("assets/models/smoking/best.onnx"),
+    )
+    model_path = next((candidate for candidate in model_candidates if candidate.is_file()), None)
+    if model_path is None:
+        raise SafetyConfigError("Safety model does not exist at /models/smoking/best.onnx")
 
     return SafetyConfig(
-        frigate_url=frigate_url,
-        restream_url=restream_url,
-        model=ModelConfig(model_path, tuple(providers)),
+        grpc_url=SAFETY_GRPC_URL,
+        restream_url=SAFETY_RESTREAM_URL,
+        model=ModelConfig(model_path, ("CPUExecutionProvider",)),
         cameras=MappingProxyType(cameras),
     )
 

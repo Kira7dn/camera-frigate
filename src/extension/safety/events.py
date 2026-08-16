@@ -1,12 +1,25 @@
-"""Temporal safety decisions and Frigate Manual Event synchronization."""
+"""Temporal Safety decisions and producer-owned media lifecycle."""
 
 from __future__ import annotations
 
+import hashlib
+import time
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
-import requests
+import cv2
+import numpy as np
+
+from extension.tracker.runtime import (
+    BoundingBox,
+    MediaManifest,
+    TrackerOperation,
+    TrackerUpdate,
+)
+from extension.tracker.transport import ProducerClient, ProducerTransportError
 
 from .config import CameraSafetyConfig
 from .inference import Detection
@@ -58,7 +71,13 @@ class TemporalGate:
                     state.state = _State.ACTIVE
                     decisions.append(HazardDecision(camera, label, True, state.last_score, state.last_bbox))
             elif state.state is _State.PENDING:
-                state.state, state.candidate_since = _State.IDLE, None
+                state.clear_since = now if state.clear_since is None else state.clear_since
+                if now - state.clear_since >= policy.clear_seconds:
+                    state.state, state.candidate_since, state.clear_since = (
+                        _State.IDLE,
+                        None,
+                        None,
+                    )
             elif state.state is _State.ACTIVE:
                 state.clear_since = now if state.clear_since is None else state.clear_since
                 if now - state.clear_since >= policy.clear_seconds:
@@ -71,120 +90,186 @@ class TemporalGate:
 
 
 class SafetyEventError(RuntimeError):
-    """Frigate Event synchronization failed."""
+    """Safety producer evidence or gRPC synchronization failed."""
 
 
-class FrigateEventClient:
-    def __init__(self, base_url: str, session: requests.Session | None = None, timeout: float = 3.0) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.session = session or requests.Session()
-        self.timeout = timeout
-        self.active: dict[tuple[str, str], str] = {}
+class SafetyMediaStore:
+    """Encode real producer frames and a bounded MP4 terminal clip."""
 
-    def probe_camera(self, camera: str) -> bool:
-        try:
-            response = self.session.get(f"{self.base_url}/api/{camera}/latest.jpg", timeout=self.timeout)
-            return response.status_code == 200 and float(response.headers.get("X-Frame-Time", "0")) > 0
-        except (requests.RequestException, ValueError):
-            return False
+    def __init__(self, max_frames: int = 120) -> None:
+        self.max_frames = max_frames
 
-    def _find_open_event(self, camera: str, label: str) -> str | None:
-        response = self.session.get(
-            f"{self.base_url}/api/events",
-            params={"camera": camera, "label": label, "sub_label": "camera-safety", "in_progress": 1, "limit": 50},
-            timeout=self.timeout,
+    @staticmethod
+    def _snapshot(frame: np.ndarray, decision: HazardDecision) -> bytes:
+        image = frame.copy()
+        if decision.bbox is None:
+            raise SafetyEventError("safety_snapshot_requires_bbox")
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = decision.bbox
+        pixels = (
+            max(0, min(width - 1, round(x1 * width))),
+            max(0, min(height - 1, round(y1 * height))),
+            max(0, min(width - 1, round(x2 * width))),
+            max(0, min(height - 1, round(y2 * height))),
         )
-        response.raise_for_status()
-        events = response.json()
-        if isinstance(events, dict):
-            events = events.get("events", [])
-        for event in events or []:
-            if event.get("sub_label") == "camera-safety" and event.get("id"):
-                return str(event["id"])
-        return None
+        if pixels[2] <= pixels[0] or pixels[3] <= pixels[1]:
+            raise SafetyEventError("safety_snapshot_invalid_bbox")
+        # The producer contract stores a raw full frame. Frigate's canonical
+        # media renderer owns the single bbox/label overlay; drawing here too
+        # would make every canonical notification contain two overlays.
+        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok or not encoded.tobytes():
+            raise SafetyEventError("safety_snapshot_encode_failed")
+        return encoded.tobytes()
 
-    def create_event(self, decision: HazardDecision) -> str:
-        key = (decision.camera, decision.label)
-        if key in self.active:
-            return self.active[key]
-        body = {
-            "sub_label": "camera-safety",
-            "score": decision.score,
-            "duration": None,
-            "include_recording": True,
-            "draw": (
-                {
-                    "boxes": [
-                        {
-                            "box": list(decision.bbox),
-                            "score": decision.score,
-                            "color": [0, 0, 255],
-                        }
-                    ]
-                }
-                if decision.bbox is not None
-                else {}
-            ),
-        }
+    def snapshot(self, frame: np.ndarray, decision: HazardDecision) -> bytes:
+        return self._snapshot(frame, decision)
+
+    def clip(self, event_id: str, frames: list[tuple[float, np.ndarray]]) -> bytes:
+        if not frames:
+            raise SafetyEventError("safety_clip_requires_real_frames")
+        frames = frames[-self.max_frames :]
+        first = frames[0][1]
+        height, width = first.shape[:2]
+        path = Path("/tmp") / f"safety-{event_id}-{uuid.uuid4().hex}.mp4"
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), 5.0, (width, height)
+        )
+        if not writer.isOpened():
+            raise SafetyEventError("safety_clip_encoder_unavailable")
         try:
-            response = self.session.post(
-                f"{self.base_url}/api/events/{decision.camera}/{decision.label}/create",
-                json=body,
-                timeout=self.timeout,
+            for _, frame in frames:
+                if frame.shape[:2] == (height, width):
+                    writer.write(frame)
+        finally:
+            writer.release()
+        try:
+            content = path.read_bytes()
+        finally:
+            path.unlink(missing_ok=True)
+        if not content:
+            raise SafetyEventError("safety_clip_encode_failed")
+        return content
+
+
+class SafetyProducer:
+    """Publish Safety lifecycle and media through the shared producer contract."""
+
+    def __init__(self, endpoint: str, node_id: str = "safety") -> None:
+        self.client = ProducerClient(endpoint, node_id)
+        self.node_id = node_id
+        self.active: dict[tuple[str, str], str] = {}
+        self.last_bbox: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+        self.last_score: dict[tuple[str, str], float] = {}
+        self.sequence = 0
+
+    def ready(self) -> bool:
+        return self.client.ready()
+
+    @staticmethod
+    def _manifest(event_id: str, camera: str, media_type: str, codec: str, content: bytes, frame_time: float) -> MediaManifest:
+        return MediaManifest(
+            media_id=uuid.uuid4().hex,
+            event_id=event_id,
+            camera_id=camera,
+            media_type=media_type,
+            codec=codec,
+            start_time=frame_time,
+            end_time=frame_time,
+            byte_size=len(content),
+            sha256=hashlib.sha256(content).hexdigest(),
+            expiry_unix_ms=int((time.time() + 3600) * 1000),
+        )
+
+    def publish(
+        self,
+        decision: HazardDecision,
+        frame: np.ndarray,
+        frame_time: float,
+        media: SafetyMediaStore,
+        frames: list[tuple[float, np.ndarray]],
+    ) -> str:
+        key = (decision.camera, decision.label)
+        if decision.active:
+            if decision.bbox is None:
+                raise SafetyEventError("safety_event_requires_bbox")
+            existing_event_id = self.active.get(key)
+            event_id = existing_event_id or "safety" + uuid.uuid4().hex[:24]
+            operation = (
+                TrackerOperation.START
+                if existing_event_id is None
+                else TrackerOperation.UPDATE
             )
-            response.raise_for_status()
-            event_id = str(response.json()["event_id"])
-        except requests.Timeout as exc:
-            try:
-                event_id = self._find_open_event(decision.camera, decision.label)
-            except (requests.RequestException, KeyError, TypeError, ValueError):
-                event_id = None
-            if event_id is not None:
-                self.active[key] = event_id
-                return event_id
-            raise SafetyEventError(f"unable to reconcile timed-out Safety Event create: {exc}") from exc
-        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-            raise SafetyEventError(f"unable to create Safety Event: {exc}") from exc
-        self.active[key] = event_id
+            self.active[key] = event_id
+            self.last_bbox[key] = decision.bbox
+            self.last_score[key] = decision.score
+        else:
+            event_id = self.active.get(key)
+            if event_id is None:
+                raise SafetyEventError("safety_clear_without_active_event")
+            operation = TrackerOperation.END
+
+        evidence_bbox = decision.bbox or self.last_bbox.get(key)
+        if evidence_bbox is None:
+            raise SafetyEventError("safety_event_requires_bbox")
+        evidence_score = decision.score
+        if not decision.active:
+            evidence_score = self.last_score.get(key, evidence_score)
+        evidence_decision = HazardDecision(
+            camera=decision.camera,
+            label=decision.label,
+            active=decision.active,
+            score=evidence_score,
+            bbox=evidence_bbox,
+        )
+        height, width = frame.shape[:2]
+        bbox = BoundingBox(
+            round(evidence_bbox[0] * width),
+            round(evidence_bbox[1] * height),
+            round(evidence_bbox[2] * width),
+            round(evidence_bbox[3] * height),
+        )
+        snapshot = media.snapshot(frame, evidence_decision)
+        manifests = [self._manifest(event_id, decision.camera, "snapshot_jpg", "jpeg", snapshot, frame_time)]
+        content_by_id = {manifests[0].media_id: snapshot}
+        if operation is TrackerOperation.END:
+            clip = media.clip(event_id, frames)
+            clip_manifest = self._manifest(event_id, decision.camera, "clip", "mp4", clip, frame_time)
+            manifests.append(clip_manifest)
+            content_by_id[clip_manifest.media_id] = clip
+        next_sequence = self.sequence + 1
+        update = TrackerUpdate(
+            node_id=self.node_id,
+            node_epoch=self.client.node_epoch,
+            camera_id=decision.camera,
+            stream_epoch=self.client.stream_epoch,
+            journal_sequence=next_sequence,
+            frame_seq=next_sequence,
+            source_pts=round(frame_time * 1_000_000),
+            frame_time=frame_time,
+            event_id=event_id,
+            track_id=f"{decision.camera}:{decision.label}",
+            operation=operation,
+            label=decision.label,
+            score_history=(evidence_score,),
+            score=evidence_score,
+            bbox=bbox,
+            state={"source": "safety"},
+            media=tuple(manifests),
+            source_type="safety",
+        )
+        try:
+            for manifest in manifests:
+                self.client.upload_media(manifest, content_by_id[manifest.media_id])
+            self.client.publish(update)
+        except ProducerTransportError as error:
+            raise SafetyEventError(str(error)) from error
+        self.sequence = next_sequence
+        if operation is TrackerOperation.END:
+            self.active.pop(key, None)
+            self.last_bbox.pop(key, None)
+            self.last_score.pop(key, None)
         return event_id
 
-    def end_event(self, camera: str, label: str) -> None:
-        key = (camera, label)
-        event_id = self.active.get(key)
-        if not event_id:
-            return
-        try:
-            response = self.session.put(
-                f"{self.base_url}/api/events/{event_id}/end",
-                json={},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise SafetyEventError(f"unable to end Safety Event {event_id}: {exc}") from exc
-        self.active.pop(key, None)
-
-    def apply(self, decision: HazardDecision) -> None:
-        if decision.active:
-            self.create_event(decision)
-        else:
-            self.end_event(decision.camera, decision.label)
-
-    def reconcile(self, camera_labels: Iterable[tuple[str, str]]) -> None:
-        for camera, label in camera_labels:
-            try:
-                response = self.session.get(
-                    f"{self.base_url}/api/events",
-                    params={"camera": camera, "label": label, "sub_label": "camera-safety", "in_progress": 1, "limit": 50},
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
-                events = response.json()
-            except (requests.RequestException, ValueError) as exc:
-                raise SafetyEventError(f"unable to reconcile Safety Events: {exc}") from exc
-            if isinstance(events, dict):
-                events = events.get("events", [])
-            for event in events or []:
-                if event.get("sub_label") == "camera-safety" and event.get("id"):
-                    self.active[(camera, label)] = str(event["id"])
-                    self.end_event(camera, label)
+    def close(self) -> None:
+        self.client.close()

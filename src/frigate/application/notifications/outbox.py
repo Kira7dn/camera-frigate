@@ -21,6 +21,7 @@ from .metrics import increment, observe_latency, set_queue_depth
 from .providers import DeliveryResult
 
 logger = logging.getLogger(__name__)
+MAX_IN_FLIGHT = 4
 
 DeliveryCallback = Callable[
     [httpx.AsyncClient, str, str, NotificationEnvelope],
@@ -222,23 +223,41 @@ class NotificationOutbox:
 
     async def _worker(self) -> None:
         last_cleanup = 0.0
+        in_flight: set[asyncio.Task[None]] = set()
         async with httpx.AsyncClient(timeout=20.0) as client:
             while not self.stop_event.is_set():
-                delivery = self._claim()
-                if delivery is None:
-                    await asyncio.sleep(0.5)
+                while len(in_flight) < MAX_IN_FLIGHT:
+                    delivery = self._claim()
+                    if delivery is None:
+                        break
+
+                    async def process_claimed(
+                        claimed: NotificationDelivery = delivery,
+                    ) -> None:
+                        try:
+                            await self._process(client, claimed)
+                        except Exception:
+                            logger.exception(
+                                "Unexpected notification delivery failure for %s",
+                                claimed.id,
+                            )
+                            now = datetime.datetime.now(datetime.UTC)
+                            NotificationDelivery.update(
+                                status="pending", next_attempt=now, updated_at=now
+                            ).where(NotificationDelivery.id == claimed.id).execute()
+
+                    in_flight.add(asyncio.create_task(process_claimed()))
+
+                if in_flight:
+                    done, in_flight = await asyncio.wait(
+                        in_flight,
+                        timeout=0.5,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        task.result()
                 else:
-                    try:
-                        await self._process(client, delivery)
-                    except Exception:
-                        logger.exception(
-                            "Unexpected notification delivery failure for %s",
-                            delivery.id,
-                        )
-                        now = datetime.datetime.now(datetime.UTC)
-                        NotificationDelivery.update(
-                            status="pending", next_attempt=now, updated_at=now
-                        ).where(NotificationDelivery.id == delivery.id).execute()
+                    await asyncio.sleep(0.5)
                 if time.monotonic() - last_cleanup > 3600:
                     self._cleanup()
                     last_cleanup = time.monotonic()

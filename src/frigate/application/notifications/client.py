@@ -384,6 +384,9 @@ class NotificationClient(Communicator):
             existing = self._aggregator.media.latest_for_event(str(event.id))
         if existing:
             return existing
+        camera = self.config.cameras.get(str(event.camera))
+        if camera is None or camera.media_mode.value == "external":
+            return None
         image_path, _ = get_event_snapshot_path(event, clean_only=True)
         if not image_path:
             return None

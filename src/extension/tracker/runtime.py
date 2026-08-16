@@ -113,6 +113,7 @@ class TrackerUpdate:
     motion: dict[str, Any] = field(default_factory=dict)
     region: dict[str, Any] = field(default_factory=dict)
     media: tuple[MediaManifest, ...] = ()
+    source_type: str = "tracker"
 
     @property
     def trace_id(self) -> str:

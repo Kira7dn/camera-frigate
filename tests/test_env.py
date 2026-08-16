@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from frigate.infrastructure.config.env import (
+    DAHUA_ENV_VARS,
     FRIGATE_ENV_VARS,
     validate_env_string,
     validate_env_vars,
@@ -79,10 +80,13 @@ class TestGo2RtcAddStreamSubstitution(unittest.TestCase):
 class TestEnvString(unittest.TestCase):
     def setUp(self):
         self._original_env_vars = dict(FRIGATE_ENV_VARS)
+        self._original_dahua_env_vars = dict(DAHUA_ENV_VARS)
 
     def tearDown(self):
         FRIGATE_ENV_VARS.clear()
         FRIGATE_ENV_VARS.update(self._original_env_vars)
+        DAHUA_ENV_VARS.clear()
+        DAHUA_ENV_VARS.update(self._original_dahua_env_vars)
 
     def test_substitution(self):
         """EnvString substitutes FRIGATE_ env vars."""
@@ -98,6 +102,17 @@ class TestEnvString(unittest.TestCase):
             "rtsp://{FRIGATE_CAM_USER}:{FRIGATE_CAM_PASS}@10.0.0.1/stream"
         )
         self.assertEqual(result, "rtsp://admin:secret@10.0.0.1/stream")
+
+    def test_dahua_substitution_uses_existing_env_names(self):
+        """Dahua RTSP placeholders use the names from .env.local directly."""
+        DAHUA_ENV_VARS["DAHUA_USER"] = "admin"
+        DAHUA_ENV_VARS["DAHUA_PASSWORD"] = "secret"
+        result = validate_env_string(
+            "rtsp://{DAHUA_USER}:{DAHUA_PASSWORD}@192.168.100.229:554/stream"
+        )
+        self.assertEqual(
+            result, "rtsp://admin:secret@192.168.100.229:554/stream"
+        )
 
     def test_no_placeholder(self):
         """Plain strings pass through unchanged."""

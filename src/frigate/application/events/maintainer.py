@@ -10,7 +10,7 @@ from multiprocessing import Queue
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any, cast
 
-from frigate.application.events.canonical import EventAggregator
+from frigate.application.events.canonical import EventAggregator, as_utc
 from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.const import CLIPS_DIR, REPLAY_CAMERA_PREFIX, THUMB_DIR
 from frigate.infrastructure.comms.event_metadata_updater import (
@@ -42,6 +42,12 @@ from frigate.util.face_snapshot import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def event_timestamp(value: Any) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    return as_utc(value).timestamp()
 
 
 def should_update_db(prev_event: dict[str, Any], current_event: dict[str, Any]) -> bool:
@@ -143,12 +149,13 @@ class EventProcessor(threading.Thread):
         # A crash has no final end message. Close recovered events at their
         # last persisted observation instead of inventing a fixed duration.
         for open_event in Event.select().where(Event.end_time == None):
+            start_time = event_timestamp(open_event.start_time)
             last_seen = float(
                 (open_event.data or {}).get(
-                    "last_seen_frame_time", open_event.start_time + 30
+                    "last_seen_frame_time", start_time + 30
                 )
             )
-            open_event.end_time = max(open_event.start_time, last_seen)
+            open_event.end_time = max(start_time, last_seen)
             open_event.save(only=[Event.end_time])
 
         while not self.stop_event.is_set():

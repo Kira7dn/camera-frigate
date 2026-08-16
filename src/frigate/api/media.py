@@ -70,6 +70,33 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=[Tags.media])
 
 
+def _external_camera(request: Request, camera_name: str) -> bool:
+    camera = request.app.frigate_config.cameras.get(camera_name)
+    return camera is not None and camera.media_mode.value == "external"
+
+
+def _latest_external_artifact(camera_name: str) -> tuple[bytes, float] | None:
+    event = (
+        Event.select()
+        .where(
+            (Event.camera == camera_name)
+            & (Event.canonical_artifact_id.is_null(False))
+        )
+        .order_by(Event.start_time.desc())
+        .first()
+    )
+    if event is None:
+        return None
+    store = CanonicalMediaStore()
+    content = store.read_bytes(cast(str | None, event.canonical_artifact_id))
+    evidence = EventEvidence.get_or_none(
+        EventEvidence.id == event.canonical_evidence_id
+    )
+    if content is None or evidence is None:
+        return None
+    return content, float(evidence.frame_time)
+
+
 async def _edge_media_response(
     request: Request,
     event_id: str,
@@ -137,6 +164,14 @@ async def mjpeg_feed(
     camera_name: str,
     params: MediaMjpegFeedQueryParams = Depends(),
 ):
+    if _external_camera(request, camera_name):
+        return JSONResponse(
+            content={
+                "success": False,
+                "message": "External camera has no Frigate live capture",
+            },
+            status_code=409,
+        )
     draw_options = {
         "bounding_boxes": params.bbox,
         "timestamp": params.timestamp,
@@ -233,6 +268,36 @@ async def latest_frame(
     extension: Extension,
     params: MediaLatestFrameQueryParams = Depends(),
 ):
+    if _external_camera(request, camera_name):
+        latest = _latest_external_artifact(camera_name)
+        if latest is None:
+            return JSONResponse(
+                content={"success": False, "message": "External evidence unavailable"},
+                status_code=404,
+            )
+        content, frame_time = latest
+        if extension is not Extension.jpg:
+            image = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                return JSONResponse(
+                    content={"success": False, "message": "Invalid external evidence"},
+                    status_code=422,
+                )
+            ok, encoded = cv2.imencode(
+                f".{extension.value}", image,
+                get_image_quality_params(extension.value, params.quality),
+            )
+            if not ok:
+                return JSONResponse(
+                    content={"success": False, "message": "Unable to encode external evidence"},
+                    status_code=422,
+                )
+            content = encoded.tobytes()
+        return Response(
+            content=content,
+            media_type=extension.get_mime_type(),
+            headers={"Cache-Control": "no-store", "X-Frame-Time": str(frame_time)},
+        )
     frame_processor: TrackedObjectProcessor = request.app.detected_frames_processor
     draw_options = {
         "bounding_boxes": params.bbox,
@@ -756,6 +821,11 @@ async def vod_event(
         )
 
     await require_camera_access(cast(str | None, event.camera), request=request)
+    if _external_camera(request, cast(str, event.camera)):
+        return JSONResponse(
+            content={"success": False, "message": "External camera has no Frigate VOD"},
+            status_code=404,
+        )
 
     end_ts = (
         datetime.now().timestamp()
@@ -782,10 +852,16 @@ async def vod_event(
     description="Returns an HLS playlist for a timestamp range with HLS discontinuity enabled. Append /master.m3u8 or /index.m3u8 for HLS playback.",
 )
 async def vod_clip(
+    request: Request,
     camera_name: str,
     start_ts: float,
     end_ts: float,
 ):
+    if _external_camera(request, camera_name):
+        return JSONResponse(
+            content={"success": False, "message": "External camera has no Frigate VOD"},
+            status_code=404,
+        )
     return await vod_ts(camera_name, start_ts, end_ts, force_discontinuity=True)
 
 
@@ -802,13 +878,41 @@ async def event_snapshot(
     jpg_bytes = None
     frame_time = 0
     try:
-        event = Event.get(Event.id == event_id, Event.end_time != None)
-        event_complete = True
+        event = Event.get(Event.id == event_id)
         await require_camera_access(cast(str | None, event.camera), request=request)
+        external = _external_camera(request, cast(str, event.camera))
+        if event.end_time is None and not external:
+            raise DoesNotExist
+        event_complete = event.end_time is not None
         if not event.has_snapshot:
             return JSONResponse(
                 content={"success": False, "message": "Snapshot not available"},
                 status_code=404,
+            )
+        if external:
+            # External producer snapshots are raw evidence. Public Event
+            # snapshot output must be the immutable canonical artifact so the
+            # bbox/label is rendered exactly once and follows ACTIVE lineage.
+            artifact = CanonicalMediaStore().get(
+                cast(str | None, event.canonical_artifact_id)
+            )
+            if artifact is None:
+                return JSONResponse(
+                    content={"success": False, "message": "Canonical artifact unavailable"},
+                    status_code=404,
+                )
+            jpg_bytes = CanonicalMediaStore().read_bytes(artifact.id)
+            if jpg_bytes is None:
+                return JSONResponse(
+                    content={"success": False, "message": "Canonical artifact unavailable"},
+                    status_code=404,
+                )
+            evidence = EventEvidence.get_or_none(EventEvidence.id == artifact.evidence_id)
+            frame_time = float(evidence.frame_time) if evidence else 0.0
+            return Response(
+                jpg_bytes,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "private, max-age=31536000", "X-Frame-Time": str(frame_time)},
             )
         edge_response = await _edge_media_response(
             request, event_id, "snapshot_jpg", "image/jpeg"
@@ -829,6 +933,11 @@ async def event_snapshot(
                 status_code=404,
             )
     except DoesNotExist:
+        if event_id.startswith("safety"):
+            return JSONResponse(
+                content={"success": False, "message": "External event not found"},
+                status_code=404,
+            )
         # see if the object is currently being tracked
         try:
             camera_states: list[CameraState] = (
@@ -903,7 +1012,8 @@ async def event_thumbnail(
     try:
         event: Event = Event.get(Event.id == event_id)
         await require_camera_access(cast(str | None, event.camera), request=request)
-        if event.end_time is not None:
+        external = _external_camera(request, cast(str, event.camera))
+        if event.end_time is not None or external:
             event_complete = True
             artifact = CanonicalMediaStore().get(cast(str | None, event.canonical_artifact_id))
             if artifact is not None:
@@ -923,6 +1033,11 @@ async def event_thumbnail(
             )
         thumbnail_bytes = get_event_thumbnail_bytes(event)
     except DoesNotExist:
+        if event_id.startswith("safety"):
+            return JSONResponse(
+                content={"success": False, "message": "External event not found"},
+                status_code=404,
+            )
         thumbnail_bytes = None
 
     if thumbnail_bytes is None:
@@ -992,6 +1107,11 @@ async def event_thumbnail(
 def grid_snapshot(
     request: Request, camera_name: str, color: str = "green", font_scale: float = 0.5
 ):
+    if _external_camera(request, camera_name):
+        return JSONResponse(
+            content={"success": False, "message": "External camera has no live grid"},
+            status_code=409,
+        )
     if camera_name in request.app.frigate_config.cameras:
         detect = request.app.frigate_config.cameras[camera_name].detect
         frame_processor: TrackedObjectProcessor = request.app.detected_frames_processor
@@ -1145,7 +1265,34 @@ async def event_snapshot_clean(request: Request, event_id: str, download: bool =
                 },
                 status_code=404,
             )
-        if event.end_time is None:
+        if _external_camera(request, cast(str, event.camera)):
+            artifact = CanonicalMediaStore().get(
+                cast(str | None, event.canonical_artifact_id)
+            )
+            canonical = CanonicalMediaStore().read_bytes(
+                cast(str | None, artifact.id) if artifact is not None else None
+            )
+            if canonical is None:
+                return JSONResponse(
+                    content={"success": False, "message": "External evidence unavailable"},
+                    status_code=404,
+                )
+            image = cv2.imdecode(np.frombuffer(canonical, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                return JSONResponse(
+                    content={"success": False, "message": "Invalid external evidence"},
+                    status_code=422,
+                )
+            ok, encoded = cv2.imencode(
+                ".webp", image, get_image_quality_params("webp", None)
+            )
+            if not ok:
+                return JSONResponse(
+                    content={"success": False, "message": "Unable to encode external evidence"},
+                    status_code=422,
+                )
+            webp_bytes = encoded.tobytes()
+        if event.end_time is None and not _external_camera(request, cast(str, event.camera)):
             # see if the object is currently being tracked
             try:
                 camera_states = (
@@ -1276,6 +1423,12 @@ async def event_clip(
     if edge_response is not None:
         return edge_response
 
+    if _external_camera(request, cast(str, event.camera)):
+        return JSONResponse(
+            content={"success": False, "message": "External clip unavailable"},
+            status_code=404,
+        )
+
     end_ts = (
         datetime.now().timestamp()
         if event.end_time is None
@@ -1302,6 +1455,16 @@ async def review_clip(
         )
 
     await require_camera_access(cast(str | None, review.camera), request=request)
+    if _external_camera(request, cast(str, review.camera)):
+        edge_response = await _edge_media_response(
+            request, review_id, "clip", "video/mp4"
+        )
+        if edge_response is not None:
+            return edge_response
+        return JSONResponse(
+            content={"success": False, "message": "External review clip unavailable"},
+            status_code=404,
+        )
 
     end_ts = (
         datetime.now().timestamp()
@@ -1325,6 +1488,11 @@ async def event_preview(request: Request, event_id: str):
         )
 
     await require_camera_access(cast(str | None, event.camera), request=request)
+    if _external_camera(request, cast(str, event.camera)):
+        return JSONResponse(
+            content={"success": False, "message": "External camera has no Frigate preview"},
+            status_code=404,
+        )
 
     start_ts = cast(float, event.start_time)
     end_ts = start_ts + (

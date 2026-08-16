@@ -54,13 +54,34 @@ def classify_response(response: httpx.Response) -> DeliveryResult:
         except ValueError:
             body = {}
         if isinstance(body, dict) and body.get("ok") is False:
-            return DeliveryResult(False, False, "provider rejected request")
+            detail = str(
+                body.get("description")
+                or body.get("message")
+                or body.get("error_code")
+                or "provider rejected request"
+            )
+            return DeliveryResult(False, True, " ".join(detail.split())[:240])
         return DeliveryResult(True)
-    retryable = response.status_code in (408, 425, 429) or response.status_code >= 500
+    detail = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            detail = str(body.get("description") or body.get("message") or "")
+    except ValueError:
+        detail = response.text.strip()
+    detail = " ".join(detail.split())[:240]
+    error = f"HTTP {response.status_code}"
+    if detail:
+        error = f"{error}: {detail}"
+    retryable = (
+        response.status_code in (408, 425, 429)
+        or response.status_code >= 500
+        or "failed to get http url content" in detail.lower()
+    )
     return DeliveryResult(
         False,
         retryable,
-        f"HTTP {response.status_code}",
+        error,
         _retry_after(response),
     )
 

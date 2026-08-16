@@ -16,7 +16,17 @@ from typing import Any
 import cv2
 import numpy as np
 
-from frigate.infrastructure.comms.detections_updater import DetectionSubscriber, DetectionTypeEnum
+from frigate.application.review.types import SeverityEnum
+from frigate.const import (
+    CLEAR_ONGOING_REVIEW_SEGMENTS,
+    CLIPS_DIR,
+    UPSERT_REVIEW_SEGMENT,
+)
+from frigate.domain.track.object_processing import ManualEventState
+from frigate.infrastructure.comms.detections_updater import (
+    DetectionSubscriber,
+    DetectionTypeEnum,
+)
 from frigate.infrastructure.comms.inter_process import InterProcessRequestor
 from frigate.infrastructure.comms.review_updater import ReviewDataPublisher
 from frigate.infrastructure.config import CameraConfig, FrigateConfig
@@ -24,14 +34,7 @@ from frigate.infrastructure.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
-from frigate.const import (
-    CLEAR_ONGOING_REVIEW_SEGMENTS,
-    CLIPS_DIR,
-    UPSERT_REVIEW_SEGMENT,
-)
 from frigate.models import ReviewSegment
-from frigate.application.review.types import SeverityEnum
-from frigate.domain.track.object_processing import ManualEventState
 from frigate.util.image import SharedMemoryFrameManager, calculate_16_9_crop
 
 logger = logging.getLogger(__name__)
@@ -804,6 +807,16 @@ class ReviewSegmentMaintainer(threading.Thread):
                                 current_segment.last_detection_time = manual_info[
                                     "end_time"
                                 ]
+
+                                # External producers do not publish Frigate
+                                # video frames. Their manual event end is the
+                                # definitive boundary; close the review segment
+                                # here instead of waiting for a future frame.
+                                if (
+                                    self.config.cameras[camera].media_mode.value
+                                    == "external"
+                                ):
+                                    self.forcibly_end_segment(camera)
                         else:
                             logger.error(
                                 f"Event with ID {event_id} has a set duration and can not be ended manually."

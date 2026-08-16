@@ -49,6 +49,13 @@ class CameraTypeEnum(str, Enum):
     lpr = "lpr"
 
 
+class CameraMediaModeEnum(str, Enum):
+    """Select who owns evidence capture for this camera."""
+
+    native = "native"
+    external = "external"
+
+
 class CameraConfig(FrigateBaseModel):
     name: str | None = Field(
         None,
@@ -173,6 +180,11 @@ class CameraConfig(FrigateBaseModel):
         default=CameraTypeEnum.generic,
         title="Camera type",
         description="Camera Type",
+    )
+    media_mode: CameraMediaModeEnum = Field(
+        default=CameraMediaModeEnum.native,
+        title="Media ownership mode",
+        description="External producers own snapshots and clips; Frigate must not capture fallback frames.",
     )
     ui: CameraUiConfig = Field(
         default_factory=CameraUiConfig,

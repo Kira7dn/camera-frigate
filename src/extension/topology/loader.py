@@ -29,6 +29,7 @@ class PlatformConfigLoader:
         path: str | Path,
         *,
         host_labelmap_path: str | Path | None = None,
+        external_cameras: set[str] | frozenset[str] | None = None,
     ) -> PlatformConfigSource:
         """Read and validate the launcher-owned source topology config."""
         config_path = Path(path)
@@ -36,6 +37,18 @@ class PlatformConfigLoader:
         if not isinstance(raw, dict):
             raise ValueError("source config must contain a YAML mapping")
         validation_raw = copy.deepcopy(raw)
+        if external_cameras:
+            validation_cameras = validation_raw.setdefault("cameras", {})
+            raw_cameras = raw.setdefault("cameras", {})
+            unknown = sorted(set(external_cameras).difference(validation_cameras))
+            if unknown:
+                raise ValueError(
+                    "external producer references unknown cameras: "
+                    + ", ".join(unknown)
+                )
+            for camera_name in external_cameras:
+                validation_cameras[camera_name]["media_mode"] = "external"
+                raw_cameras[camera_name]["media_mode"] = "external"
         model = validation_raw.get("model")
         if (
             host_labelmap_path is not None

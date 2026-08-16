@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -19,27 +20,41 @@ from multiprocessing.synchronize import Event as MpEvent
 from pathlib import Path
 from typing import Any
 
+import cv2
 import grpc
 from grpc import aio
 from playhouse.sqliteq import SqliteQueueDatabase
 
 from extension.topology.compiler import PlatformTopologyPlan
 from extension.tracker.runtime import (
+    MediaManifest,
     TrackerJournal,
     TrackerOperation,
     TrackerUpdate,
     tracker_config_fingerprint,
 )
-from frigate.application.events.canonical import EventAggregator
+from frigate.application.events.canonical import (
+    EventAggregator,
+    RenderSpec,
+    as_utc,
+    normalized_xyxy,
+)
 from frigate.application.events.types import EventStateEnum, EventTypeEnum
 from frigate.infrastructure.comms.events_updater import EventUpdatePublisher
 from frigate.infrastructure.config import FrigateConfig
-from frigate.models import EdgeMediaManifest, TrackerJournalEntry
+from frigate.models import (
+    EdgeMediaManifest,
+    Event,
+    EventEvidence,
+    ReviewSegment,
+    TrackerJournalEntry,
+)
 from frigate.util.image import SharedMemoryFrameManager
 
 logger = logging.getLogger(__name__)
 SERVICE = "camera.tracker.v1.TrackerService"
 PROTOCOL_VERSION = 2
+PRODUCER_MEDIA_MAX_BYTES = 128 * 1024 * 1024
 
 
 def _encode(value: Mapping[str, Any]) -> bytes:
@@ -259,6 +274,17 @@ async def start_server(
     return server
 
 
+async def start_producer_server(
+    bind: str, service: ProducerIngressService
+) -> aio.Server:
+    """Start the same private gRPC service for Safety producer ingress."""
+    server = aio.server()
+    server.add_generic_rpc_handlers((service.handler(),))
+    server.add_insecure_port(bind)
+    await server.start()
+    return server
+
+
 class TrackerIngestError(RuntimeError):
     pass
 
@@ -326,6 +352,145 @@ class TrackerHostIngest:
         self.accepted[accepted_key] = update.event_id
 
 
+class ProducerIngressService:
+    """Frigate-main ingress for non-native producers.
+
+    The existing private gRPC service is also the only producer ingress.  Safety
+    uses these two methods; no HTTP event API or live-frame lookup is involved.
+    Media is uploaded as binary gRPC chunks and the event message carries only
+    its validated manifest.
+    """
+
+    def __init__(
+        self,
+        ingest: TrackerHostIngest,
+        media_root: str | Path,
+        health: Callable[[], tuple[dict[str, object], ...]],
+    ) -> None:
+        self.ingest = ingest
+        self.media_root = Path(media_root)
+        self.media_root.mkdir(parents=True, exist_ok=True)
+        self.health = health
+        self.media_paths: dict[str, Path] = {}
+        self.media_manifests: dict[str, MediaManifest] = {}
+        self._lock = threading.Lock()
+
+    async def capabilities(self, request: bytes, context: aio.ServicerContext) -> bytes:
+        cameras = self.health()
+        return _encode(
+            {
+                "schema_version": 1,
+                "protocol_version": PROTOCOL_VERSION,
+                "node_id": "frigate-main",
+                "health": {"ready": True, "degraded": False},
+                "cameras": list(cameras),
+            }
+        )
+
+    async def upload_media(
+        self, requests: AsyncIterator[bytes], context: aio.ServicerContext
+    ) -> bytes:
+        try:
+            header = _decode(await anext(requests))
+            media_id = str(header["media_id"])
+            event_id = str(header["event_id"])
+            camera_id = str(header["camera_id"])
+            media_type = str(header["media_type"])
+            codec = str(header["codec"])
+            byte_size = int(header["byte_size"])
+            sha256 = str(header["sha256"])
+            start_time = float(header["start_time"])
+            end_time = float(header["end_time"])
+        except (StopAsyncIteration, KeyError, TypeError, ValueError):
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid_media_manifest")
+        if not media_id or not event_id or not camera_id:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid_media_identity")
+        if media_type not in {"snapshot_jpg", "clip"}:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "unsupported_media_type")
+        if codec not in {"jpeg", "h264", "mp4"}:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "unsupported_media_codec")
+        if byte_size <= 0 or byte_size > PRODUCER_MEDIA_MAX_BYTES:
+            await context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "invalid_media_size")
+
+        temporary = self.media_root / f".{media_id}.tmp"
+        target = self.media_root / media_id
+        digest = hashlib.sha256()
+        received = 0
+        try:
+            with temporary.open("wb") as handle:
+                async for chunk in requests:
+                    if not chunk:
+                        continue
+                    received += len(chunk)
+                    if received > byte_size:
+                        raise ValueError("media_size_overflow")
+                    digest.update(chunk)
+                    handle.write(chunk)
+            if received != byte_size or digest.hexdigest() != sha256:
+                raise ValueError("media_integrity_mismatch")
+            os.replace(temporary, target)
+        except (OSError, ValueError) as error:
+            temporary.unlink(missing_ok=True)
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+
+        manifest = MediaManifest(
+            media_id=media_id,
+            event_id=event_id,
+            camera_id=camera_id,
+            media_type=media_type,
+            codec=codec,
+            start_time=start_time,
+            end_time=end_time,
+            byte_size=byte_size,
+            sha256=sha256,
+            expiry_unix_ms=int((time.time() + 3600) * 1000),
+        )
+        with self._lock:
+            previous = self.media_manifests.get(media_id)
+            if previous is not None and (
+                previous.event_id != event_id or previous.sha256 != sha256
+            ):
+                await context.abort(grpc.StatusCode.ALREADY_EXISTS, "media_id_conflict")
+            self.media_paths[media_id] = target
+            self.media_manifests[media_id] = manifest
+        return _encode({"ok": True, "media_id": media_id, "sha256": sha256})
+
+    async def publish(self, request: bytes, context: aio.ServicerContext) -> bytes:
+        try:
+            update = TrackerUpdate.from_json(_decode(request)["update"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"invalid_update:{error}")
+        if update.source_type != "safety":
+            await context.abort(grpc.StatusCode.PERMISSION_DENIED, "producer_source_not_allowed")
+        try:
+            await asyncio.to_thread(self.ingest.accept, update)
+        except TrackerIngestError as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+        except (OSError, RuntimeError, ValueError) as error:
+            await context.abort(grpc.StatusCode.INTERNAL, str(error))
+        return _encode({"ok": True, "event_id": update.event_id, "sequence": update.journal_sequence})
+
+    def handler(self) -> grpc.GenericRpcHandler:
+        return grpc.method_handlers_generic_handler(
+            SERVICE,
+            {
+                "GetCapabilities": grpc.unary_unary_rpc_method_handler(
+                    self.capabilities,
+                    request_deserializer=lambda value: value,
+                    response_serializer=lambda value: value,
+                ),
+                "UploadMedia": grpc.stream_unary_rpc_method_handler(
+                    self.upload_media,
+                    request_deserializer=lambda value: value,
+                    response_serializer=lambda value: value,
+                ),
+                "Publish": grpc.unary_unary_rpc_method_handler(
+                    self.publish,
+                    request_deserializer=lambda value: value,
+                    response_serializer=lambda value: value,
+                ),
+            },
+        )
 class TrackerCanonicalStore:
     """Persist accepted producer identity after EventProcessor commit."""
 
@@ -471,6 +636,19 @@ class TrackerMaintainer(threading.Thread):
             node_id: TrackerHostIngest(topology.camera_owners, self._commit)
             for node_id in topology.tracker_nodes
         }
+        producer_cameras = {
+            camera: "safety"
+            for camera in topology.safety_cameras
+            if camera not in topology.camera_owners
+        }
+        self.producer_ingest = TrackerHostIngest(
+            producer_cameras, self._commit_producer
+        )
+        self.producer_service: ProducerIngressService | None = None
+        self.producer_server_bind = os.environ.get(
+            "PRODUCER_GRPC_BIND", "0.0.0.0:50052"
+        )
+        self.producer_event_aggregator = EventAggregator()
 
     @staticmethod
     def _tls(node: Any) -> ClientTls:
@@ -620,6 +798,232 @@ class TrackerMaintainer(threading.Thread):
                 self.frame_manager.close(frame_name)
         self.store.accept(update)
 
+    def _producer_media_path(self, media_id: str) -> Path | None:
+        service = self.producer_service
+        if service is None:
+            return None
+        with service._lock:
+            return service.media_paths.get(media_id)
+
+    def _persist_producer_manifest(self, update: TrackerUpdate, manifest: MediaManifest) -> None:
+        existing = EdgeMediaManifest.get_or_none(
+            EdgeMediaManifest.media_id == manifest.media_id
+        )
+        if existing is not None:
+            if existing.event_id != update.event_id or existing.sha256 != manifest.sha256:
+                raise TrackerIngestError("durable_media_conflict")
+            return
+        EdgeMediaManifest.create(
+            media_id=manifest.media_id,
+            node_id=update.node_id,
+            camera_id=manifest.camera_id,
+            event_id=manifest.event_id,
+            media_type=manifest.media_type,
+            codec=manifest.codec,
+            start_time=manifest.start_time,
+            end_time=manifest.end_time,
+            byte_size=manifest.byte_size,
+            sha256=manifest.sha256,
+            expires_at=datetime.datetime.fromtimestamp(
+                manifest.expiry_unix_ms / 1000, datetime.UTC
+            ),
+        )
+
+    def _commit_producer(self, update: TrackerUpdate) -> None:
+        """Commit Safety evidence synchronously using the canonical Frigate owner."""
+        if update.source_type != "safety":
+            raise TrackerIngestError("producer_source_mismatch")
+        camera_config = self.config.cameras.get(update.camera_id)
+        if camera_config is None or camera_config.media_mode.value != "external":
+            raise TrackerIngestError("producer_camera_not_external")
+
+        snapshot_manifest = next(
+            (item for item in update.media if item.media_type == "snapshot_jpg"), None
+        )
+        clip_manifest = next(
+            (item for item in update.media if item.media_type == "clip"), None
+        )
+        if update.operation is TrackerOperation.START and snapshot_manifest is None:
+            raise TrackerIngestError("producer_start_requires_snapshot")
+        if update.operation is TrackerOperation.END and clip_manifest is None:
+            raise TrackerIngestError("producer_end_requires_clip")
+
+        for manifest in update.media:
+            if manifest.event_id != update.event_id or manifest.camera_id != update.camera_id:
+                raise TrackerIngestError("producer_media_identity_mismatch")
+            path = self._producer_media_path(manifest.media_id)
+            if path is None or not path.is_file():
+                raise TrackerIngestError("producer_media_unavailable")
+            if path.stat().st_size != manifest.byte_size:
+                raise TrackerIngestError("producer_media_size_mismatch")
+            if hashlib.sha256(path.read_bytes()).hexdigest() != manifest.sha256:
+                raise TrackerIngestError("producer_media_integrity_mismatch")
+            self._persist_producer_manifest(update, manifest)
+
+        snapshot_path = (
+            self._producer_media_path(snapshot_manifest.media_id)
+            if snapshot_manifest is not None
+            else None
+        )
+        width = int(camera_config.detect.width or 0)
+        height = int(camera_config.detect.height or 0)
+        if snapshot_path is not None:
+            image = cv2.imread(str(snapshot_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise TrackerIngestError("producer_snapshot_decode_failed")
+            width, height = int(image.shape[1]), int(image.shape[0])
+        if width <= 0 or height <= 0:
+            raise TrackerIngestError("producer_snapshot_dimensions_missing")
+        bbox = normalized_xyxy(
+            (update.bbox.left, update.bbox.top, update.bbox.right, update.bbox.bottom),
+            width,
+            height,
+        )
+        evidence_id: str | None = None
+        if snapshot_manifest is not None and snapshot_path is not None:
+            evidence_id = hashlib.sha256(
+                f"{update.event_id}:{snapshot_manifest.media_id}".encode()
+            ).hexdigest()
+            evidence = self.producer_event_aggregator.add_evidence(
+                evidence_id=evidence_id,
+                event_id=update.event_id,
+                frame_ref=str(snapshot_path),
+                frame_time=update.frame_time,
+                width=width,
+                height=height,
+                boxes=[
+                    {
+                        "role": "object",
+                        "label": update.label,
+                        "score": update.score,
+                        "normalized_xyxy": bbox,
+                    }
+                ],
+                technical={
+                    "source_type": update.source_type,
+                    "media_id": snapshot_manifest.media_id,
+                    "sha256": snapshot_manifest.sha256,
+                    "codec": snapshot_manifest.codec,
+                },
+            )
+            if evidence is None:
+                raise TrackerIngestError("producer_evidence_not_durable")
+
+        now = datetime.datetime.fromtimestamp(update.frame_time, datetime.UTC)
+        existing = Event.get_or_none(Event.id == update.event_id)
+        if existing is None:
+            Event.insert(
+                {
+                    Event.id: update.event_id,
+                    Event.label: update.label,
+                    Event.sub_label: "camera-safety",
+                    Event.camera: update.camera_id,
+                    Event.start_time: now,
+                    Event.end_time: now if update.operation is TrackerOperation.END else None,
+                    Event.top_score: update.score,
+                    Event.score: update.score,
+                    Event.false_positive: False,
+                    Event.zones: [],
+                    Event.thumbnail: "",
+                    Event.has_clip: clip_manifest is not None,
+                    Event.has_snapshot: snapshot_manifest is not None,
+                    Event.region: bbox,
+                    Event.box: bbox,
+                    Event.area: max(1, int((bbox[2] - bbox[0]) * width * (bbox[3] - bbox[1]) * height)),
+                    Event.plus_id: "",
+                    Event.model_hash: "external",
+                    Event.detector_type: "safety",
+                    Event.model_type: "external",
+                    Event.data: {
+                        "type": "producer",
+                        "source_type": update.source_type,
+                        "score": update.score,
+                        "box": bbox,
+                        "frame_time": update.frame_time,
+                        "producer_node_id": update.node_id,
+                    },
+                    Event.state: "ACTIVE",
+                    Event.revision: 0,
+                }
+            ).execute()
+        else:
+            if existing.camera != update.camera_id or existing.label != update.label:
+                raise TrackerIngestError("producer_event_identity_mismatch")
+            values: dict[Any, Any] = {
+                Event.score: update.score,
+                Event.top_score: max(float(existing.top_score or 0), update.score),
+                Event.has_snapshot: bool(existing.has_snapshot or snapshot_manifest),
+                Event.has_clip: bool(existing.has_clip or clip_manifest),
+                Event.box: bbox,
+                Event.region: bbox,
+            }
+            if update.operation is TrackerOperation.END:
+                values[Event.end_time] = now
+            Event.update(values).where(Event.id == update.event_id).execute()
+
+        observation_id = hashlib.sha256(
+            f"{update.node_id}:{update.node_epoch}:{update.journal_sequence}".encode()
+        ).hexdigest()
+        self.producer_event_aggregator.observe(
+            observation_id=observation_id,
+            event_id=update.event_id,
+            kind="event_ended" if update.operation is TrackerOperation.END else "producer_update",
+            observed_at=now,
+            frame_time=update.frame_time,
+            evidence_id=evidence_id,
+            payload={
+                "source_type": update.source_type,
+                "camera": update.camera_id,
+                "label": update.label,
+                "score": update.score,
+                "bbox": bbox,
+            },
+        )
+        # The START/UPDATE snapshot is the canonical alert evidence. END owns
+        # the terminal clip and state, but must not replace the ACTIVE image
+        # with a post-clear frame where the subject may have left the scene.
+        if evidence_id is not None and update.operation is not TrackerOperation.END:
+            event = Event.get_by_id(update.event_id)
+            label = event.display_label or event.label
+            artifact = self.producer_event_aggregator.media.materialize(
+                RenderSpec(update.event_id, event.revision, evidence_id),
+                EventEvidence.get_by_id(evidence_id),
+                label,
+            )
+            if artifact is None:
+                raise TrackerIngestError("producer_canonical_artifact_unavailable")
+            Event.update(
+                state="ACTIVE" if update.operation is not TrackerOperation.END else "FINALIZING",
+                canonical_evidence_id=evidence_id,
+                canonical_artifact_id=artifact.id,
+                display_label=label,
+            ).where(Event.id == update.event_id).execute()
+        if update.operation is TrackerOperation.END:
+            artifact = self.producer_event_aggregator.finalize(update.event_id)
+            event = Event.get_by_id(update.event_id)
+            if artifact is not None:
+                ReviewSegment.insert(
+                    id=update.event_id,
+                    camera=update.camera_id,
+                    start_time=as_utc(event.start_time).timestamp(),
+                    end_time=as_utc(event.end_time).timestamp(),
+                    severity="alert",
+                    thumb_path=artifact.path,
+                    data={
+                        "detections": [update.event_id],
+                        "objects": [update.label],
+                        "verified_objects": [],
+                        "sub_labels": [],
+                        "zones": [],
+                        "audio": [],
+                        "thumb_time": update.frame_time,
+                        "metadata": {
+                            "source_type": update.source_type,
+                            "artifact_id": artifact.id,
+                        },
+                    },
+                ).on_conflict_ignore().execute()
+
     async def _run_node(self, node_id: str) -> None:
         node = self.config.tracker[node_id]
         ingest = self.ingests[node_id]
@@ -730,14 +1134,32 @@ class TrackerMaintainer(threading.Thread):
                 await asyncio.sleep(min(1.0, node.deadline))
 
     def run(self) -> None:
-        if not self.topology.tracker_nodes:
+        if not self.topology.tracker_nodes and not self.producer_ingest.camera_owners:
             return
 
         async def run_all() -> None:
             self.loop = asyncio.get_running_loop()
-            await asyncio.gather(
-                *(self._run_node(node_id) for node_id in self.topology.tracker_nodes)
+            self.producer_service = ProducerIngressService(
+                self.producer_ingest,
+                Path("/media/frigate") / "producer-media",
+                lambda: tuple(
+                    {"camera_id": camera, "ready": True}
+                    for camera in self.producer_ingest.camera_owners
+                ),
             )
+            producer_server = await start_producer_server(
+                self.producer_server_bind, self.producer_service
+            )
+            try:
+                if self.topology.tracker_nodes:
+                    await asyncio.gather(
+                        *(self._run_node(node_id) for node_id in self.topology.tracker_nodes)
+                    )
+                else:
+                    while not self.stop_event.is_set() and not self.shutdown.is_set():
+                        await asyncio.sleep(0.2)
+            finally:
+                await producer_server.stop(2)
 
         asyncio.run(run_all())
 
@@ -758,6 +1180,15 @@ class TrackerMaintainer(threading.Thread):
         offset: int = 0,
         length: int | None = None,
     ) -> bytes:
+        if node_id == "safety":
+            path = self._producer_media_path(media_id)
+            if path is None or not path.is_file():
+                raise RuntimeError("producer_media_unavailable")
+            data = await asyncio.to_thread(path.read_bytes)
+            if offset < 0 or offset > len(data):
+                raise ValueError("invalid_media_range")
+            return data[offset:] if length is None else data[offset : offset + length]
+
         async def fetch() -> bytes:
             channel = self.channels.get(node_id)
             if channel is None:
@@ -784,6 +1215,88 @@ class TrackerMaintainer(threading.Thread):
 
     def close(self) -> None:
         self.publisher.stop()
+
+
+class ProducerTransportError(RuntimeError):
+    """Producer gRPC transport failed; caller must retry the same identity."""
+
+
+class ProducerClient:
+    """Small synchronous client for the shared Frigate producer ingress."""
+
+    def __init__(self, endpoint: str, node_id: str, node_epoch: str | None = None) -> None:
+        self.endpoint = endpoint
+        self.node_id = node_id
+        self.node_epoch = node_epoch or uuid.uuid4().hex
+        self.stream_epoch = uuid.uuid4().hex
+        self.sequence = 0
+        self.channel = grpc.insecure_channel(endpoint)
+        self._publish = self.channel.unary_unary(
+            f"/{SERVICE}/Publish",
+            request_serializer=lambda value: value,
+            response_deserializer=lambda value: value,
+        )
+        self._upload = self.channel.stream_unary(
+            f"/{SERVICE}/UploadMedia",
+            request_serializer=lambda value: value,
+            response_deserializer=lambda value: value,
+        )
+        self._capabilities = self.channel.unary_unary(
+            f"/{SERVICE}/GetCapabilities",
+            request_serializer=lambda value: value,
+            response_deserializer=lambda value: value,
+        )
+
+    def ready(self, timeout: float = 2.0) -> bool:
+        try:
+            value = _decode(self._capabilities(b"{}", timeout=timeout))
+            return bool(value.get("health", {}).get("ready"))
+        except (grpc.RpcError, ValueError, TypeError):
+            return False
+
+    def upload_media(self, manifest: MediaManifest, content: bytes, timeout: float = 10.0) -> None:
+        if len(content) != manifest.byte_size:
+            raise ProducerTransportError("media_size_mismatch")
+        if hashlib.sha256(content).hexdigest() != manifest.sha256:
+            raise ProducerTransportError("media_integrity_mismatch")
+        header = {
+            "media_id": manifest.media_id,
+            "event_id": manifest.event_id,
+            "camera_id": manifest.camera_id,
+            "media_type": manifest.media_type,
+            "codec": manifest.codec,
+            "start_time": manifest.start_time,
+            "end_time": manifest.end_time,
+            "byte_size": manifest.byte_size,
+            "sha256": manifest.sha256,
+        }
+
+        def messages():
+            yield _encode(header)
+            for offset in range(0, len(content), 64 * 1024):
+                yield content[offset : offset + 64 * 1024]
+
+        try:
+            response = _decode(self._upload(messages(), timeout=timeout))
+            if not response.get("ok"):
+                raise ProducerTransportError("media_upload_rejected")
+        except (grpc.RpcError, ValueError, TypeError) as error:
+            raise ProducerTransportError(f"media_upload_failed:{error}") from error
+
+    def publish(self, update: TrackerUpdate, timeout: float = 10.0) -> None:
+        try:
+            response = _decode(
+                self._publish(
+                    _encode({"update": update.to_json()}), timeout=timeout
+                )
+            )
+            if not response.get("ok"):
+                raise ProducerTransportError("producer_update_rejected")
+        except (grpc.RpcError, ValueError, TypeError) as error:
+            raise ProducerTransportError(f"producer_publish_failed:{error}") from error
+
+    def close(self) -> None:
+        self.channel.close()
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,6 +12,7 @@ from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any, cast
 
+from frigate.const import PROCESS_PRIORITY_HIGH
 from frigate.domain.camera import CameraMetrics
 from frigate.infrastructure.comms.inter_process import InterProcessRequestor
 from frigate.infrastructure.comms.recordings_updater import (
@@ -23,7 +24,6 @@ from frigate.infrastructure.config.camera.updater import (
     CameraConfigUpdateEnum,
     CameraConfigUpdateSubscriber,
 )
-from frigate.const import PROCESS_PRIORITY_HIGH
 from frigate.log import LogPipe
 from frigate.util.builtin import EventsPerSecond, get_record_segment_time
 from frigate.util.ffmpeg import start_or_restart_ffmpeg, stop_ffmpeg
@@ -146,7 +146,15 @@ def capture_frames(
                 if process_stdout is None:
                     logger.error(f"{config.name}: ffmpeg stdout is unavailable.")
                     break
-                frame_bytes = cast(bytes, process_stdout.read(frame_size))
+                chunks: list[bytes] = []
+                bytes_read = 0
+                while bytes_read < frame_size:
+                    chunk = cast(bytes, process_stdout.read(frame_size - bytes_read))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    bytes_read += len(chunk)
+                frame_bytes = b"".join(chunks)
                 if len(frame_bytes) != frame_size:
                     frame_manager.close(frame_name)
                     source_eof = preserve_source_order and not stop_event.is_set()
@@ -485,7 +493,7 @@ class CameraWatchdog(threading.Thread):
                 payload_tuple = cast(tuple[str, float | int | None, object], payload)
                 camera, segment_time, _ = payload_tuple
                 segment_time_value = (
-                    float(segment_time) if isinstance(segment_time, (int, float)) else 0.0
+                    float(segment_time) if isinstance(segment_time, int | float) else 0.0
                 )
 
                 if camera != self.config.name:

@@ -5,10 +5,11 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 
@@ -45,6 +46,8 @@ class PlatformTopologyPlan:
     recognition_endpoint: str
     recognition_server_name: str | None
     embedded_cameras: tuple[str, ...]
+    external_cameras: tuple[str, ...]
+    safety_cameras: tuple[str, ...]
     tracker_nodes: Mapping[str, TrackerNodePlan]
     camera_owners: Mapping[str, str]
 
@@ -79,6 +82,8 @@ class PlatformTopologyPlan:
                 "server_name": self.recognition_server_name,
             },
             "embedded_cameras": list(self.embedded_cameras),
+            "external_cameras": list(self.external_cameras),
+            "safety_cameras": list(self.safety_cameras),
             "camera_owners": dict(self.camera_owners),
             "main_config": str(output_dir / "config.main.yml"),
             "nodes": [
@@ -102,7 +107,24 @@ class PlatformTopologyPlan:
 def compile_topology(config: FrigateConfig) -> PlatformTopologyPlan:
     """Resolve all runtime ownership once from validated configuration."""
     owners = config.tracker.camera_owners
-    embedded = tuple(name for name in config.cameras if name not in owners)
+    safety_cameras = {
+        name
+        for name, camera in config.cameras.items()
+        if camera.enabled
+        and camera.media_mode.value == "external"
+        and "smoking" in camera.review.alerts.labels
+    }
+    configured_external = set(owners)
+    configured_external.update(safety_cameras)
+    configured_external.update(
+        name
+        for name, camera in config.cameras.items()
+        if camera.media_mode.value == "external"
+    )
+    external = tuple(name for name in config.cameras if name in configured_external)
+    embedded = tuple(
+        name for name in config.cameras if name not in owners and name not in configured_external
+    )
     nodes: dict[str, TrackerNodePlan] = {}
     for node_id in sorted(config.tracker):
         node = config.tracker[node_id]
@@ -182,6 +204,8 @@ def compile_topology(config: FrigateConfig) -> PlatformTopologyPlan:
         recognition_endpoint=config.recognition.endpoint,
         recognition_server_name=config.recognition.tls.server_name,
         embedded_cameras=embedded,
+        external_cameras=external,
+        safety_cameras=tuple(name for name in config.cameras if name in safety_cameras),
         tracker_nodes=MappingProxyType(nodes),
         camera_owners=MappingProxyType(dict(owners)),
     )

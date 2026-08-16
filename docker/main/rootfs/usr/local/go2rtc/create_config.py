@@ -9,12 +9,12 @@ from typing import Any
 from ruamel.yaml import YAML
 
 sys.path.insert(0, "/opt/frigate")
-from frigate.infrastructure.config.env import substitute_frigate_vars
 from frigate.const import (
     BIRDSEYE_PIPE,
     LIBAVFORMAT_VERSION_MAJOR,
 )
 from frigate.ffmpeg_presets import parse_preset_hardware_acceleration_encode
+from frigate.infrastructure.config.env import substitute_frigate_vars
 from frigate.util.config import find_config_file, resolve_ffmpeg_path
 from frigate.util.services import (
     is_go2rtc_arbitrary_exec_allowed,
@@ -25,12 +25,16 @@ sys.path.remove("/opt/frigate")
 
 yaml = YAML()
 
-FRIGATE_ENV_VARS = {k: v for k, v in os.environ.items() if k.startswith("FRIGATE_")}
+CONFIG_ENV_VARS = {
+    k: v
+    for k, v in os.environ.items()
+    if k.startswith("FRIGATE_")
+}
 # read docker secret files as env vars too
 if os.path.isdir("/run/secrets"):
     for secret_file in os.listdir("/run/secrets"):
         if secret_file.startswith("FRIGATE_"):
-            FRIGATE_ENV_VARS[secret_file] = (
+            CONFIG_ENV_VARS[secret_file] = (
                 Path(os.path.join("/run/secrets", secret_file)).read_text().strip()
             )
 
@@ -113,7 +117,7 @@ for name in list(go2rtc_config.get("streams", {})):
 
     if isinstance(stream, str):
         try:
-            formatted_stream = stream.format(**FRIGATE_ENV_VARS)
+            formatted_stream = stream.format(**CONFIG_ENV_VARS)
             if is_restricted_go2rtc_source(formatted_stream):
                 print(
                     f"[ERROR] Stream '{name}' uses a restricted source (echo/expr/exec) which is disabled by default for security. "
@@ -132,7 +136,7 @@ for name in list(go2rtc_config.get("streams", {})):
         filtered_streams = []
         for i, stream_item in enumerate(stream):
             try:
-                formatted_stream = stream_item.format(**FRIGATE_ENV_VARS)
+                formatted_stream = stream_item.format(**CONFIG_ENV_VARS)
                 if is_restricted_go2rtc_source(formatted_stream):
                     print(
                         f"[ERROR] Stream '{name}' item {i + 1} uses a restricted source (echo/expr/exec) which is disabled by default for security. "

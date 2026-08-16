@@ -57,6 +57,21 @@ class TestNotificationProviders(unittest.TestCase):
         self.assertEqual(result.retry_after, 12)
         self.assertFalse(classify_response(httpx.Response(400)).retryable)
 
+    def test_provider_media_fetch_failures_are_retryable(self):
+        telegram = httpx.Response(
+            400,
+            json={"description": "Bad Request: failed to get HTTP URL content"},
+        )
+        zalo = httpx.Response(
+            200,
+            json={"ok": False, "message": "temporary photo fetch failure"},
+        )
+
+        self.assertTrue(classify_response(telegram).retryable)
+        zalo_result = classify_response(zalo)
+        self.assertTrue(zalo_result.retryable)
+        self.assertEqual(zalo_result.error, "temporary photo fetch failure")
+
     def test_telegram_uses_event_snapshot_url_without_artifact(self):
         requests: list[httpx.Request] = []
 
