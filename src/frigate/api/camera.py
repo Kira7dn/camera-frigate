@@ -169,13 +169,14 @@ async def live_session(request: Request, camera_name: str, stream: str | None = 
         content={
             "camera": camera_name,
             "stream_name": stream_name,
+            "input_mode": frigate_config.runtime.input_mode,
             "status": "online" if producers else "offline",
             "video_source": "frigate-main/go2rtc",
             "inference": {
                 "configured": camera.media_mode.value == "external",
                 "status": "external" if camera.media_mode.value == "external" else "local",
             },
-            "transports": ["webrtc", "mse"] if producers else [],
+            "transports": ["mse"] if producers else [],
             "producer_count": len(producers),
         }
     )

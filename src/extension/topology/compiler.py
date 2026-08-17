@@ -86,7 +86,6 @@ class PlatformTopologyPlan:
             "external_cameras": list(self.external_cameras),
             "safety_cameras": list(self.safety_cameras),
             "camera_owners": dict(self.camera_owners),
-            "main_config": str(output_dir / "config.main.yml"),
             "nodes": [
                 {
                     "id": node.node_id,
@@ -221,20 +220,6 @@ def materialize_topology(
 ) -> dict[str, Any]:
     """Write launcher configs from the same compiled topology used at runtime."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    main = copy.deepcopy(raw_config)
-    main_runtime = main.setdefault("runtime", {})
-    main_runtime.update(
-        {
-            "topology_revision": plan.revision,
-            "topology_role": "main",
-            "topology_node_id": "",
-        }
-    )
-    main_path = output_dir / "config.main.yml"
-    _write_utf8(
-        main_path,
-        yaml.safe_dump(main, sort_keys=False, allow_unicode=True),
-    )
     for node in plan.tracker_nodes.values():
         edge = copy.deepcopy(raw_config)
         edge_runtime = edge.setdefault("runtime", {})

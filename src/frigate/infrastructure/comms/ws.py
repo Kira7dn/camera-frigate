@@ -150,7 +150,7 @@ _WS_GLOBAL_OUTBOUND_TOPICS = frozenset(
 )
 
 # Topics that restricted roles must never receive. Birdseye composites span
-# all cameras, so the existing JSMPEG policy already restricts birdseye access
+# all cameras, so the existing camera policy also restricts birdseye access
 # to unrestricted roles; the layout broadcast follows the same rule.
 _WS_UNRESTRICTED_ONLY_TOPICS = frozenset(
     {

@@ -368,7 +368,6 @@ function UIPlayground() {
                 {birdseyeConfig && (
                   <BirdseyeLivePlayer
                     birdseyeConfig={birdseyeConfig}
-                    liveMode={birdseyeConfig.restream ? "mse" : "jsmpeg"}
                     containerRef={containerRef}
                   />
                 )}

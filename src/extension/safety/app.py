@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import signal
 import threading
 import time
@@ -13,6 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import cv2
+import yaml
 
 from .config import SafetyConfigError, load_config, resolve_stream_url
 from .events import (
@@ -26,6 +28,15 @@ from .inference import OnnxSafetyModel
 
 logger = logging.getLogger(__name__)
 HEALTH_PATH = Path("/tmp/camera-safety-health.json")
+CONFIG_PATH = Path("/config/config.yml")
+
+
+def _runtime_config() -> dict:
+    try:
+        value = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, yaml.YAMLError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass
@@ -64,7 +75,6 @@ class LatestFrameReader:
     def __init__(self, url: str, mock_url: str | None = None) -> None:
         self.url = url
         self.mock_url = mock_url
-        self.state_path = Path("/config/runtime-input.json")
         self._capture: cv2.VideoCapture | None = None
         self._frame: object = None
         self._frame_at = 0.0
@@ -72,6 +82,7 @@ class LatestFrameReader:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._history: list[tuple[float, object]] = []
+        self._last_history_at = 0.0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="safety-reader", daemon=True)
@@ -79,48 +90,44 @@ class LatestFrameReader:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            with self._lock:
-                url = self.url
+            mode = (_runtime_config().get("runtime") or {}).get("input_mode", "rtsp")
+            url = self.mock_url if mode == "mock" else self.url
+            if not url:
+                self._stop.wait(1.0)
+                continue
             capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-            mock_capture = (
-                cv2.VideoCapture(self.mock_url, cv2.CAP_FFMPEG)
-                if self.mock_url
-                else None
-            )
             self._capture = capture
             if not capture.isOpened():
                 capture.release()
-                if mock_capture is not None:
-                    mock_capture.release()
                 self._capture = None
                 self._stop.wait(1.0)
                 continue
+            next_mode_check = 0.0
             try:
                 while not self._stop.is_set():
+                    now = time.monotonic()
+                    if now >= next_mode_check:
+                        current_mode = (
+                            (_runtime_config().get("runtime") or {}).get(
+                                "input_mode", "rtsp"
+                            )
+                        )
+                        if current_mode != mode:
+                            break
+                        next_mode_check = now + 0.25
                     ok, frame = capture.read()
-                    mock_ok, mock_frame = (False, None)
-                    if mock_capture is not None:
-                        mock_ok, mock_frame = mock_capture.read()
-                    try:
-                        mode = json.loads(
-                            self.state_path.read_text(encoding="utf-8")
-                        ).get("mode", "rtsp")
-                    except (FileNotFoundError, json.JSONDecodeError, OSError):
-                        mode = "rtsp"
-                    if mode == "mock" and mock_ok:
-                        frame, ok = mock_frame, True
                     if not ok:
                         break
                     with self._lock:
                         self._frame = frame
                         self._frame_at = time.time()
-                        self._history.append((self._frame_at, frame.copy()))
+                        if self._frame_at - self._last_history_at >= 0.2:
+                            self._history.append((self._frame_at, frame.copy()))
+                            self._last_history_at = self._frame_at
                         if len(self._history) > 120:
                             del self._history[:-120]
             finally:
                 capture.release()
-                if mock_capture is not None:
-                    mock_capture.release()
                 self._capture = None
             self._stop.wait(0.5)
 
@@ -158,23 +165,102 @@ class CameraWorker:
         self.events = events
         self.health = health
         self.stop_event = stop_event
-        mock_url = os.environ.get(f"CAMERA_MOCK_VIDEO_{camera.upper()}")
+        mock_url = (
+            (_runtime_config().get("runtime") or {}).get("mock_sources") or {}
+        ).get(camera)
         self.reader = LatestFrameReader(resolve_stream_url(config, camera), mock_url)
         self.media = SafetyMediaStore()
         self.gate = TemporalGate({camera: config.cameras[camera]})
-        self.pending: dict[tuple[str, str], HazardDecision] = {}
+        self.pending: dict[
+            tuple[str, str],
+            tuple[HazardDecision, object, float, list[tuple[float, object]]],
+        ] = {}
+        self.queued: set[tuple[str, str]] = set()
+        self.publish_queue: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=32)
+        self.publish_stop = threading.Event()
+        self.publish_thread: threading.Thread | None = None
+        self.live_pending: tuple[HazardDecision, tuple[int, int], float] | None = None
+        self.live_queued = False
+
+    def _queue_pending(self) -> None:
+        for key in tuple(self.pending):
+            if key in self.queued:
+                continue
+            try:
+                self.publish_queue.put_nowait(("event", key))
+            except queue.Full:
+                return
+            self.queued.add(key)
+
+    def _queue_live(self) -> None:
+        if self.live_pending is None or self.live_queued:
+            return
+        try:
+            self.publish_queue.put_nowait(("live", None))
+        except queue.Full:
+            return
+        self.live_queued = True
+
+    def _publish_loop(self) -> None:
+        while not self.publish_stop.is_set() or not self.publish_queue.empty():
+            try:
+                kind, value = self.publish_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                if kind == "live":
+                    job = self.live_pending
+                    if job is not None:
+                        decision, frame_shape, frame_at = job
+                        self.events.publish_live(decision, frame_shape, frame_at)
+                        if self.live_pending is job:
+                            self.live_pending = None
+                    continue
+                key = value
+                job = self.pending.get(key)
+                if job is None:
+                    continue
+                decision, frame, frame_at, frames = job
+                if decision.active:
+                    self.health.active_decision_count += 1
+                    self.health.event_create_attempts += 1
+                else:
+                    self.health.clear_decision_count += 1
+                    self.health.event_end_attempts += 1
+                event_id = self.events.publish(
+                    decision, frame, frame_at, self.media, frames
+                )
+                self.health.last_event_id = event_id
+                if decision.active:
+                    self.health.event_create_successes += 1
+                else:
+                    self.health.event_end_successes += 1
+                self.pending.pop(key, None)
+            except SafetyEventError as exc:
+                self.health.event_sync_failures += 1
+                self.health.error = str(exc)
+                logger.warning("Safety Event sync failed: %s", exc)
+            finally:
+                if kind == "live":
+                    self.live_queued = False
+                else:
+                    self.queued.discard(value)
+                self.publish_queue.task_done()
 
     def run(self) -> None:
         self.reader.start()
+        self.publish_thread = threading.Thread(
+            target=self._publish_loop,
+            name=f"safety-publisher-{self.camera}",
+            daemon=True,
+        )
+        self.publish_thread.start()
         interval = 1.0 / self.config.cameras[self.camera].inference_fps
         try:
             while not self.stop_event.is_set():
-                try:
-                    self.health.source_mode = json.loads(
-                        Path("/config/runtime-input.json").read_text(encoding="utf-8")
-                    ).get("mode", "rtsp")
-                except (FileNotFoundError, json.JSONDecodeError, OSError):
-                    self.health.source_mode = "rtsp"
+                self.health.source_mode = (
+                    (_runtime_config().get("runtime") or {}).get("input_mode", "rtsp")
+                )
                 sample = self.reader.latest()
                 if sample is None:
                     self.health.source = False
@@ -194,40 +280,51 @@ class CameraWorker:
                         self.health.last_detection_score = detection.score
                         self.health.last_detection_bbox = detection.bbox
                         self.health.last_detection_at = detection.observed_at
+                    live_detection = max(
+                        (
+                            item
+                            for item in detections
+                            if item.label in self.config.cameras[self.camera].labels
+                            and self.config.cameras[self.camera].labels[item.label].enabled
+                            and item.score
+                            >= self.config.cameras[self.camera].labels[item.label].threshold
+                        ),
+                        key=lambda item: item.score,
+                        default=None,
+                    )
+                    if live_detection is not None:
+                        self.live_pending = (
+                            HazardDecision(
+                                self.camera,
+                                live_detection.label,
+                                True,
+                                live_detection.score,
+                                live_detection.bbox,
+                            ),
+                            tuple(frame.shape[:2]),
+                            frame_at,
+                        )
+                        self._queue_live()
                     decisions = self.gate.observe(self.camera, detections, time.monotonic())
                     for decision in decisions:
-                        self.pending[(decision.camera, decision.label)] = decision
-                    for key, decision in list(self.pending.items()):
-                        try:
-                            if decision.active:
-                                self.health.active_decision_count += 1
-                                self.health.event_create_attempts += 1
-                            else:
-                                self.health.clear_decision_count += 1
-                                self.health.event_end_attempts += 1
-                            event_id = self.events.publish(
-                                decision,
-                                frame,
-                                frame_at,
-                                self.media,
-                                self.reader.history(),
-                            )
-                            self.health.last_event_id = event_id
-                            if decision.active:
-                                self.health.event_create_successes += 1
-                            else:
-                                self.health.event_end_successes += 1
-                            self.pending.pop(key, None)
-                        except SafetyEventError as exc:
-                            self.health.event_sync_failures += 1
-                            self.health.error = str(exc)
-                            logger.warning("Safety Event sync failed: %s", exc)
+                        key = (decision.camera, decision.label)
+                        self.pending[key] = (
+                            decision,
+                            frame.copy(),
+                            frame_at,
+                            self.reader.history(),
+                        )
+                    self._queue_pending()
                 except Exception as exc:  # model/runtime errors are degraded, not negative safety decisions
                     self.health.error = str(exc)
                     logger.exception("Safety inference failed")
+                self._queue_pending()
                 self.stop_event.wait(interval)
         finally:
             self.reader.stop()
+            self.publish_stop.set()
+            if self.publish_thread is not None:
+                self.publish_thread.join(timeout=12)
 
 
 class SafetyApplication:

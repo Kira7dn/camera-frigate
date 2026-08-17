@@ -22,7 +22,6 @@ class CameraMetrics:
     ffmpeg_pid: ValueProxy[int]
     reconnects_last_hour: ValueProxy[int]
     stalls_last_hour: ValueProxy[int]
-    runtime_input: ValueProxy[int]
 
     def __init__(self, manager: SyncManager):
         self.camera_fps = manager.Value("d", 0)
@@ -41,9 +40,6 @@ class CameraMetrics:
         self.ffmpeg_pid = manager.Value("i", 0)
         self.reconnects_last_hour = manager.Value("i", 0)
         self.stalls_last_hour = manager.Value("i", 0)
-        # 0 = configured RTSP input, 1 = in-process mock input.  This value
-        # is deliberately independent from the camera stop event and queue.
-        self.runtime_input = manager.Value("i", 0)
 
 
 class PTZMetrics:

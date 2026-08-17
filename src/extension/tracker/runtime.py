@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -31,6 +32,7 @@ import cv2
 from peewee import SqliteDatabase
 
 from extension.topology.loader import PlatformConfigLoader
+from extension.topology.compiler import compile_topology
 from frigate.domain.camera import CameraMetrics, PTZMetrics
 from frigate.domain.camera.maintainer import CameraMaintainer
 from frigate.domain.camera.runtime import (
@@ -55,6 +57,54 @@ from frigate.util.image import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_tracker_config(path: str | Path, node_id: str) -> FrigateConfig:
+    """Load the canonical source config and isolate this node in memory."""
+    config = PlatformConfigLoader.load_runtime(path, install=True)
+    if config.runtime.topology_role == "tracker":
+        if config.runtime.topology_node_id != node_id:
+            raise ValueError(f"runtime config requires topology_node_id={node_id}")
+        return config
+    if config.runtime.topology_role != "source":
+        raise ValueError("tracker input must be a source or tracker config")
+    source = PlatformConfigLoader.load_source(path)
+    config = source.config
+    plan = compile_topology(config)
+    node = plan.tracker_nodes.get(node_id)
+    if node is None:
+        raise ValueError(f"unknown tracker node: {node_id}")
+
+    raw = copy.deepcopy(source.raw)
+    wanted = set(node.cameras)
+    raw["cameras"] = {
+        name: value for name, value in raw.get("cameras", {}).items() if name in wanted
+    }
+    go2rtc = raw.get("go2rtc")
+    if isinstance(go2rtc, dict):
+        go2rtc["streams"] = {
+            name: value
+            for name, value in go2rtc.get("streams", {}).items()
+            if name in wanted
+        }
+    runtime = raw.setdefault("runtime", {})
+    runtime.update(
+        {
+            "topology_revision": plan.revision,
+            "topology_role": "tracker",
+            "topology_node_id": node_id,
+        }
+    )
+    for source_type in ("replay", "direct"):
+        source_config = runtime.get(source_type)
+        if isinstance(source_config, dict):
+            sources = source_config.get("sources")
+            if isinstance(sources, dict):
+                source_config["sources"] = {
+                    name: value for name, value in sources.items() if name in wanted
+                }
+    raw["tracker"] = {node_id: raw["tracker"][node_id]}
+    return FrigateConfig.model_validate(raw)
 
 
 class TrackerOperation(StrEnum):
@@ -169,7 +219,13 @@ class EdgeMediaStore:
         end_time: float,
     ) -> MediaManifest:
         media_id = uuid.uuid4().hex
-        content = path.read_bytes()
+        stored_path = path.with_name(f"{media_id}{path.suffix}")
+        if stored_path != path:
+            if media_type == "trace":
+                shutil.copyfile(path, stored_path)
+            else:
+                path.replace(stored_path)
+        content = stored_path.read_bytes()
         manifest = MediaManifest(
             media_id=media_id,
             event_id=update.event_id,
@@ -183,7 +239,7 @@ class EdgeMediaStore:
             expiry_unix_ms=int((time.time() + 3600) * 1000),
         )
         with self._lock:
-            self._paths[media_id] = path
+            self._paths[media_id] = stored_path
         return manifest
 
     def _capture_snapshot_from_frame(
@@ -396,15 +452,10 @@ class EdgeMediaStore:
                 completed = None
 
             if completed is None or completed.returncode != 0 or not temporary.is_file():
-                # The tracker image may not expose ffmpeg in PATH. Preserve the
-                # producer-owned media contract by copying the mounted replay
-                # source rather than dropping the clip altogether.
+                # Do not publish the full source as a fake event clip when
+                # clip materialization fails. Evidence must be time-bounded.
                 temporary.unlink(missing_ok=True)
-                try:
-                    shutil.copyfile(source, temporary)
-                except OSError:
-                    temporary.unlink(missing_ok=True)
-                    return None
+                return None
             os.replace(temporary, clip_path)
             return self._register(
                 clip_path,
@@ -445,6 +496,11 @@ class EdgeMediaStore:
             raise ValueError("invalid_media_id")
         with self._lock:
             path = self._paths.get(media_id)
+            if path is None:
+                matches = tuple(self.root.rglob(f"{media_id}.*"))
+                path = next((candidate for candidate in matches if candidate.is_file()), None)
+                if path is not None:
+                    self._paths[media_id] = path
         if path is None:
             raise FileNotFoundError(media_id)
         size = path.stat().st_size
@@ -610,13 +666,23 @@ class TrackerJournal:
 
 
 def tracker_config_fingerprint(config: FrigateConfig, node_id: str) -> str:
-    """Return the compiler-owned revision shared by every runtime view."""
+    """Return a stable topology fingerprint shared by main and tracker."""
     if node_id not in config.tracker:
         raise ValueError(f"unknown tracker node: {node_id}")
-    revision = config.runtime.topology_revision
-    if not revision:
-        raise ValueError("compiled tracker topology revision is required")
-    return revision
+    node_cameras = sorted(config.tracker[node_id].cameras)
+    payload = {
+        "node_id": node_id,
+        "tracker": config.tracker[node_id].model_dump(
+            mode="json", exclude={"tls": {"key"}}
+        ),
+        "cameras": node_cameras,
+        "streams": [
+            name for name in sorted(config.go2rtc.streams) if name in node_cameras
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class _Dispatcher(DispatcherProtocol):
@@ -651,6 +717,7 @@ class CameraTrackAdapter:
         self.motion: list[tuple[int, int, int, int]] = []
         self.regions: list[tuple[int, int, int, int]] = []
         self.event_ids: dict[str, str] = {}
+        self.retired_track_ids: set[str] = set()
         self.state = CameraState(camera, config, self.frame_manager, ptz)
         self.state.on("start", self._start)
         self.state.on("update", self._update)
@@ -666,6 +733,11 @@ class CameraTrackAdapter:
         motion: list[tuple[int, int, int, int]],
         regions: list[tuple[int, int, int, int]],
     ) -> None:
+        objects = {
+            key: obj
+            for key, obj in objects.items()
+            if str(obj.get("id", key)) not in self.retired_track_ids
+        }
         self.frame_seq += 1
         if self.source_epoch is None:
             self.source_epoch = frame_time
@@ -676,6 +748,7 @@ class CameraTrackAdapter:
 
     def _start(self, camera: str, obj: TrackedObject, *_: object) -> None:
         track_id = str(obj.obj_data["id"])
+        self.retired_track_ids.discard(track_id)
         self.event_ids[track_id] = uuid.uuid4().hex[:30]
         self._emit(TrackerOperation.START, obj)
 
@@ -697,6 +770,7 @@ class CameraTrackAdapter:
                 self._current_frame(),
             )
         self.event_ids.pop(str(obj.obj_data["id"]), None)
+        self.retired_track_ids.add(str(obj.obj_data["id"]))
         if not obj.false_positive:
             self.ptz.end_object(camera, obj)
 
@@ -705,7 +779,7 @@ class CameraTrackAdapter:
 
     def _emit(self, operation: TrackerOperation, obj: TrackedObject) -> None:
         update = self._update_value(operation, obj)
-        if self.media is not None and operation is not TrackerOperation.END:
+        if self.media is not None and operation is TrackerOperation.START:
             self.media.remember_snapshot(update, obj, self._current_frame())
         self.publish(update)
 
@@ -769,6 +843,8 @@ class CameraTrackAdapter:
         )
         if self.media is None or not needs_recognition:
             return update
+        if operation is not TrackerOperation.START:
+            return update
         frame = self.frame_manager.get(
             self.frame_name, camera_config.frame_shape_yuv
         )
@@ -782,6 +858,7 @@ class CameraTrackAdapter:
         for track_id, obj in tuple(self.state.tracked_objects.items()):
             if str(track_id) in self.event_ids:
                 self._end(self.camera, obj)
+            self.state.tracked_objects.pop(track_id, None)
 
     def close(self) -> None:
         self.finalize()
@@ -848,8 +925,8 @@ class TrackerRuntime:
         self.source_idle_polls = {camera: 0 for camera in config.cameras}
         self.session_complete_written = False
         self.degraded = False
+        self.lifecycle_lock = threading.RLock()
         self._camera_start_thread: threading.Thread | None = None
-        self._runtime_input_thread: threading.Thread | None = None
         self.consumer = threading.Thread(
             target=self._consume, name="tracker_frames", daemon=True
         )
@@ -895,31 +972,6 @@ class TrackerRuntime:
             self._camera_start_thread.start()
         else:
             self.cameras.start()
-        self._runtime_input_thread = threading.Thread(
-            target=self._watch_runtime_input,
-            name="tracker-runtime-input",
-            daemon=True,
-        )
-        self._runtime_input_thread.start()
-
-    def _watch_runtime_input(self) -> None:
-        """Apply the shared runtime input mode without restarting capture."""
-        state_path = Path("/config/runtime-input.json")
-        last_mode = "rtsp"
-        while not self.stop_event.is_set():
-            mode = "rtsp"
-            try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-                if payload.get("mode") == "mock":
-                    mode = "mock"
-            except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
-                pass
-            if mode != last_mode:
-                self.cameras.set_runtime_input(list(self.config.cameras), mode == "mock")
-                logger.info("Tracker runtime input changed to %s", mode)
-                last_mode = mode
-            self.stop_event.wait(0.25)
-
     def _wait_for_input_start(self, marker: Path) -> None:
         """Release direct camera readers only after the shared E2E barrier."""
         while not self.stop_event.is_set() and not marker.is_file():
@@ -938,9 +990,10 @@ class TrackerRuntime:
                 continue
             self.source_idle_polls[camera] = 0
             try:
-                self.adapters[camera].process(
-                    frame_name, frame_time, objects, motion, regions
-                )
+                with self.lifecycle_lock:
+                    self.adapters[camera].process(
+                        frame_name, frame_time, objects, motion, regions
+                    )
             except (KeyError, RuntimeError, ValueError):
                 logger.exception("Tracker frame processing failed camera=%s", camera)
                 self.degraded = True
@@ -1019,8 +1072,6 @@ class TrackerRuntime:
         timeout = self.node_config.shutdown_drain
         if self._camera_start_thread is not None:
             self._camera_start_thread.join(timeout=timeout)
-        if self._runtime_input_thread is not None:
-            self._runtime_input_thread.join(timeout=timeout)
         self.cameras.join(timeout=timeout)
         self.consumer.join(timeout=timeout)
         self.ptz.join(timeout=timeout)
@@ -1056,13 +1107,7 @@ def _arguments() -> argparse.Namespace:
 async def _run(args: argparse.Namespace) -> None:
     from extension.tracker.transport import TrackerService, start_server
 
-    config = await asyncio.to_thread(
-        PlatformConfigLoader.load_runtime,
-        args.config,
-        expected_role="tracker",
-        expected_node_id=args.node_id,
-        install=True,
-    )
+    config = await asyncio.to_thread(_load_tracker_config, args.config, args.node_id)
     manager = mp.Manager()
     setup_logging(manager)
     stop_event = mp.Event()

@@ -1159,8 +1159,6 @@ def _get_stream_owner_cameras(request: Request, stream_name: str) -> set[str]:
 GO2RTC_STREAM_PROXY_PATHS = frozenset(
     {
         "/live/mse/api/ws",
-        "/live/webrtc/api/ws",
-        "/api/go2rtc/webrtc",
     }
 )
 

@@ -68,13 +68,6 @@ class BirdseyeConfig(FrigateBaseModel):
         title="Height",
         description="Output height (pixels) of the composed Birdseye frame.",
     )
-    quality: int = Field(
-        default=8,
-        title="Encoding quality",
-        description="Encoding quality for the Birdseye mpeg1 feed (1 highest quality, 31 lowest).",
-        ge=1,
-        le=31,
-    )
     inactivity_threshold: int = Field(
         default=30,
         title="Inactivity threshold",

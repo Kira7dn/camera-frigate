@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -161,7 +162,10 @@ class SafetyProducer:
         self.active: dict[tuple[str, str], str] = {}
         self.last_bbox: dict[tuple[str, str], tuple[float, float, float, float]] = {}
         self.last_score: dict[tuple[str, str], float] = {}
+        self.pending_event_ids: dict[tuple[str, str], str] = {}
         self.sequence = 0
+        self.live_sequence = 0
+        self._lock = threading.Lock()
 
     def ready(self) -> bool:
         return self.client.ready()
@@ -189,87 +193,154 @@ class SafetyProducer:
         media: SafetyMediaStore,
         frames: list[tuple[float, np.ndarray]],
     ) -> str:
-        key = (decision.camera, decision.label)
-        if decision.active:
-            if decision.bbox is None:
-                raise SafetyEventError("safety_event_requires_bbox")
-            existing_event_id = self.active.get(key)
-            event_id = existing_event_id or "safety" + uuid.uuid4().hex[:24]
-            operation = (
-                TrackerOperation.START
-                if existing_event_id is None
-                else TrackerOperation.UPDATE
-            )
-            self.active[key] = event_id
-            self.last_bbox[key] = decision.bbox
-            self.last_score[key] = decision.score
-        else:
-            event_id = self.active.get(key)
-            if event_id is None:
-                raise SafetyEventError("safety_clear_without_active_event")
-            operation = TrackerOperation.END
+        with self._lock:
+            key = (decision.camera, decision.label)
+            if decision.active:
+                if decision.bbox is None:
+                    raise SafetyEventError("safety_event_requires_bbox")
+                existing_event_id = self.active.get(key)
+                event_id = (
+                    existing_event_id
+                    or self.pending_event_ids.get(key)
+                    or "safety" + uuid.uuid4().hex[:24]
+                )
+                operation = (
+                    TrackerOperation.START
+                    if existing_event_id is None
+                    else TrackerOperation.UPDATE
+                )
+            else:
+                event_id = self.active.get(key)
+                if event_id is None:
+                    raise SafetyEventError("safety_clear_without_active_event")
+                operation = TrackerOperation.END
 
-        evidence_bbox = decision.bbox or self.last_bbox.get(key)
-        if evidence_bbox is None:
-            raise SafetyEventError("safety_event_requires_bbox")
-        evidence_score = decision.score
-        if not decision.active:
-            evidence_score = self.last_score.get(key, evidence_score)
-        evidence_decision = HazardDecision(
-            camera=decision.camera,
-            label=decision.label,
-            active=decision.active,
-            score=evidence_score,
-            bbox=evidence_bbox,
-        )
-        height, width = frame.shape[:2]
-        bbox = BoundingBox(
-            round(evidence_bbox[0] * width),
-            round(evidence_bbox[1] * height),
-            round(evidence_bbox[2] * width),
-            round(evidence_bbox[3] * height),
-        )
-        snapshot = media.snapshot(frame, evidence_decision)
-        manifests = [self._manifest(event_id, decision.camera, "snapshot_jpg", "jpeg", snapshot, frame_time)]
-        content_by_id = {manifests[0].media_id: snapshot}
-        if operation is TrackerOperation.END:
-            clip = media.clip(event_id, frames)
-            clip_manifest = self._manifest(event_id, decision.camera, "clip", "mp4", clip, frame_time)
-            manifests.append(clip_manifest)
-            content_by_id[clip_manifest.media_id] = clip
-        next_sequence = self.sequence + 1
-        update = TrackerUpdate(
-            node_id=self.node_id,
-            node_epoch=self.client.node_epoch,
-            camera_id=decision.camera,
-            stream_epoch=self.client.stream_epoch,
-            journal_sequence=next_sequence,
-            frame_seq=next_sequence,
-            source_pts=round(frame_time * 1_000_000),
-            frame_time=frame_time,
-            event_id=event_id,
-            track_id=f"{decision.camera}:{decision.label}",
-            operation=operation,
-            label=decision.label,
-            score_history=(evidence_score,),
-            score=evidence_score,
-            bbox=bbox,
-            state={"source": "safety"},
-            media=tuple(manifests),
-            source_type="safety",
-        )
-        try:
-            for manifest in manifests:
-                self.client.upload_media(manifest, content_by_id[manifest.media_id])
-            self.client.publish(update)
-        except ProducerTransportError as error:
-            raise SafetyEventError(str(error)) from error
-        self.sequence = next_sequence
-        if operation is TrackerOperation.END:
-            self.active.pop(key, None)
-            self.last_bbox.pop(key, None)
-            self.last_score.pop(key, None)
-        return event_id
+            evidence_bbox = decision.bbox or self.last_bbox.get(key)
+            if evidence_bbox is None:
+                raise SafetyEventError("safety_event_requires_bbox")
+            evidence_score = decision.score
+            if not decision.active:
+                evidence_score = self.last_score.get(key, evidence_score)
+            evidence_decision = HazardDecision(
+                camera=decision.camera,
+                label=decision.label,
+                active=decision.active,
+                score=evidence_score,
+                bbox=evidence_bbox,
+            )
+            height, width = frame.shape[:2]
+            bbox = BoundingBox(
+                round(evidence_bbox[0] * width),
+                round(evidence_bbox[1] * height),
+                round(evidence_bbox[2] * width),
+                round(evidence_bbox[3] * height),
+            )
+            snapshot = media.snapshot(frame, evidence_decision)
+            manifests = [
+                self._manifest(
+                    event_id,
+                    decision.camera,
+                    "snapshot_jpg",
+                    "jpeg",
+                    snapshot,
+                    frame_time,
+                )
+            ]
+            content_by_id = {manifests[0].media_id: snapshot}
+            if operation is TrackerOperation.END:
+                clip = media.clip(event_id, frames)
+                clip_manifest = self._manifest(
+                    event_id, decision.camera, "clip", "mp4", clip, frame_time
+                )
+                manifests.append(clip_manifest)
+                content_by_id[clip_manifest.media_id] = clip
+            next_sequence = self.sequence + 1
+            update = TrackerUpdate(
+                node_id=self.node_id,
+                node_epoch=self.client.node_epoch,
+                camera_id=decision.camera,
+                stream_epoch=self.client.stream_epoch,
+                journal_sequence=next_sequence,
+                frame_seq=next_sequence,
+                source_pts=round(frame_time * 1_000_000),
+                frame_time=frame_time,
+                event_id=event_id,
+                track_id=f"{decision.camera}:{decision.label}",
+                operation=operation,
+                label=decision.label,
+                score_history=(evidence_score,),
+                score=evidence_score,
+                bbox=bbox,
+                state={"source": "safety"},
+                media=tuple(manifests),
+                source_type="safety",
+            )
+            if decision.active:
+                self.pending_event_ids[key] = event_id
+            try:
+                for manifest in manifests:
+                    self.client.upload_media(manifest, content_by_id[manifest.media_id])
+                self.client.publish(update)
+            except ProducerTransportError as error:
+                raise SafetyEventError(str(error)) from error
+            self.sequence = next_sequence
+            if operation is TrackerOperation.END:
+                self.active.pop(key, None)
+                self.pending_event_ids.pop(key, None)
+                self.last_bbox.pop(key, None)
+                self.last_score.pop(key, None)
+            else:
+                self.active[key] = event_id
+                self.pending_event_ids.pop(key, None)
+                self.last_bbox[key] = decision.bbox
+                self.last_score[key] = decision.score
+            return event_id
+
+    def publish_live(
+        self,
+        decision: HazardDecision,
+        frame_shape: tuple[int, int],
+        frame_time: float,
+    ) -> None:
+        if decision.bbox is None:
+            return
+        with self._lock:
+            self.live_sequence += 1
+            key = (decision.camera, decision.label)
+            event_id = self.active.get(
+                key, f"live-{decision.camera}-{decision.label}"
+            )
+            height, width = frame_shape
+            bbox = BoundingBox(
+                round(decision.bbox[0] * width),
+                round(decision.bbox[1] * height),
+                round(decision.bbox[2] * width),
+                round(decision.bbox[3] * height),
+            )
+            update = TrackerUpdate(
+                node_id=self.node_id,
+                node_epoch=self.client.node_epoch,
+                camera_id=decision.camera,
+                stream_epoch=self.client.stream_epoch,
+                journal_sequence=0,
+                frame_seq=self.live_sequence,
+                source_pts=round(frame_time * 1_000_000),
+                frame_time=frame_time,
+                event_id=event_id,
+                track_id=f"{decision.camera}:{decision.label}:live",
+                operation=TrackerOperation.UPDATE,
+                label=decision.label,
+                score_history=(decision.score,),
+                score=decision.score,
+                bbox=bbox,
+                state={"source": "safety", "live": True},
+                media=(),
+                source_type="safety",
+            )
+            try:
+                self.client.publish_live(update)
+            except ProducerTransportError as error:
+                raise SafetyEventError(str(error)) from error
 
     def close(self) -> None:
         self.client.close()

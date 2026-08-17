@@ -46,7 +46,7 @@ from frigate.util.image import SharedMemoryFrameManager
 
 WORKSPACE = Path(__file__).resolve().parents[2]
 FACE_VIDEO = WORKSPACE / "assets/fixtures/mock_videos/face-recognition/segments/01_P1E_S1_C1_5s-20s.mp4"
-LPR_VIDEO = WORKSPACE / "assets/fixtures/mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483 (1024p).mp4"
+LPR_VIDEO = WORKSPACE / "assets/fixtures/mock_videos/car-number-plate-video/cam-in/pexels-casey-whalen-6571483-1024p.mp4"
 MODEL = WORKSPACE / "assets/models/yolov9-t-320.onnx"
 LABELMAP = Path(__file__).resolve().parents[1] / "docker/main/rootfs/labelmap/coco-80.txt"
 

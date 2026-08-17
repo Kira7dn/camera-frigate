@@ -13,7 +13,6 @@ import {
   isFirefox,
   isIOS,
   isMobile,
-  isSafari,
   useMobileOrientation,
 } from "react-device-detect";
 import { useTranslation } from "react-i18next";
@@ -110,21 +109,6 @@ export default function LiveBirdseyeView({
       return "absolute top-0 bottom-0 left-[50%] -translate-x-[50%]";
     }
   }, [cameraAspectRatio, containerAspectRatio, fullscreen, isPortrait]);
-
-  const preferredLiveMode = useMemo(() => {
-    if (!config || !config.birdseye.restream) {
-      return "jsmpeg";
-    }
-
-    if (
-      isSafari ||
-      !("MediaSource" in window || "ManagedMediaSource" in window)
-    ) {
-      return "webrtc";
-    }
-
-    return "mse";
-  }, [config]);
 
   const birdseyeLayout = useBirdseyeLayout();
 
@@ -297,7 +281,6 @@ export default function LiveBirdseyeView({
               <BirdseyeLivePlayer
                 className={`${fullscreen ? "*:rounded-none" : ""}`}
                 birdseyeConfig={config.birdseye}
-                liveMode={preferredLiveMode}
                 containerRef={containerRef}
                 playerRef={playerRef}
                 pip={pip}

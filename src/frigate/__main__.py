@@ -10,6 +10,7 @@ import ruamel.yaml.comments
 from pydantic import ValidationError
 
 from frigate.app import FrigateApp
+from frigate.api.runtime_input import recover_stale_runtime_input
 from frigate.infrastructure.config import FrigateConfig
 from frigate.log import setup_logging
 from frigate.util.config import find_config_file
@@ -114,7 +115,7 @@ def main() -> None:
         sys.exit(0)
 
     # Run the main application.
-    FrigateApp(config, manager, stop_event).start()
+    FrigateApp(recover_stale_runtime_input(config), manager, stop_event).start()
 
 
 if __name__ == "__main__":

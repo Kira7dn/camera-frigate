@@ -4,20 +4,10 @@ import datetime
 import logging
 import os
 import shutil
-import threading
 from multiprocessing.synchronize import Event as MpEvent
-from wsgiref.simple_server import make_server
-
-from ws4py.server.wsgirefserver import (
-    WebSocketWSGIHandler,
-    WebSocketWSGIRequestHandler,
-    WSGIServer,
-)
-from ws4py.server.wsgiutils import WebSocketWSGIApplication
 
 from frigate.infrastructure.comms.config_updater import ConfigSubscriber
 from frigate.infrastructure.comms.detections_updater import DetectionSubscriber, DetectionTypeEnum
-from frigate.infrastructure.comms.ws import WebSocket
 from frigate.infrastructure.config import FrigateConfig
 from frigate.infrastructure.config.camera.updater import (
     CameraConfigUpdateEnum,
@@ -30,9 +20,7 @@ from frigate.const import (
     REPLAY_CAMERA_PREFIX,
 )
 from frigate.infrastructure.output.birdseye import Birdseye
-from frigate.infrastructure.output.camera import JsmpegCamera
 from frigate.infrastructure.output.preview import PreviewRecorder
-from frigate.infrastructure.output.ws_auth import ws_has_camera_access
 from frigate.util.image import SharedMemoryFrameManager, get_blank_yuv_frame
 from frigate.util.process import FrigateProcess
 
@@ -95,16 +83,11 @@ class OutputProcess(FrigateProcess):
     def add_camera(
         self,
         camera: str,
-        websocket_server: WSGIServer,
-        jsmpeg_cameras: dict[str, JsmpegCamera],
         preview_recorders: dict[str, PreviewRecorder],
         preview_write_times: dict[str, float],
         birdseye: Birdseye | None,
     ) -> None:
         camera_config = self.config.cameras[camera]
-        jsmpeg_cameras[camera] = JsmpegCamera(
-            camera_config, self.config, self.stop_event, websocket_server
-        )
         preview_recorders[camera] = PreviewRecorder(camera_config)
         preview_write_times[camera] = 0
 
@@ -120,18 +103,6 @@ class OutputProcess(FrigateProcess):
 
         frame_manager = SharedMemoryFrameManager()
 
-        # start a websocket server on 8082
-        WebSocketWSGIHandler.http_version = "1.1"
-        websocket_server = make_server(
-            "127.0.0.1",
-            8082,
-            server_class=WSGIServer,
-            handler_class=WebSocketWSGIRequestHandler,
-            app=WebSocketWSGIApplication(handler_cls=WebSocket),
-        )
-        websocket_server.initialize_websockets_manager()
-        websocket_thread = threading.Thread(target=websocket_server.serve_forever)
-
         detection_subscriber = DetectionSubscriber(DetectionTypeEnum.video.value)
         config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
@@ -145,7 +116,6 @@ class OutputProcess(FrigateProcess):
         )
         birdseye_config_subscriber = ConfigSubscriber("config/birdseye", exact=True)
 
-        jsmpeg_cameras: dict[str, JsmpegCamera] = {}
         birdseye: Birdseye | None = None
         preview_recorders: dict[str, PreviewRecorder] = {}
         preview_write_times: dict[str, float] = {}
@@ -160,17 +130,13 @@ class OutputProcess(FrigateProcess):
 
             self.add_camera(
                 camera,
-                websocket_server,
-                jsmpeg_cameras,
                 preview_recorders,
                 preview_write_times,
                 birdseye,
             )
 
         if self.config.birdseye.enabled:
-            birdseye = Birdseye(self.config, self.stop_event, websocket_server)
-
-        websocket_thread.start()
+            birdseye = Birdseye(self.config, self.stop_event)
 
         while not self.stop_event.is_set():
             update_topic, birdseye_config = (
@@ -192,8 +158,6 @@ class OutputProcess(FrigateProcess):
                     if not self.is_debug_replay_camera(camera):
                         self.add_camera(
                             camera,
-                            websocket_server,
-                            jsmpeg_cameras,
                             preview_recorders,
                             preview_write_times,
                             birdseye,
@@ -257,27 +221,11 @@ class OutputProcess(FrigateProcess):
             )
             preview_write_times[camera] = frame_time
 
-            # send camera frame to ffmpeg process if websockets are connected
-            if any(
-                ws.environ["PATH_INFO"].endswith(camera)
-                and ws_has_camera_access(ws, camera, self.config)
-                for ws in websocket_server.manager
-            ):
-                # write to the converter for the camera if clients are listening to the specific camera
-                jsmpeg_cameras[camera].write_frame(frame.tobytes())
-
-            # send output data to birdseye if websocket is connected or restreaming
+            # send output data to the go2rtc Birdseye restream
             if (
                 self.config.birdseye.enabled
                 and birdseye is not None
-                and (
-                    self.config.birdseye.restream
-                    or any(
-                        ws.environ["PATH_INFO"].endswith("birdseye")
-                        and ws_has_camera_access(ws, "birdseye", self.config)
-                        for ws in websocket_server.manager
-                    )
-                )
+                and self.config.birdseye.restream
             ):
                 birdseye.write_data(
                     camera,
@@ -316,9 +264,6 @@ class OutputProcess(FrigateProcess):
 
         detection_subscriber.stop()
 
-        for jsmpeg in jsmpeg_cameras.values():
-            jsmpeg.stop()
-
         for preview in preview_recorders.values():
             preview.stop()
 
@@ -327,11 +272,6 @@ class OutputProcess(FrigateProcess):
 
         config_subscriber.stop()
         birdseye_config_subscriber.stop()
-        websocket_server.manager.close_all()
-        websocket_server.manager.stop()
-        websocket_server.manager.join()
-        websocket_server.shutdown()
-        websocket_thread.join()
         logger.info("exiting output process...")
 
 

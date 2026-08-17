@@ -40,7 +40,9 @@ from frigate.application.events.canonical import (
     normalized_xyxy,
 )
 from frigate.application.events.types import EventStateEnum, EventTypeEnum
+from frigate.const import UPDATE_CAMERA_ACTIVITY
 from frigate.infrastructure.comms.events_updater import EventUpdatePublisher
+from frigate.infrastructure.comms.inter_process import InterProcessRequestor
 from frigate.infrastructure.config import FrigateConfig
 from frigate.models import (
     EdgeMediaManifest,
@@ -91,10 +93,23 @@ class TrackerService:
         self.media_reader = media_reader
         self.active_lifecycles = active_lifecycles
         self.degraded = False
+        self._live_lock = threading.Lock()
+        self._live_updates: dict[tuple[str, str], TrackerUpdate] = {}
 
     def publish(self, update: TrackerUpdate) -> TrackerUpdate:
-        """Persist an update; the connection sender drains the outbox."""
+        """Persist lifecycle edges; keep bbox updates latest-only in memory."""
+        if update.operation is TrackerOperation.UPDATE:
+            with self._live_lock:
+                self._live_updates[(update.camera_id, update.track_id)] = update
+            return update
         return self.journal.append(update)
+
+    def _next_live_update(self) -> TrackerUpdate | None:
+        with self._live_lock:
+            if not self._live_updates:
+                return None
+            key = next(iter(self._live_updates))
+            return self._live_updates.pop(key)
 
     async def _authorize(self, context: aio.ServicerContext) -> None:
         if not self.allowed_clients:
@@ -180,6 +195,12 @@ class TrackerService:
                             acknowledged = ack_sequence
                         elif request.get("type") != "health":
                             raise TrackerIngestError("tracker_ack_without_update")
+                    continue
+                live_update = self._next_live_update()
+                if live_update is not None:
+                    yield _encode(
+                        {"type": "live", "update": live_update.to_json()}
+                    )
                     continue
                 done, _ = await asyncio.wait(
                     (request_task,), timeout=0.1, return_when=asyncio.FIRST_COMPLETED
@@ -275,7 +296,7 @@ class TrackerHostIngest:
     def __init__(
         self,
         camera_owners: Mapping[str, str],
-        commit: Callable[[TrackerUpdate], None],
+        commit: Callable[..., None],
     ) -> None:
         self.camera_owners = dict(camera_owners)
         self.commit = commit
@@ -330,6 +351,20 @@ class TrackerHostIngest:
             update.journal_sequence
         )
         self.accepted[accepted_key] = update.event_id
+
+    def accept_live(self, update: TrackerUpdate) -> None:
+        if self.camera_owners.get(update.camera_id) != update.node_id:
+            raise TrackerIngestError("camera_owner_mismatch")
+        track_key = (
+            update.node_id,
+            update.camera_id,
+            update.stream_epoch,
+            update.track_id,
+        )
+        active_event = self.active.get(track_key)
+        if active_event is not None and active_event != update.event_id:
+            raise TrackerIngestError("live_update_without_active_start")
+        self.commit(update, False)
 
 
 class ProducerIngressService:
@@ -450,6 +485,21 @@ class ProducerIngressService:
             await context.abort(grpc.StatusCode.INTERNAL, str(error))
         return _encode({"ok": True, "event_id": update.event_id, "sequence": update.journal_sequence})
 
+    async def live(self, request: bytes, context: aio.ServicerContext) -> bytes:
+        try:
+            update = TrackerUpdate.from_json(_decode(request)["update"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"invalid_live_update:{error}")
+        if update.source_type != "safety" or update.operation is not TrackerOperation.UPDATE:
+            await context.abort(grpc.StatusCode.PERMISSION_DENIED, "invalid_live_source")
+        try:
+            await asyncio.to_thread(self.ingest.accept_live, update)
+        except TrackerIngestError as error:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(error))
+        except (OSError, RuntimeError, ValueError) as error:
+            await context.abort(grpc.StatusCode.INTERNAL, str(error))
+        return _encode({"ok": True, "event_id": update.event_id})
+
     def handler(self) -> grpc.GenericRpcHandler:
         return grpc.method_handlers_generic_handler(
             SERVICE,
@@ -466,6 +516,11 @@ class ProducerIngressService:
                 ),
                 "Publish": grpc.unary_unary_rpc_method_handler(
                     self.publish,
+                    request_deserializer=lambda value: value,
+                    response_serializer=lambda value: value,
+                ),
+                "Live": grpc.unary_unary_rpc_method_handler(
+                    self.live,
                     request_deserializer=lambda value: value,
                     response_serializer=lambda value: value,
                 ),
@@ -629,6 +684,10 @@ class TrackerMaintainer(threading.Thread):
             "PRODUCER_GRPC_BIND", "0.0.0.0:50052"
         )
         self.producer_event_aggregator = EventAggregator()
+        self.live_activity: dict[str, dict[str, dict[str, Any]]] = {}
+        self.live_activity_lock = threading.RLock()
+        self.live_activity_send_lock = threading.Lock()
+        self.live_activity_requestor = InterProcessRequestor()
 
     @staticmethod
     def _event_state(update: TrackerUpdate) -> EventStateEnum:
@@ -696,7 +755,7 @@ class TrackerMaintainer(threading.Thread):
             f"{update.event_id}"
         )
 
-    def _commit(self, update: TrackerUpdate) -> None:
+    def _commit(self, update: TrackerUpdate, durable: bool = True) -> None:
         node = self.config.tracker[update.node_id]
         receipt = uuid.uuid4().hex
         frame_name = self._unavailable_frame_name(update)
@@ -767,7 +826,48 @@ class TrackerMaintainer(threading.Thread):
                 # event. Windows removes named shared memory when its last handle
                 # closes, while POSIX keeps it until unlink.
                 self.frame_manager.close(frame_name)
-        self.store.accept(update)
+        if durable:
+            self.store.accept(update)
+        self._publish_live_activity(update)
+
+    def _publish_live_activity(self, update: TrackerUpdate) -> None:
+        """Publish the single live bbox state consumed by the dashboard."""
+        with self.live_activity_lock:
+            camera_objects = self.live_activity.setdefault(update.camera_id, {})
+            if update.operation is TrackerOperation.END:
+                camera_objects.pop(update.event_id, None)
+            else:
+                left, top, right, bottom = (
+                    update.bbox.left,
+                    update.bbox.top,
+                    update.bbox.right,
+                    update.bbox.bottom,
+                )
+                sub_label = update.state.get("sub_label")
+                if isinstance(sub_label, (list, tuple)):
+                    sub_label = sub_label[0] if sub_label else None
+                camera_objects[update.event_id] = {
+                    "id": update.event_id,
+                    "label": update.label,
+                    "stationary": bool(update.state.get("stationary", False)),
+                    "area": max(0, (right - left) * (bottom - top)),
+                    "ratio": (right - left) / max(1, bottom - top),
+                    "score": update.score,
+                    "box": [left, top, right, bottom],
+                    "sub_label": sub_label,
+                    "current_zones": list(update.current_zones),
+                }
+            snapshot = {
+                camera: {
+                    "motion": bool(objects),
+                    "objects": list(objects.values()),
+                }
+                for camera, objects in self.live_activity.items()
+            }
+        with self.live_activity_send_lock:
+            self.live_activity_requestor.send_data(
+                UPDATE_CAMERA_ACTIVITY, snapshot
+            )
 
     def _producer_media_path(self, media_id: str) -> Path | None:
         service = self.producer_service
@@ -800,13 +900,30 @@ class TrackerMaintainer(threading.Thread):
             ),
         )
 
-    def _commit_producer(self, update: TrackerUpdate) -> None:
+    def _commit_producer(self, update: TrackerUpdate, durable: bool = True) -> None:
         """Commit Safety evidence synchronously using the canonical Frigate owner."""
         if update.source_type != "safety":
             raise TrackerIngestError("producer_source_mismatch")
         camera_config = self.config.cameras.get(update.camera_id)
         if camera_config is None or camera_config.media_mode.value != "external":
             raise TrackerIngestError("producer_camera_not_external")
+
+        if not durable:
+            existing = Event.get_or_none(Event.id == update.event_id)
+            if existing is None:
+                return
+            width = int(camera_config.detect.width or 0)
+            height = int(camera_config.detect.height or 0)
+            if width <= 0 or height <= 0:
+                return
+            bbox = normalized_xyxy(
+                (update.bbox.left, update.bbox.top, update.bbox.right, update.bbox.bottom),
+                width,
+                height,
+            )
+            Event.update(box=bbox, region=bbox).where(Event.id == update.event_id).execute()
+            self._publish_live_activity(update)
+            return
 
         snapshot_manifest = next(
             (item for item in update.media if item.media_type == "snapshot_jpg"), None
@@ -994,6 +1111,7 @@ class TrackerMaintainer(threading.Thread):
                         },
                     },
                 ).on_conflict_ignore().execute()
+        self._publish_live_activity(update)
 
     async def _run_node(self, node_id: str) -> None:
         node = self.config.tracker[node_id]
@@ -1013,6 +1131,12 @@ class TrackerMaintainer(threading.Thread):
                     response_deserializer=lambda value: value,
                 )
                 call = connect()
+                write_lock = asyncio.Lock()
+
+                async def write_message(payload: Mapping[str, Any]) -> None:
+                    async with write_lock:
+                        await call.write(_encode(payload))
+
                 hello = _decode(await asyncio.wait_for(call.read(), node.deadline))
                 if (
                     hello.get("type") != "hello"
@@ -1028,15 +1152,13 @@ class TrackerMaintainer(threading.Thread):
                 durable_sequence = self.store.last_sequence(node_id, node_epoch)
                 ingest.start_epoch(node_id, node_epoch, durable_sequence)
                 ingest.active = self.store.active_lifecycles(node_id, node_epoch)
-                await call.write(
-                    _encode(
-                        {
-                            "type": "session_start",
-                            "protocol_version": PROTOCOL_VERSION,
-                            "node_epoch": node_epoch,
-                            "ack_sequence": durable_sequence,
-                        }
-                    )
+                await write_message(
+                    {
+                        "type": "session_start",
+                        "protocol_version": PROTOCOL_VERSION,
+                        "node_epoch": node_epoch,
+                        "ack_sequence": durable_sequence,
+                    }
                 )
                 session_started = True
                 connect_failure_logged = False
@@ -1045,7 +1167,7 @@ class TrackerMaintainer(threading.Thread):
                 async def send_heartbeat() -> None:
                     while True:
                         await asyncio.sleep(1)
-                        await call.write(_encode({"type": "health"}))
+                        await write_message({"type": "health"})
 
                 heartbeat = asyncio.create_task(send_heartbeat())
                 while True:
@@ -1053,17 +1175,19 @@ class TrackerMaintainer(threading.Thread):
                     if raw is aio.EOF:
                         break
                     message = _decode(raw)
+                    if message.get("type") == "live":
+                        update = TrackerUpdate.from_json(str(message["update"]))
+                        await asyncio.to_thread(ingest.accept_live, update)
+                        continue
                     if message.get("type") != "update":
                         continue
                     update = TrackerUpdate.from_json(str(message["update"]))
                     await asyncio.to_thread(ingest.accept, update)
-                    await call.write(
-                        _encode(
-                            {
-                                "type": "ack",
-                                "ack_sequence": update.journal_sequence,
-                            }
-                        )
+                    await write_message(
+                        {
+                            "type": "ack",
+                            "ack_sequence": update.journal_sequence,
+                        }
                     )
             except (grpc.RpcError, OSError, RuntimeError, ValueError) as error:
                 if not self.stop_event.is_set() and not self.shutdown.is_set():
@@ -1169,6 +1293,7 @@ class TrackerMaintainer(threading.Thread):
         return await asyncio.wrap_future(future)
 
     def close(self) -> None:
+        self.live_activity_requestor.stop()
         self.publisher.stop()
 
 
@@ -1188,6 +1313,11 @@ class ProducerClient:
         self.channel = grpc.insecure_channel(endpoint)
         self._publish = self.channel.unary_unary(
             f"/{SERVICE}/Publish",
+            request_serializer=lambda value: value,
+            response_deserializer=lambda value: value,
+        )
+        self._live = self.channel.unary_unary(
+            f"/{SERVICE}/Live",
             request_serializer=lambda value: value,
             response_deserializer=lambda value: value,
         )
@@ -1249,6 +1379,16 @@ class ProducerClient:
                 raise ProducerTransportError("producer_update_rejected")
         except (grpc.RpcError, ValueError, TypeError) as error:
             raise ProducerTransportError(f"producer_publish_failed:{error}") from error
+
+    def publish_live(self, update: TrackerUpdate, timeout: float = 2.0) -> None:
+        try:
+            response = _decode(
+                self._live(_encode({"update": update.to_json()}), timeout=timeout)
+            )
+            if not response.get("ok"):
+                raise ProducerTransportError("producer_live_rejected")
+        except (grpc.RpcError, ValueError, TypeError) as error:
+            raise ProducerTransportError(f"producer_live_failed:{error}") from error
 
     def close(self) -> None:
         self.channel.close()

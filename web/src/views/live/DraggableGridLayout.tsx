@@ -22,9 +22,7 @@ import "react-grid-layout/css/styles.css";
 import "react-resizable/css/styles.css";
 import {
   AudioState,
-  LivePlayerMode,
   LiveStreamMetadata,
-  StatsState,
   VolumeState,
 } from "@/types/live";
 import { ASPECT_VERTICAL_LAYOUT, ASPECT_WIDE_LAYOUT } from "@/types/record";
@@ -64,11 +62,6 @@ type DraggableGridLayoutProps = {
   setIsEditMode: React.Dispatch<React.SetStateAction<boolean>>;
   fullscreen: boolean;
   toggleFullscreen: () => void;
-  preferredLiveModes: { [key: string]: LivePlayerMode };
-  setPreferredLiveModes: React.Dispatch<
-    React.SetStateAction<{ [key: string]: LivePlayerMode }>
-  >;
-  resetPreferredLiveMode: (cameraName: string) => void;
   isRestreamedStates: { [key: string]: boolean };
   supportsAudioOutputStates: {
     [key: string]: { supportsAudio: boolean; cameraName: string };
@@ -88,9 +81,6 @@ export default function DraggableGridLayout({
   setIsEditMode,
   fullscreen,
   toggleFullscreen,
-  preferredLiveModes,
-  setPreferredLiveModes,
-  resetPreferredLiveMode,
   isRestreamedStates,
   supportsAudioOutputStates,
   streamMetadata,
@@ -403,25 +393,10 @@ export default function DraggableGridLayout({
     placeholder.h = layoutItem.h;
   };
 
-  // audio and stats states
+  // audio states
 
   const [audioStates, setAudioStates] = useState<AudioState>({});
   const [volumeStates, setVolumeStates] = useState<VolumeState>({});
-  const [statsStates, setStatsStates] = useState<StatsState>(() => {
-    const initialStates: StatsState = {};
-    cameras.forEach((camera) => {
-      initialStates[camera.name] = false;
-    });
-    return initialStates;
-  });
-
-  const toggleStats = (cameraName: string): void => {
-    setStatsStates((prev) => ({
-      ...prev,
-      [cameraName]: !prev[cameraName],
-    }));
-  };
-
   useEffect(() => {
     if (!allGroupsStreamingSettings) {
       return;
@@ -571,7 +546,6 @@ export default function DraggableGridLayout({
                     "outline outline-2 outline-muted-foreground hover:cursor-grab hover:outline-4 active:cursor-grabbing",
                 )}
                 birdseyeConfig={birdseyeConfig}
-                liveMode={birdseyeConfig.restream ? "mse" : "jsmpeg"}
                 onClick={() => onSelectCamera("birdseye")}
               >
                 {isEditMode && showCircles && <CornerCircles />}
@@ -610,9 +584,6 @@ export default function DraggableGridLayout({
               const showStillWithoutActivity =
                 currentGroupStreamingSettings?.[camera.name]?.streamType !==
                 "continuous";
-              const useWebGL =
-                currentGroupStreamingSettings?.[camera.name]
-                  ?.compatibilityMode || false;
               return (
                 <GridLiveContextMenu
                   className={grow}
@@ -620,7 +591,6 @@ export default function DraggableGridLayout({
                   camera={camera.name}
                   streamName={streamName}
                   cameraGroup={cameraGroup}
-                  preferredLiveMode={preferredLiveModes[camera.name] ?? "mse"}
                   isRestreamed={isRestreamedStates[camera.name]}
                   supportsAudio={
                     supportsAudioOutputStates[streamName]?.supportsAudio ??
@@ -628,8 +598,6 @@ export default function DraggableGridLayout({
                   }
                   audioState={audioStates[camera.name]}
                   toggleAudio={() => toggleAudio(camera.name)}
-                  statsState={statsStates[camera.name]}
-                  toggleStats={() => toggleStats(camera.name)}
                   volumeState={volumeStates[camera.name]}
                   setVolumeState={(value) =>
                     setVolumeStates((prev) => ({
@@ -639,9 +607,6 @@ export default function DraggableGridLayout({
                   }
                   muteAll={muteAll}
                   unmuteAll={unmuteAll}
-                  resetPreferredLiveMode={() =>
-                    resetPreferredLiveMode(camera.name)
-                  }
                   config={config}
                   streamMetadata={streamMetadata}
                 >
@@ -651,7 +616,6 @@ export default function DraggableGridLayout({
                     autoLive={autoLive ?? globalAutoLive}
                     showStillWithoutActivity={showStillWithoutActivity ?? true}
                     alwaysShowCameraName={displayCameraNames}
-                    useWebGL={useWebGL}
                     cameraRef={cameraRef}
                     className={cn(
                       "rounded-lg bg-black md:rounded-2xl",
@@ -664,24 +628,10 @@ export default function DraggableGridLayout({
                       windowVisible && visibleCameras.includes(camera.name)
                     }
                     cameraConfig={camera}
-                    preferredLiveMode={preferredLiveModes[camera.name] ?? "mse"}
                     playInBackground={false}
-                    showStats={statsStates[camera.name]}
                     onClick={() => {
                       !isEditMode && onSelectCamera(camera.name);
                     }}
-                    onError={(e) => {
-                      setPreferredLiveModes((prevModes) => {
-                        const newModes = { ...prevModes };
-                        if (e === "mse-decode") {
-                          newModes[camera.name] = "webrtc";
-                        } else {
-                          newModes[camera.name] = "jsmpeg";
-                        }
-                        return newModes;
-                      });
-                    }}
-                    onResetLiveMode={() => resetPreferredLiveMode(camera.name)}
                     playAudio={audioStates[camera.name]}
                     volume={volumeStates[camera.name]}
                   />
@@ -790,7 +740,6 @@ type BirdseyeLivePlayerGridItemProps = {
   onTouchEnd?: React.TouchEventHandler<HTMLDivElement>;
   children?: React.ReactNode;
   birdseyeConfig: BirdseyeConfig;
-  liveMode: LivePlayerMode;
   onClick: () => void;
 };
 
@@ -807,7 +756,6 @@ const BirdseyeLivePlayerGridItem = React.forwardRef<
       onTouchEnd,
       children,
       birdseyeConfig,
-      liveMode,
       onClick,
       ...props
     },
@@ -825,7 +773,6 @@ const BirdseyeLivePlayerGridItem = React.forwardRef<
         <BirdseyeLivePlayer
           className={className}
           birdseyeConfig={birdseyeConfig}
-          liveMode={liveMode}
           onClick={onClick}
           containerRef={ref as React.RefObject<HTMLDivElement>}
         />
@@ -845,18 +792,14 @@ type GridLiveContextMenuProps = {
   camera: string;
   streamName: string;
   cameraGroup: string;
-  preferredLiveMode: string;
   isRestreamed: boolean;
   supportsAudio: boolean;
   audioState: boolean;
   toggleAudio: () => void;
-  statsState: boolean;
-  toggleStats: () => void;
   volumeState?: number;
   setVolumeState: (volumeState: number) => void;
   muteAll: () => void;
   unmuteAll: () => void;
-  resetPreferredLiveMode: () => void;
   config?: FrigateConfig;
   streamMetadata?: { [key: string]: LiveStreamMetadata };
 };
@@ -876,18 +819,14 @@ const GridLiveContextMenu = React.forwardRef<
       camera,
       streamName,
       cameraGroup,
-      preferredLiveMode,
       isRestreamed,
       supportsAudio,
       audioState,
       toggleAudio,
-      statsState,
-      toggleStats,
       volumeState,
       setVolumeState,
       muteAll,
       unmuteAll,
-      resetPreferredLiveMode,
       config,
       streamMetadata,
       ...props
@@ -908,18 +847,14 @@ const GridLiveContextMenu = React.forwardRef<
           camera={camera}
           streamName={streamName}
           cameraGroup={cameraGroup}
-          preferredLiveMode={preferredLiveMode}
           isRestreamed={isRestreamed}
           supportsAudio={supportsAudio}
           audioState={audioState}
           toggleAudio={toggleAudio}
-          statsState={statsState}
-          toggleStats={toggleStats}
           volumeState={volumeState}
           setVolumeState={setVolumeState}
           muteAll={muteAll}
           unmuteAll={unmuteAll}
-          resetPreferredLiveMode={resetPreferredLiveMode}
           config={config}
           streamMetadata={streamMetadata}
         >

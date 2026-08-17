@@ -1,4 +1,3 @@
-export type LivePlayerMode = "webrtc" | "mse" | "jsmpeg" | "debug";
 export type VideoResolutionType = {
   width: number;
   height: number;
@@ -34,20 +33,20 @@ export type LiveStreamMetadata = {
 export type LiveSession = {
   camera: string;
   stream_name: string;
+  input_mode: "rtsp" | "mock";
   status: "online" | "offline";
   video_source: "frigate-main/go2rtc";
   inference: {
     configured: boolean;
     status: "external" | "local";
   };
-  transports: Array<"webrtc" | "mse">;
+  transports: Array<"mse">;
   producer_count: number;
 };
 
 export type LivePlayerError = "stalled" | "startup" | "mse-decode";
 
 export type AudioState = Record<string, boolean>;
-export type StatsState = Record<string, boolean>;
 export type VolumeState = Record<string, number>;
 
 export type PlayerStatsType = {

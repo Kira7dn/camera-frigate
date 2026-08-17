@@ -538,9 +538,6 @@ export interface FrigateConfig {
 
   go2rtc: {
     streams: Record<string, string | string[]>;
-    webrtc: {
-      candidates: string[];
-    };
   };
 
   camera_groups: { [groupName: string]: CameraGroupConfig };

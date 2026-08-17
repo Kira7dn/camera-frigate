@@ -21,6 +21,7 @@ from frigate.util.image import SharedMemoryFrameManager, UntrackedSharedMemory
 from frigate.util.object import get_camera_regions_grid
 from frigate.util.services import calculate_shm_requirements
 from frigate.domain.video import CameraCapture, CameraTracker
+from frigate.domain.video.ffmpeg import runtime_input_mode
 
 logger = logging.getLogger(__name__)
 
@@ -58,22 +59,10 @@ class CameraMaintainer(threading.Thread):
         self.camera_processes: dict[str, mp.Process] = {}
         self.capture_processes: dict[str, mp.Process] = {}
         self.camera_stop_events: dict[str, MpEvent] = {}
+        self.capture_stop_events: dict[str, MpEvent] = {}
         self.metrics_manager = metrics_manager
         self.allowed_cameras = frozenset(config.cameras)
-
-    def set_runtime_input(self, cameras: list[str], mock: bool) -> None:
-        """Switch frame selection without stopping RTSP, capture, or queues."""
-        requested = set(cameras)
-        unknown = requested.difference(self.camera_metrics)
-        if unknown:
-            raise ValueError(f"Unknown cameras: {sorted(unknown)}")
-        for camera in requested:
-            self.camera_metrics[camera].runtime_input.value = 1 if mock else 0
-        logger.info(
-            "Runtime input changed to %s for %s",
-            "mock" if mock else "rtsp",
-            ",".join(sorted(requested)),
-        )
+        self.input_mode = runtime_input_mode()
 
     def __ensure_camera_stop_event(self, camera: str) -> MpEvent:
         camera_stop_event = self.camera_stop_events.get(camera)
@@ -85,6 +74,17 @@ class CameraMaintainer(threading.Thread):
             camera_stop_event.clear()
 
         return camera_stop_event
+
+    def __ensure_capture_stop_event(self, camera: str) -> MpEvent:
+        capture_stop_event = self.capture_stop_events.get(camera)
+
+        if capture_stop_event is None:
+            capture_stop_event = mp.Event()
+            self.capture_stop_events[camera] = capture_stop_event
+        else:
+            capture_stop_event.clear()
+
+        return capture_stop_event
 
     def __init_historical_regions(self) -> None:
         # delete region grids for removed or renamed cameras
@@ -195,7 +195,7 @@ class CameraMaintainer(threading.Thread):
             logger.info(f"Capture process not started for disabled camera {name}")
             return
 
-        camera_stop_event = self.__ensure_camera_stop_event(name)
+        capture_stop_event = self.__ensure_capture_stop_event(name)
 
         # pre-create shms
         count = 10 if runtime else self.shm_count
@@ -207,7 +207,7 @@ class CameraMaintainer(threading.Thread):
             config,
             count,
             self.camera_metrics[name],
-            camera_stop_event,
+            capture_stop_event,
             self.config.logger,
         )
         capture_process.daemon = True
@@ -216,14 +216,23 @@ class CameraMaintainer(threading.Thread):
         self.camera_metrics[name].capture_process_pid.value = capture_process.pid
         logger.info(f"Capture process started for {name}: {capture_process.pid}")
 
-    def __stop_camera_capture_process(self, camera: str) -> None:
+    def __stop_camera_capture_process(self, camera: str, force: bool = False) -> None:
         capture_process = self.capture_processes.get(camera)
         if capture_process is not None:
             logger.info(f"Waiting for capture process for {camera} to stop")
-            camera_stop_event = self.camera_stop_events.get(camera)
+            capture_stop_event = self.capture_stop_events.get(camera)
 
-            if camera_stop_event is not None:
-                camera_stop_event.set()
+            if capture_stop_event is not None:
+                capture_stop_event.set()
+
+            if force:
+                if capture_process.is_alive():
+                    capture_process.terminate()
+                capture_process.join(timeout=5)
+                if capture_process.is_alive():
+                    capture_process.kill()
+                    capture_process.join(timeout=5)
+                return
 
             capture_process.join(timeout=10)
             if capture_process.is_alive():
@@ -231,7 +240,10 @@ class CameraMaintainer(threading.Thread):
                     f"Capture process for {camera} didn't exit, forcing termination"
                 )
                 capture_process.terminate()
-                capture_process.join()
+                capture_process.join(timeout=5)
+                if capture_process.is_alive():
+                    capture_process.kill()
+                    capture_process.join(timeout=5)
 
     def __unlink_camera_frame_slots(self, camera: str) -> None:
         """Drop the camera's per-frame YUV SHM segments from this
@@ -252,7 +264,7 @@ class CameraMaintainer(threading.Thread):
             except Exception as exc:  # noqa: BLE001 - cleanup must remain best effort
                 logger.debug("Could not unlink SHM %s: %s", name, exc)
 
-    def __stop_camera_process(self, camera: str) -> None:
+    def __stop_camera_process(self, camera: str, close_queue: bool = True) -> None:
         camera_process = self.camera_processes.get(camera)
         if camera_process is not None:
             logger.info(f"Waiting for process for {camera} to stop")
@@ -261,13 +273,18 @@ class CameraMaintainer(threading.Thread):
             if camera_stop_event is not None:
                 camera_stop_event.set()
 
-            camera_process.join(timeout=10)
+            camera_process.join(timeout=5)
             if camera_process.is_alive():
                 logger.warning(f"Process for {camera} didn't exit, forcing termination")
                 camera_process.terminate()
-                camera_process.join()
-            logger.info(f"Closing frame queue for {camera}")
-            empty_and_close_queue(self.camera_metrics[camera].frame_queue)
+                camera_process.join(timeout=5)
+            if camera_process.is_alive():
+                logger.warning(f"Process for {camera} didn't exit after terminate, killing")
+                camera_process.kill()
+                camera_process.join(timeout=5)
+            if close_queue:
+                logger.info(f"Closing frame queue for {camera}")
+                empty_and_close_queue(self.camera_metrics[camera].frame_queue)
 
     def run(self) -> None:
         self.__init_historical_regions()
@@ -278,6 +295,26 @@ class CameraMaintainer(threading.Thread):
             self.__start_camera_capture(camera, config)
 
         while not self.stop_event.wait(1):
+            current_input_mode = runtime_input_mode()
+            if current_input_mode != self.input_mode:
+                logger.info(
+                    "Runtime input changed from %s to %s; restarting camera pipelines",
+                    self.input_mode,
+                    current_input_mode,
+                )
+                pipelines = [
+                    (camera, config)
+                    for camera, config in self.config.cameras.items()
+                    if camera in self.capture_processes
+                ]
+                for camera, _ in pipelines:
+                    self.__stop_camera_capture_process(camera, force=True)
+                for camera, _ in pipelines:
+                    self.capture_processes.pop(camera, None)
+                for camera, config in pipelines:
+                    self.__start_camera_capture(camera, config)
+                self.input_mode = current_input_mode
+
             updates = self.update_subscriber.check_for_updates()
 
             for update_type, updated_cameras in updates.items():
@@ -307,6 +344,7 @@ class CameraMaintainer(threading.Thread):
                         self.capture_processes.pop(camera, None)
                         self.camera_processes.pop(camera, None)
                         self.camera_stop_events.pop(camera, None)
+                        self.capture_stop_events.pop(camera, None)
                         self.region_grids.pop(camera, None)
                         self.camera_metrics.pop(camera, None)
                         self.ptz_metrics.pop(camera, None)

@@ -1,24 +1,19 @@
-"""Handle outputting birdseye frames via jsmpeg and go2rtc."""
+﻿"""Compose Birdseye frames for the go2rtc MSE live stream."""
 
 import datetime
 import glob
 import logging
 import math
 import os
-import queue
-import subprocess as sp
-import threading
-import traceback
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Any, cast
+from typing import Any
 
 import cv2
 import numpy as np
 
 from frigate.infrastructure.comms.inter_process import InterProcessRequestor
-from frigate.infrastructure.config import BirdseyeModeEnum, FfmpegConfig, FrigateConfig
+from frigate.infrastructure.config import BirdseyeModeEnum, FrigateConfig
 from frigate.const import BASE_DIR, BIRDSEYE_PIPE, INSTALL_DIR, UPDATE_BIRDSEYE_LAYOUT
-from frigate.infrastructure.output.ws_auth import ws_has_camera_access
 from frigate.util.image import (
     SharedMemoryFrameManager,
     copy_yuv_to_position,
@@ -111,168 +106,6 @@ class Canvas:
         )
         self.aspect_cache[cam_name] = camera_aspect
         return camera_aspect
-
-
-class FFMpegConverter(threading.Thread):
-    def __init__(
-        self,
-        ffmpeg: FfmpegConfig,
-        input_queue: queue.Queue,
-        stop_event: MpEvent,
-        in_width: int,
-        in_height: int,
-        out_width: int,
-        out_height: int,
-        quality: int,
-        birdseye_rtsp: bool = False,
-    ):
-        super().__init__(name="birdseye_output_converter")
-        self.camera = "birdseye"
-        self.input_queue = input_queue
-        self.stop_event = stop_event
-        self.bd_pipe: int | None = None
-
-        if birdseye_rtsp:
-            self.recreate_birdseye_pipe()
-
-        ffmpeg_cmd = [
-            ffmpeg.ffmpeg_path,
-            "-threads",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "yuv420p",
-            "-video_size",
-            f"{in_width}x{in_height}",
-            "-i",
-            "pipe:",
-            "-threads",
-            "1",
-            "-f",
-            "mpegts",
-            "-s",
-            f"{out_width}x{out_height}",
-            "-codec:v",
-            "mpeg1video",
-            "-q",
-            f"{quality}",
-            "-bf",
-            "0",
-            "pipe:",
-        ]
-
-        self.process = sp.Popen(
-            ffmpeg_cmd,
-            stdout=sp.PIPE,
-            stderr=sp.DEVNULL,
-            stdin=sp.PIPE,
-            start_new_session=True,
-        )
-
-    def recreate_birdseye_pipe(self) -> None:
-        if self.bd_pipe:
-            os.close(self.bd_pipe)
-
-        if os.path.exists(BIRDSEYE_PIPE):
-            os.remove(BIRDSEYE_PIPE)
-
-        os.mkfifo(BIRDSEYE_PIPE, mode=0o777)
-        stdin = os.open(BIRDSEYE_PIPE, os.O_RDONLY | os.O_NONBLOCK)
-        self.bd_pipe = os.open(BIRDSEYE_PIPE, os.O_WRONLY)
-        os.close(stdin)
-        self.reading_birdseye = False
-
-    def __write(self, b: bytes) -> None:
-        assert self.process.stdin is not None
-        self.process.stdin.write(b)
-
-        if self.bd_pipe:
-            try:
-                os.write(self.bd_pipe, b)
-                self.reading_birdseye = True
-            except BrokenPipeError:
-                if self.reading_birdseye:
-                    # we know the pipe was being read from and now it is not
-                    # so we should recreate the pipe to ensure no partially-read
-                    # frames exist
-                    logger.debug(
-                        "Recreating the birdseye pipe because it was read from and now is not"
-                    )
-                    self.recreate_birdseye_pipe()
-
-                return
-
-    def read(self, length: int) -> Any:
-        try:
-            stdout = self.process.stdout
-            if stdout is None:
-                return False
-            return cast(Any, stdout).read1(length)
-        except ValueError:
-            return False
-
-    def exit(self) -> None:
-        if self.bd_pipe:
-            os.close(self.bd_pipe)
-
-        self.process.terminate()
-        try:
-            self.process.communicate(timeout=30)
-        except sp.TimeoutExpired:
-            self.process.kill()
-            self.process.communicate()
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                frame = self.input_queue.get(True, timeout=1)
-                self.__write(frame)
-            except queue.Empty:
-                pass
-
-        self.exit()
-
-
-class BroadcastThread(threading.Thread):
-    def __init__(
-        self,
-        camera: str,
-        converter: FFMpegConverter,
-        websocket_server: Any,
-        stop_event: MpEvent,
-        config: FrigateConfig,
-    ):
-        super().__init__()
-        self.camera = camera
-        self.converter = converter
-        self.websocket_server = websocket_server
-        self.stop_event = stop_event
-        self.config = config
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            buf = self.converter.read(65536)
-            if buf:
-                manager = self.websocket_server.manager
-                with manager.lock:
-                    websockets = manager.websockets.copy()
-                    ws_iter = iter(websockets.values())
-
-                for ws in ws_iter:
-                    if (
-                        not ws.terminated
-                        and ws.environ["PATH_INFO"] == f"/{self.camera}"
-                        and ws_has_camera_access(ws, self.camera, self.config)
-                    ):
-                        try:
-                            ws.send(buf, binary=True)
-                        except ValueError:
-                            pass
-                        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                            logger.debug(f"Websocket unexpectedly closed {e}")
-            elif self.converter.process.poll() is not None:
-                break
 
 
 class BirdsEyeFrameManager:
@@ -808,34 +641,16 @@ class Birdseye:
         self,
         config: FrigateConfig,
         stop_event: MpEvent,
-        websocket_server: Any,
     ) -> None:
         self.config = config
         canvas_width, canvas_height = get_canvas_shape(
             config.birdseye.width, config.birdseye.height
         )
-        self.input: queue.Queue[bytes] = queue.Queue(maxsize=10)
-        self.converter = FFMpegConverter(
-            config.ffmpeg,
-            self.input,
-            stop_event,
-            canvas_width,
-            canvas_height,
-            canvas_width,
-            canvas_height,
-            config.birdseye.quality,
-            config.birdseye.restream,
-        )
-        self.broadcaster = BroadcastThread(
-            "birdseye",
-            self.converter,
-            websocket_server,
-            stop_event,
-            config,
-        )
         self.birdseye_manager = BirdsEyeFrameManager(self.config, stop_event)
         self.frame_manager = SharedMemoryFrameManager()
         self.stop_event = stop_event
+        self.birdseye_pipe: int | None = None
+        self.reading_birdseye = False
         self.requestor = InterProcessRequestor()
         self.idle_fps: float = self.config.birdseye.idle_heartbeat_fps
         self._idle_interval: float | None = (
@@ -843,13 +658,37 @@ class Birdseye:
         )
 
         if config.birdseye.restream:
+            self.recreate_birdseye_pipe()
             self.birdseye_buffer: Any = self.frame_manager.create(
                 "birdseye",
                 self.birdseye_manager.yuv_shape[0] * self.birdseye_manager.yuv_shape[1],
             )
 
-        self.converter.start()
-        self.broadcaster.start()
+
+    def recreate_birdseye_pipe(self) -> None:
+        if self.birdseye_pipe:
+            os.close(self.birdseye_pipe)
+
+        if os.path.exists(BIRDSEYE_PIPE):
+            os.remove(BIRDSEYE_PIPE)
+
+        os.mkfifo(BIRDSEYE_PIPE, mode=0o777)
+        reader = os.open(BIRDSEYE_PIPE, os.O_RDONLY | os.O_NONBLOCK)
+        self.birdseye_pipe = os.open(BIRDSEYE_PIPE, os.O_WRONLY)
+        os.close(reader)
+        self.reading_birdseye = False
+
+    def write_birdseye_frame(self, frame_bytes: bytes) -> None:
+        if self.birdseye_pipe is None:
+            return
+
+        try:
+            os.write(self.birdseye_pipe, frame_bytes)
+            self.reading_birdseye = True
+        except BrokenPipeError:
+            if self.reading_birdseye:
+                logger.debug("Recreating the Birdseye pipe after the reader closed")
+                self.recreate_birdseye_pipe()
 
     def __send_new_frame(self) -> None:
         frame_bytes = self.birdseye_manager.frame.tobytes()
@@ -857,11 +696,7 @@ class Birdseye:
         if self.config.birdseye.restream:
             self.birdseye_buffer[:] = frame_bytes
 
-        try:
-            self.input.put_nowait(frame_bytes)
-        except queue.Full:
-            # drop frames if queue is full
-            pass
+        self.write_birdseye_frame(frame_bytes)
 
     def all_cameras_disabled(self) -> None:
         self.birdseye_manager.clear_frame()
@@ -909,5 +744,9 @@ class Birdseye:
                 self.__send_new_frame()
 
     def stop(self) -> None:
-        self.converter.join()
-        self.broadcaster.join()
+        if self.birdseye_pipe:
+            os.close(self.birdseye_pipe)
+            self.birdseye_pipe = None
+
+
+

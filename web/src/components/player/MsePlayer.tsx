@@ -844,7 +844,6 @@ function MSEPlayer({
         if (wsRef.current) {
           onDisconnect();
           if (errorCount >= 3) {
-            // too many mse errors, try jsmpeg
             handleError("startup", `Max error count ${errorCount} exceeded.`);
           } else {
             reconnect(5000);

@@ -1,28 +1,18 @@
-import WebRtcPlayer from "./WebRTCPlayer";
 import { CameraConfig } from "@/types/frigateConfig";
-import AutoUpdatingCameraImage from "../camera/AutoUpdatingCameraImage";
 import ActivityIndicator from "../indicators/activity-indicator";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useResizeObserver } from "@/hooks/resize-observer";
 import MSEPlayer from "./MsePlayer";
-import JSMpegPlayer from "./JSMpegPlayer";
 import { MdCircle } from "react-icons/md";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { useCameraActivity } from "@/hooks/use-camera-activity";
-import {
-  LivePlayerError,
-  LivePlayerMode,
-  PlayerStatsType,
-  VideoResolutionType,
-  LiveSession,
-} from "@/types/live";
+import { VideoResolutionType, LiveSession } from "@/types/live";
 import { getIconForLabel } from "@/utils/iconUtil";
 import Chip from "../indicators/Chip";
 import { cn } from "@/lib/utils";
 import { TbExclamationCircle } from "react-icons/tb";
 import { TooltipPortal } from "@radix-ui/react-tooltip";
 import { baseUrl } from "@/api/baseUrl";
-import { PlayerStats } from "./PlayerStats";
 import { LuVideoOff } from "react-icons/lu";
 import { Trans, useTranslation } from "react-i18next";
 import { useCameraFriendlyName } from "@/hooks/use-camera-friendly-name";
@@ -93,23 +83,15 @@ type LivePlayerProps = {
   cameraConfig: CameraConfig;
   streamName: string;
   liveStatus?: "online" | "offline";
-  preferredLiveMode: LivePlayerMode;
-  showStillWithoutActivity?: boolean;
   alwaysShowCameraName?: boolean;
-  useWebGL: boolean;
   windowVisible?: boolean;
   playAudio?: boolean;
   volume?: number;
   playInBackground: boolean;
-  micEnabled?: boolean; // only webrtc supports mic
-  iOSCompatFullScreen?: boolean;
   pip?: boolean;
   autoLive?: boolean;
-  showStats?: boolean;
   onClick?: () => void;
   setFullResolution?: React.Dispatch<React.SetStateAction<VideoResolutionType>>;
-  onError?: (error: LivePlayerError) => void;
-  onResetLiveMode?: () => void;
 };
 
 export default function LivePlayer({
@@ -119,23 +101,15 @@ export default function LivePlayer({
   cameraConfig,
   streamName,
   liveStatus,
-  preferredLiveMode,
-  showStillWithoutActivity = true,
   alwaysShowCameraName = false,
-  useWebGL = false,
   windowVisible = true,
   playAudio = false,
   volume,
   playInBackground = false,
-  micEnabled = false,
-  iOSCompatFullScreen = false,
   pip,
   autoLive = true,
-  showStats = false,
   onClick,
   setFullResolution,
-  onError,
-  onResetLiveMode,
 }: LivePlayerProps) {
   const { t } = useTranslation(["components/player"]);
 
@@ -151,26 +125,11 @@ export default function LivePlayer({
     { revalidateOnFocus: true, refreshInterval: 5000 },
   );
   const effectiveLiveStatus = liveStatus ?? liveSession?.status;
-
-  // player is showing on a dashboard if containerRef is not provided
-
-  const inDashboard = containerRef?.current == null;
+  const inputMode = liveSession?.input_mode ?? "rtsp";
 
   const [overlayDimensions] = useResizeObserver(overlayRef);
   const isCompact =
     overlayDimensions.width > 0 && overlayDimensions.width < 280;
-
-  // stats
-
-  const [stats, setStats] = useState<PlayerStatsType>({
-    streamType: "-",
-    bandwidth: 0, // in kBps
-    latency: undefined, // in seconds
-    totalFrames: 0,
-    droppedFrames: undefined,
-    decodedFrames: 0,
-    droppedFrameRate: 0, // percentage
-  });
 
   // camera activity
 
@@ -182,128 +141,20 @@ export default function LivePlayer({
     offline,
   } = useCameraActivity(cameraConfig, true, effectiveLiveStatus);
 
-  const { data: liveEvents } = useSWR<
-    { id: string; label: string; score: number; box?: [number, number, number, number]; end_time?: number | null }[]
-  >(`events?camera=${encodeURIComponent(cameraConfig.name)}&limit=20`, {
-    refreshInterval: 1000,
-    revalidateOnFocus: false,
-  });
-
-  const liveBoundingObjects = useMemo(() => {
-    const byId = new Map(objects.map((object) => [object.id, object]));
-    for (const event of liveEvents ?? []) {
-      if (!event.box || event.end_time != null) {
-        continue;
-      }
-      const [left, top, right, bottom] = event.box;
-      const normalized = Math.max(left, top, right, bottom) <= 1;
-      byId.set(event.id, {
-        id: event.id,
-        label: event.label,
-        score: event.score,
-        box: normalized
-          ? [
-              left * cameraConfig.detect.width,
-              top * cameraConfig.detect.height,
-              right * cameraConfig.detect.width,
-              bottom * cameraConfig.detect.height,
-            ]
-          : event.box,
-        stationary: false,
-        area: 0,
-        ratio: 0,
-        sub_label: "",
-      });
-    }
-    return [...byId.values()];
-  }, [cameraConfig, liveEvents, objects]);
-
-  const cameraActive = useMemo(
-    () =>
-      !showStillWithoutActivity ||
-      (windowVisible && (activeMotion || activeTracking)),
-    [activeMotion, activeTracking, showStillWithoutActivity, windowVisible],
-  );
+  const liveBoundingObjects = objects;
 
   // camera live state
 
   const [liveReady, setLiveReady] = useState(false);
 
-  const liveReadyRef = useRef(liveReady);
-  const cameraActiveRef = useRef(cameraActive);
-
-  useEffect(() => {
-    liveReadyRef.current = liveReady;
-    cameraActiveRef.current = cameraActive;
-  }, [liveReady, cameraActive]);
-
-  useEffect(() => {
-    if (!autoLive || !liveReady) {
-      return;
-    }
-
-    if (!cameraActive) {
-      const timer = setTimeout(() => {
-        if (liveReadyRef.current && !cameraActiveRef.current) {
-          setLiveReady(false);
-          onResetLiveMode?.();
-        }
-      }, 500);
-
-      return () => {
-        clearTimeout(timer);
-      };
-    }
-    // live mode won't change
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoLive, cameraActive, liveReady]);
-
-  // camera still state
-
-  const stillReloadInterval = useMemo(() => {
-    if (!windowVisible || offline || !showStillWithoutActivity) {
-      return -1; // no reason to update the image when the window is not visible
-    }
-
-    if (liveReady && !cameraActive) {
-      return 300;
-    }
-
-    if (liveReady) {
-      return 60000;
-    }
-
-    if (activeMotion || activeTracking) {
-      if (autoLive) {
-        return 200;
-      } else {
-        return 59000;
-      }
-    }
-
-    return 30000;
-  }, [
-    autoLive,
-    showStillWithoutActivity,
-    liveReady,
-    activeMotion,
-    activeTracking,
-    offline,
-    windowVisible,
-    cameraActive,
-  ]);
-
-  useEffect(() => {
-    setLiveReady(false);
-  }, [preferredLiveMode]);
-
   const [key, setKey] = useState(0);
   const prevStreamNameRef = useRef(streamName);
+  const prevInputModeRef = useRef(inputMode);
 
-  const resetPlayer = () => {
+  const resetPlayer = useCallback(() => {
     setLiveReady(false);
     setKey((prevKey) => prevKey + 1);
-  };
+  }, []);
 
   useEffect(() => {
     if (prevStreamNameRef.current !== streamName) {
@@ -312,13 +163,14 @@ export default function LivePlayer({
         resetPlayer();
       }
     }
-  }, [streamName]);
+  }, [resetPlayer, streamName]);
 
   useEffect(() => {
-    if (showStillWithoutActivity && !autoLive) {
-      setLiveReady(false);
+    if (prevInputModeRef.current !== inputMode) {
+      prevInputModeRef.current = inputMode;
+      resetPlayer();
     }
-  }, [showStillWithoutActivity, autoLive]);
+  }, [inputMode, resetPlayer]);
 
   const playerIsPlaying = useCallback(() => {
     setLiveReady(true);
@@ -356,77 +208,20 @@ export default function LivePlayer({
     return <ActivityIndicator />;
   }
 
-  let player;
-  if (!autoLive || !streamName) {
-    player = null;
-  } else if (preferredLiveMode == "webrtc") {
-    player = (
-      <WebRtcPlayer
-        key={"webrtc_" + key}
-        className={`size-full rounded-lg md:rounded-2xl ${liveReady ? "" : "hidden"}`}
-        camera={streamName}
-        playbackEnabled={cameraActive || liveReady}
-        getStats={showStats}
-        setStats={setStats}
-        audioEnabled={playAudio}
-        volume={volume}
-        microphoneEnabled={micEnabled}
-        iOSCompatFullScreen={iOSCompatFullScreen}
-        onPlaying={playerIsPlaying}
-        pip={pip}
-        onError={onError}
-      />
-    );
-  } else if (preferredLiveMode == "mse") {
-    if ("MediaSource" in window || "ManagedMediaSource" in window) {
-      player = (
-        <MSEPlayer
-          key={"mse_" + key}
-          className={`size-full rounded-lg md:rounded-2xl ${liveReady ? "" : "hidden"}`}
-          camera={streamName}
-          playbackEnabled={cameraActive || liveReady}
-          audioEnabled={playAudio}
-          volume={volume}
-          playInBackground={playInBackground}
-          getStats={showStats}
-          setStats={setStats}
-          onPlaying={playerIsPlaying}
-          pip={pip}
-          setFullResolution={setFullResolution}
-          onError={onError}
-        />
-      );
-    } else {
-      player = (
-        <div className="w-5xl text-center text-sm">
-          {t("livePlayerRequiredIOSVersion")}
-        </div>
-      );
-    }
-  } else if (preferredLiveMode == "jsmpeg") {
-    if (cameraActive || !showStillWithoutActivity || liveReady) {
-      player = (
-        <JSMpegPlayer
-          key={"jsmpeg_" + key}
-          className="flex justify-center overflow-hidden rounded-lg md:rounded-2xl"
-          camera={cameraConfig.name}
-          width={cameraConfig.detect.width}
-          height={cameraConfig.detect.height}
-          playbackEnabled={
-            cameraActive || !showStillWithoutActivity || liveReady
-          }
-          useWebGL={useWebGL}
-          setStats={setStats}
-          containerRef={containerRef ?? internalContainerRef}
-          onPlaying={playerIsPlaying}
-        />
-      );
-    } else {
-      player = null;
-    }
-  } else {
-    player = <ActivityIndicator />;
-  }
+  const player = !streamName ? null : (
+    <MSEPlayer
+      key={"mse_" + key}
+      className={`size-full rounded-lg md:rounded-2xl ${liveReady ? "" : "hidden"}`}
+      camera={streamName}
+      playbackEnabled={true}
+      audioEnabled={playAudio}
+      volume={volume}
+      playInBackground={playInBackground}
+      onPlaying={playerIsPlaying}
+      pip={pip}
+      setFullResolution={setFullResolution}
+    />
+  );
 
   return (
     <div
@@ -441,8 +236,7 @@ export default function LivePlayer({
       data-camera={cameraConfig.name}
       className={cn(
         "relative flex w-full cursor-pointer justify-center outline",
-        activeTracking &&
-          ((showStillWithoutActivity && !liveReady) || liveReady)
+        activeTracking && liveReady
           ? "outline-3 rounded-lg shadow-severity_alert outline-severity_alert md:rounded-2xl"
           : "outline-0 outline-background",
         "transition-all duration-500",
@@ -455,8 +249,7 @@ export default function LivePlayer({
         }
       }}
     >
-      {cameraEnabled &&
-        ((showStillWithoutActivity && !liveReady) || liveReady) && (
+      {cameraEnabled && liveReady && (
           <ImageShadowOverlay
             upperClassName="md:rounded-2xl"
             lowerClassName="md:rounded-2xl"
@@ -470,13 +263,9 @@ export default function LivePlayer({
           height={cameraConfig.detect.height}
         />
       )}
-      {cameraEnabled &&
-        !offline &&
-        (!showStillWithoutActivity || isReEnabling) &&
-        !liveReady && <ActivityIndicator />}
+      {cameraEnabled && !offline && !liveReady && <ActivityIndicator />}
 
-      {((showStillWithoutActivity && !liveReady) || liveReady) &&
-        objects.length > 0 && (
+      {liveReady && objects.length > 0 && (
           <div className="absolute left-0 top-2 z-40">
             <Tooltip>
               <div className="flex">
@@ -527,28 +316,7 @@ export default function LivePlayer({
           </div>
         )}
 
-      <div
-        className={cn(
-          "absolute inset-0 w-full",
-          showStillWithoutActivity &&
-            !liveReady &&
-            !isReEnabling &&
-            cameraEnabled
-            ? "visible"
-            : "invisible",
-        )}
-      >
-        <AutoUpdatingCameraImage
-          className="pointer-events-none size-full"
-          cameraClasses="relative size-full flex justify-center"
-          camera={cameraConfig.name}
-          showFps={false}
-          reloadInterval={stillReloadInterval}
-          periodicCache
-        />
-      </div>
-
-      {offline && inDashboard && (
+      {offline && (
         <>
           <div className="absolute inset-0 rounded-lg bg-black/50 md:rounded-2xl" />
           <div className="absolute inset-0 left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 items-center justify-center">
@@ -576,31 +344,6 @@ export default function LivePlayer({
         </>
       )}
 
-      {offline && !showStillWithoutActivity && cameraEnabled && (
-        <div className="absolute inset-0 left-1/2 top-1/2 flex h-96 w-96 -translate-x-1/2 -translate-y-1/2">
-          <div className="flex flex-col items-center justify-center rounded-lg bg-background/50 p-5">
-            <p className="my-5 text-lg">
-              {effectiveLiveStatus === "offline"
-                ? "Không nhận được khung hình nào từ Frigate main"
-                : t("streamOffline.title")}
-            </p>
-            <TbExclamationCircle className="mb-3 size-10" />
-            {!isCompact && (
-              <p className="max-w-96 text-center">
-                <Trans
-                  ns="components/player"
-                  values={{
-                    cameraName: cameraName,
-                  }}
-                >
-                  streamOffline.desc
-                </Trans>
-              </p>
-            )}
-          </div>
-        </div>
-      )}
-
       {!cameraEnabled && (
         <div className="relative flex h-full w-full items-center justify-center rounded-2xl border border-secondary-foreground bg-background_alt">
           <div className="flex h-32 flex-col items-center justify-center rounded-lg p-4 md:h-48 md:w-48">
@@ -614,7 +357,7 @@ export default function LivePlayer({
 
       <div className="absolute right-2 top-2 flex items-center gap-3">
         {(alwaysShowCameraName ||
-          (offline && showStillWithoutActivity) ||
+          offline ||
           !cameraEnabled) && (
           <Chip
             className={`z-0 flex items-start justify-between space-x-1 bg-gray-500 bg-gradient-to-br from-gray-400 to-gray-500 text-xs capitalize`}
@@ -625,13 +368,10 @@ export default function LivePlayer({
         {autoLive &&
           !offline &&
           activeMotion &&
-          ((showStillWithoutActivity && !liveReady) || liveReady) && (
+          liveReady && (
             <MdCircle className="mr-2 size-2 animate-pulse text-danger shadow-danger drop-shadow-md" />
           )}
       </div>
-      {showStats && (
-        <PlayerStats stats={stats} minimal={cameraRef !== undefined} />
-      )}
     </div>
   );
 }

@@ -282,6 +282,9 @@ class RuntimeDeploymentConfig(FrigateBaseModel):
     media_dir: str = "runtime/media"
     data_dir: str = "runtime/data"
     rtsp_transport: str = Field(default="tcp", pattern="^(tcp|udp)$")
+    input_mode: str = Field(default="rtsp", pattern="^(rtsp|mock)$")
+    mock_sources: dict[str, str] = Field(default_factory=dict)
+    test_timeout_seconds: int = Field(default=300, ge=30, le=3600)
     topology_revision: str = Field(default="", pattern="^$|^[a-f0-9]{64}$")
     topology_role: str = Field(default="source", pattern="^(source|main|tracker)$")
     topology_node_id: str = Field(default="", pattern="^$|^[A-Za-z0-9_-]+$")
@@ -592,7 +595,7 @@ class FrigateConfig(FrigateBaseModel):
     live: CameraLiveConfig = Field(
         default_factory=CameraLiveConfig,
         title="Live playback",
-        description="Settings to control the jsmpeg live stream resolution and quality. This does not affect restreamed cameras that use go2rtc for live view.",
+        description="Mapping of configured camera stream names to the go2rtc streams used by the MSE live player.",
     )
     motion: MotionConfig | None = Field(
         default=None,

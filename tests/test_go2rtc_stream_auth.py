@@ -67,12 +67,6 @@ class TestDenyResponseForGo2rtcStream(unittest.TestCase):
     def test_empty_url_passes_through(self):
         self.assertIsNone(self._deny("", "limited_user"))
 
-    def test_jsmpeg_path_not_handled_here(self):
-        # jsmpeg is authorized per-frame in the output pipeline, not here
-        self.assertIsNone(
-            self._deny("http://host/live/jsmpeg/back_door", "limited_user")
-        )
-
     # --- restricted role: allowed vs forbidden cameras ---
 
     def test_mse_allowed_camera(self):
@@ -83,18 +77,6 @@ class TestDenyResponseForGo2rtcStream(unittest.TestCase):
     def test_mse_forbidden_camera_denied(self):
         self.assertEqual(
             self._deny("http://host/live/mse/api/ws?src=back_door", "limited_user"),
-            403,
-        )
-
-    def test_webrtc_ws_forbidden_camera_denied(self):
-        self.assertEqual(
-            self._deny("http://host/live/webrtc/api/ws?src=back_door", "limited_user"),
-            403,
-        )
-
-    def test_webrtc_signaling_forbidden_camera_denied(self):
-        self.assertEqual(
-            self._deny("http://host/api/go2rtc/webrtc?src=back_door", "limited_user"),
             403,
         )
 

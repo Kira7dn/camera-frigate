@@ -1,4 +1,4 @@
-"""Authorization helpers for JSMPEG websocket clients."""
+"""Authorization helpers for camera-scoped Frigate WebSocket messages."""
 
 from typing import Any
 

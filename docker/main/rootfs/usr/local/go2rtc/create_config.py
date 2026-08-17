@@ -69,21 +69,6 @@ if go2rtc_config.get("log") is None:
 elif go2rtc_config["log"].get("format") is None:
     go2rtc_config["log"]["format"] = "text"
 
-# ensure there is a default webrtc config
-if go2rtc_config.get("webrtc") is None:
-    go2rtc_config["webrtc"] = {}
-
-if go2rtc_config["webrtc"].get("candidates") is None:
-    default_candidates = []
-    # use internal candidate if it was discovered when running through the add-on
-    internal_candidate = os.environ.get("FRIGATE_GO2RTC_WEBRTC_CANDIDATE_INTERNAL")
-    if internal_candidate is not None:
-        default_candidates.append(internal_candidate)
-    # should set default stun server so webrtc can work
-    default_candidates.append("stun:8555")
-
-    go2rtc_config["webrtc"]["candidates"] = default_candidates
-
 if go2rtc_config.get("rtsp", {}).get("username") is not None:
     go2rtc_config["rtsp"]["username"] = substitute_frigate_vars(
         go2rtc_config["rtsp"]["username"]

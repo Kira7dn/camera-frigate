@@ -19,6 +19,7 @@ export default defineConfig({
     "import.meta.vitest": "undefined",
   },
   server: {
+    allowedHosts: true,
     https:
       tlsCert && tlsKey
         ? { cert: fs.readFileSync(tlsCert), key: fs.readFileSync(tlsKey) }
