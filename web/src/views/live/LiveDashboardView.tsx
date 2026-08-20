@@ -63,6 +63,40 @@ type LiveDashboardViewProps = {
   fullscreen: boolean;
   toggleFullscreen: () => void;
 };
+
+type RuntimeInputMode = "mock" | "rtsp";
+type RuntimeAction = "starting" | "stopping" | null;
+
+const RUNTIME_CAMERAS = ["face_camera", "car_camera", "safety_camera"];
+const RUNTIME_ACTION_TIMEOUT_MS = 90000;
+
+async function waitForRuntimeMode(
+  target: RuntimeInputMode,
+  timeoutMs = RUNTIME_ACTION_TIMEOUT_MS,
+): Promise<{ inputs: Record<string, string> }> {
+  const deadline = Date.now() + timeoutMs;
+  let lastState: { inputs: Record<string, string> } = { inputs: {} };
+
+  while (Date.now() < deadline) {
+    const response = await fetch("/api/runtime/input", { cache: "no-store" });
+    if (response.ok) {
+      lastState = await response.json();
+      const inputs = lastState.inputs || {};
+      if (
+        RUNTIME_CAMERAS.every((camera) => inputs[camera] === target) &&
+        Object.keys(inputs).length === RUNTIME_CAMERAS.length
+      ) {
+        return lastState;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  throw new Error(
+    `Runtime input did not reach ${target} for all cameras: ${JSON.stringify(lastState.inputs)}`,
+  );
+}
+
 export default function LiveDashboardView({
   cameras,
   cameraGroup,
@@ -74,21 +108,73 @@ export default function LiveDashboardView({
   const { t } = useTranslation(["views/live"]);
   const { data: runtimeInput, mutate: mutateRuntimeInput } = useSWR<{
     inputs: Record<string, string>;
+    reason?: string | null;
   }>("runtime/input", { refreshInterval: 1000 });
-  const runtimeTestRunning = Object.values(runtimeInput?.inputs ?? {}).length > 0 &&
-    Object.values(runtimeInput?.inputs ?? {}).every((mode) => mode === "mock");
+
+  const runtimeInputs = runtimeInput?.inputs ?? {};
+  const runtimeTestRunning =
+    RUNTIME_CAMERAS.every((camera) => runtimeInputs[camera] === "mock") &&
+    Object.keys(runtimeInputs).length === RUNTIME_CAMERAS.length;
+  const runtimeLiveRunning =
+    RUNTIME_CAMERAS.every((camera) => runtimeInputs[camera] === "rtsp") &&
+    Object.keys(runtimeInputs).length === RUNTIME_CAMERAS.length;
+  const runtimeAutoStopped =
+    runtimeLiveRunning && runtimeInput?.reason?.startsWith("mock_source_eof:");
+  const [runtimeAction, setRuntimeAction] = useState<RuntimeAction>(null);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [runtimeMessage, setRuntimeMessage] = useState<string | null>(null);
 
   const toggleRuntimeTest = useCallback(async () => {
-    const action = runtimeTestRunning ? "stop" : "start";
-    const response = await fetch(`/api/runtime/input/${action}`, {
-      method: "POST",
-      headers: { "X-CSRF-Token": "1" },
-    });
-    if (!response.ok) {
-      throw new Error(`runtime input ${action} failed: ${response.status}`);
+    if (runtimeAction) {
+      return;
     }
-    await mutateRuntimeInput();
-  }, [mutateRuntimeInput, runtimeTestRunning]);
+
+    const target: RuntimeInputMode = runtimeTestRunning ? "rtsp" : "mock";
+    const action = target === "mock" ? "start" : "stop";
+    setRuntimeAction(target === "mock" ? "starting" : "stopping");
+    setRuntimeError(null);
+    setRuntimeMessage(null);
+
+    try {
+      const response = await fetch(`/api/runtime/input/${action}`, {
+        method: "POST",
+        headers: { "X-CSRF-Token": "1" },
+      });
+      if (!response.ok) {
+        throw new Error(`Runtime input ${action} failed: HTTP ${response.status}`);
+      }
+
+      const state = await waitForRuntimeMode(target);
+      await mutateRuntimeInput(state, false);
+      setRuntimeMessage(
+        target === "mock"
+          ? "Mock live is active for all 3 cameras."
+          : "Live camera input has been restored for all 3 cameras.",
+      );
+    } catch (error) {
+      try {
+        // The server may complete the stream switch after a dropped response.
+        const state = await waitForRuntimeMode(target, 45000);
+        await mutateRuntimeInput(state, false);
+        setRuntimeMessage(
+          target === "mock"
+            ? "Mock live is active for all 3 cameras."
+            : "Live camera input has been restored for all 3 cameras.",
+        );
+      } catch (recoveryError) {
+        setRuntimeError(
+          recoveryError instanceof Error
+            ? recoveryError.message
+            : error instanceof Error
+              ? error.message
+              : "Runtime input switch failed.",
+        );
+        await mutateRuntimeInput();
+      }
+    } finally {
+      setRuntimeAction(null);
+    }
+  }, [mutateRuntimeInput, runtimeAction, runtimeTestRunning]);
 
   const { data: config } = useSWR<FrigateConfig>("config");
 
@@ -386,9 +472,49 @@ export default function LiveDashboardView({
       className="scrollbar-container size-full select-none overflow-y-auto px-1 pt-2 md:p-2"
       ref={containerRef}
     >
-      <div className="flex justify-end px-2 pb-1">
-        <Button size="sm" variant={runtimeTestRunning ? "destructive" : "secondary"} onClick={toggleRuntimeTest}>
-          {runtimeTestRunning ? "Stop mock live" : "Test mock live"}
+      <div className="flex flex-wrap items-center justify-end gap-2 px-2 pb-1">
+        <div
+          className={cn(
+            "text-xs",
+            runtimeError ? "text-destructive" : "text-muted-foreground",
+          )}
+          role="status"
+          aria-live="polite"
+        >
+          {runtimeError ||
+            (runtimeAutoStopped
+              ? `Mock video ended (${runtimeInput?.reason?.replace("mock_source_eof:", "")}); all cameras restored.`
+              : runtimeMessage) ||
+            (runtimeAction === "starting"
+              ? "Switching all cameras to mock video..."
+              : runtimeAction === "stopping"
+                ? "Restoring live camera input..."
+                : runtimeTestRunning
+                  ? "Mock live active: 3 cameras"
+                  : runtimeLiveRunning
+                    ? "Live camera input active"
+                    : "Synchronizing camera input...")}
+        </div>
+        <Button
+          data-testid="mock-live-toggle"
+          size="sm"
+          variant={runtimeTestRunning ? "destructive" : "secondary"}
+          onClick={toggleRuntimeTest}
+          disabled={runtimeAction !== null || !runtimeInput}
+          aria-busy={runtimeAction !== null}
+          title={
+            runtimeTestRunning
+              ? "Restore RTSP input for all cameras"
+              : "Switch all cameras to mock video for testing"
+          }
+        >
+          {runtimeAction === "starting"
+            ? "Starting mock live..."
+            : runtimeAction === "stopping"
+              ? "Restoring live..."
+              : runtimeTestRunning
+                ? "Stop mock live"
+                : "Test mock live"}
         </Button>
       </div>
       {isMobile && (

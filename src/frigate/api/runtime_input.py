@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 import requests
@@ -21,6 +22,10 @@ router = APIRouter(prefix="/runtime/input", tags=["Runtime input"])
 CAMERAS = ["face_camera", "car_camera", "safety_camera"]
 _runtime_lock = threading.Lock()
 _recovery_timer: threading.Timer | None = None
+_mock_monitor_thread: threading.Thread | None = None
+_mock_monitor_stop = threading.Event()
+_last_stop_reason: str | None = None
+_MOCK_EOF_DIR = "/config/runtime/mock-eof"
 
 
 def _write_mode(app, mode: str) -> None:
@@ -67,21 +72,83 @@ def _set_go2rtc(app, camera: str, mode: str) -> None:
     response.raise_for_status()
 
 
+def _set_all_go2rtc(app, mode: str) -> None:
+    """Switch all camera sources concurrently and fail as one operation."""
+    with ThreadPoolExecutor(max_workers=len(CAMERAS)) as executor:
+        futures = [executor.submit(_set_go2rtc, app, camera, mode) for camera in CAMERAS]
+        for future in futures:
+            future.result()
+
+
+def _mock_eof_cameras() -> list[str]:
+    ended: list[str] = []
+    for camera in CAMERAS:
+        if os.path.isfile(os.path.join(_MOCK_EOF_DIR, f"{camera}.end")):
+            ended.append(camera)
+    return ended
+
+
+def _clear_mock_eof() -> None:
+    for camera in CAMERAS:
+        try:
+            os.unlink(os.path.join(_MOCK_EOF_DIR, f"{camera}.end"))
+        except FileNotFoundError:
+            continue
+
+
+def _cancel_mock_monitor() -> None:
+    global _mock_monitor_thread
+    _mock_monitor_stop.set()
+    _mock_monitor_thread = None
+
+
+def _monitor_mock_sources(app, stop_event: threading.Event) -> None:
+    global _last_stop_reason
+    while not stop_event.wait(0.5):
+        with _runtime_lock:
+            if str(app.frigate_config.runtime.input_mode) != "mock":
+                return
+            ended = _mock_eof_cameras()
+            if not ended:
+                continue
+            _last_stop_reason = f"mock_source_eof:{','.join(ended)}"
+            _cancel_recovery()
+            _cancel_mock_monitor()
+            try:
+                _switch_mode(app, "rtsp")
+                logger.info(
+                    "Mock source EOF on %s; restored all runtime inputs to rtsp",
+                    ",".join(ended),
+                )
+            except Exception:
+                logger.exception("Automatic mock EOF recovery failed")
+            return
+
+
+def _start_mock_monitor(app) -> None:
+    global _mock_monitor_thread, _mock_monitor_stop
+    _cancel_mock_monitor()
+    _mock_monitor_stop = threading.Event()
+    _mock_monitor_thread = threading.Thread(
+        target=_monitor_mock_sources,
+        args=(app, _mock_monitor_stop),
+        name="runtime-mock-eof-monitor",
+        daemon=True,
+    )
+    _mock_monitor_thread.start()
+
+
 def _switch_mode(app, mode: str) -> None:
     previous_mode = str(app.frigate_config.runtime.input_mode)
-    if previous_mode == mode:
-        return
     try:
-        for camera in CAMERAS:
-            _set_go2rtc(app, camera, mode)
+        _set_all_go2rtc(app, mode)
         _write_mode(app, mode)
     except Exception:
         logger.exception("Runtime input switch to %s failed; restoring %s", mode, previous_mode)
-        for camera in CAMERAS:
-            try:
-                _set_go2rtc(app, camera, previous_mode)
-            except Exception:
-                logger.exception("Could not restore go2rtc stream %s", camera)
+        try:
+            _set_all_go2rtc(app, previous_mode)
+        except Exception:
+            logger.exception("Could not restore all go2rtc streams")
         raise
 
 
@@ -113,7 +180,10 @@ def _arm_recovery(app) -> None:
 
 def _state(app) -> dict[str, object]:
     mode = app.frigate_config.runtime.input_mode
-    return {"inputs": {camera: mode for camera in CAMERAS}}
+    return {
+        "inputs": {camera: mode for camera in CAMERAS},
+        "reason": _last_stop_reason,
+    }
 
 
 def recover_stale_runtime_input(config: FrigateConfig) -> FrigateConfig:
@@ -143,10 +213,14 @@ def get_runtime_input(request: Request) -> dict[str, object]:
 
 @router.post("/start")
 def start_runtime_input(request: Request) -> dict[str, object]:
+    global _last_stop_reason
     try:
         with _runtime_lock:
+            _clear_mock_eof()
+            _last_stop_reason = None
             _switch_mode(request.app, "mock")
             _arm_recovery(request.app)
+            _start_mock_monitor(request.app)
             return {"success": True, **_state(request.app)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -154,10 +228,13 @@ def start_runtime_input(request: Request) -> dict[str, object]:
 
 @router.post("/stop")
 def stop_runtime_input(request: Request) -> dict[str, object]:
+    global _last_stop_reason
     try:
         with _runtime_lock:
             _cancel_recovery()
+            _cancel_mock_monitor()
             _switch_mode(request.app, "rtsp")
+            _last_stop_reason = "manual"
             return {"success": True, **_state(request.app)}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

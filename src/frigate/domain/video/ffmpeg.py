@@ -91,6 +91,22 @@ def put_ordered_frame(
 logger = logging.getLogger(__name__)
 
 _RUNTIME_CONFIG_PATH = "/config/config.yml"
+_RUNTIME_MOCK_EOF_DIR = "/config/runtime/mock-eof"
+
+
+def _runtime_mock_eof_path(camera: str) -> str:
+    return os.path.join(_RUNTIME_MOCK_EOF_DIR, f"{camera}.end")
+
+
+def _write_runtime_mock_eof(camera: str, frame_time: float | None) -> None:
+    try:
+        os.makedirs(_RUNTIME_MOCK_EOF_DIR, exist_ok=True)
+        with open(_runtime_mock_eof_path(camera), "w", encoding="utf-8") as stream:
+            stream.write(f"{frame_time or 0.0:.9f}\n")
+    except OSError:
+        logger.exception("Could not write mock EOF marker for %s", camera)
+
+
 def _runtime_input() -> tuple[str, dict[str, str]]:
     """Read the input selector directly from the canonical mounted config."""
     try:
@@ -147,7 +163,7 @@ def capture_frames(
     )
     source_start_dir = os.environ.get("PASSAGE_SOURCE_START_DIR")
     source_start_written = False
-    preserve_source_order = any(
+    preserve_source_order = input_mode == "mock" or any(
         "detect" in ffmpeg_input.roles and os.path.isfile(str(ffmpeg_input.path))
         for ffmpeg_input in config.ffmpeg.inputs
     )
@@ -276,6 +292,8 @@ def capture_frames(
 
             frame_index = 0 if frame_index == shm_frame_count - 1 else frame_index + 1
     finally:
+        if input_mode == "mock" and source_eof:
+            _write_runtime_mock_eof(camera_name, last_source_frame_time)
         if source_start_dir and source_eof and last_source_frame_time is not None:
             end_path = os.path.join(source_start_dir, f"{config.name}.end")
             try:
@@ -372,12 +390,21 @@ class CameraWatchdog(threading.Thread):
 
     def _finite_source_has_ended(self) -> bool:
         """Check whether a direct finite source completed its single pass."""
+        if self.ffmpeg_input_mode == "mock":
+            return self.capture_thread is not None and not self.capture_thread.is_alive()
         end_path = self._finite_source_end_path()
         return end_path is not None and os.path.isfile(end_path)
 
     def _mark_finite_source_exhausted(self, now: float) -> None:
         """Record a clean finite-source EOF without treating it as a crash."""
         if not self._finite_source_exhausted:
+            if self.ffmpeg_input_mode == "mock":
+                frame_time = (
+                    self.capture_thread.current_frame.value
+                    if self.capture_thread is not None
+                    else None
+                )
+                _write_runtime_mock_eof(str(self.config.name), frame_time)
             self.logger.info(
                 "%s reached direct source EOF; watchdog restarts are disabled",
                 self.config.name,
@@ -816,7 +843,7 @@ class CameraWatchdog(threading.Thread):
             if input_option_index > 0 and mock_cmd[input_option_index - 1] == "-i":
                 mock_cmd[input_option_index - 1:input_option_index - 1] = [
                     "-stream_loop",
-                    "-1",
+                    "1",
                     "-re",
                 ]
             ffmpeg_cmd = mock_cmd
